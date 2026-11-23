@@ -10,6 +10,7 @@ from app.providers.whatsapp import WhatsAppProvider, create_whatsapp_provider
 from app.routers.admin import router as admin_router
 from app.routers.attendance import router as attendance_router
 from app.routers.auth import router as auth_router
+from app.routers.leaves import router as leaves_router
 
 
 def create_app(
@@ -52,6 +53,7 @@ def create_app(
     app.include_router(auth_router)
     app.include_router(admin_router)
     app.include_router(attendance_router)
+    app.include_router(leaves_router)
 
     upload_path = Path(cfg.upload_dir)
     if upload_path.exists() and upload_path.is_dir():

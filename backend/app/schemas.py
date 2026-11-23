@@ -480,3 +480,56 @@ class ResendWaResponse(BaseModel):
     wa_sent: bool
     wa_notified_at: datetime | None = None
     message: str
+
+
+# ---------------------------------------------------------------------------
+# Leave Request Verification Schemas (Task 5)
+# ---------------------------------------------------------------------------
+
+
+class LeaveRequestResponse(BaseModel):
+    """Enriched student leave request returned to teacher and admin dashboards."""
+
+    id: str
+    student_id: str
+    student_name: str
+    student_nis: str
+    class_id: str
+    class_name: str
+    parent_id: str
+    parent_name: str
+    parent_phone_wa: str
+    request_type: str
+    start_date: date
+    end_date: date
+    reason: str
+    attachment_url: str | None = None
+    status: str
+    verified_by: str | None = None
+    verified_by_name: str | None = None
+    verified_at: datetime | None = None
+    created_at: datetime
+
+
+class LeaveVerifyRequest(BaseModel):
+    """Payload for a teacher to approve or reject a parent leave request."""
+
+    decision: Literal["approved", "rejected"]
+    note: str | None = Field(default=None, max_length=500)
+
+    @field_validator("note")
+    @classmethod
+    def normalize_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+
+class LeaveVerifyResponse(BaseModel):
+    """Result of verifying a leave request and syncing matching attendance sessions."""
+
+    leave: LeaveRequestResponse
+    synced_sessions_count: int
+    wa_sent: bool
+    message: str
