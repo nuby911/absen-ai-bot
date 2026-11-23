@@ -6,13 +6,16 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import Settings, get_settings
 from app.providers.face_engine import FaceEngine, create_face_engine
+from app.providers.whatsapp import WhatsAppProvider, create_whatsapp_provider
 from app.routers.admin import router as admin_router
+from app.routers.attendance import router as attendance_router
 from app.routers.auth import router as auth_router
 
 
 def create_app(
     settings: Settings | None = None,
     face_engine: FaceEngine | None = None,
+    whatsapp_provider: WhatsAppProvider | None = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application instance."""
     cfg = settings or get_settings()
@@ -27,6 +30,11 @@ def create_app(
     app.state.settings = cfg
     app.state.face_engine = (
         face_engine if face_engine is not None else create_face_engine(cfg)
+    )
+    app.state.whatsapp_provider = (
+        whatsapp_provider
+        if whatsapp_provider is not None
+        else create_whatsapp_provider(cfg)
     )
 
     app.add_middleware(
@@ -43,6 +51,7 @@ def create_app(
 
     app.include_router(auth_router)
     app.include_router(admin_router)
+    app.include_router(attendance_router)
 
     upload_path = Path(cfg.upload_dir)
     if upload_path.exists() and upload_path.is_dir():

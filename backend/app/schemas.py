@@ -1,6 +1,7 @@
-from datetime import datetime, time
+from datetime import date, datetime, time
 import math
 import re
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -323,3 +324,159 @@ class FaceThresholdResponse(BaseModel):
     """Active cosine similarity threshold response."""
 
     threshold: float
+
+
+# ---------------------------------------------------------------------------
+# Attendance Sessions, Kiosk Scan & Manual Override Schemas (Task 4)
+# ---------------------------------------------------------------------------
+
+
+class AttendanceSessionCreate(BaseModel):
+    """Payload to open a gate or subject attendance session."""
+
+    class_id: str | None = None
+    schedule_id: str | None = None
+    session_type: Literal["gate_in", "gate_out", "subject"]
+    session_date: date | None = None
+    expected_start_time: time | None = None
+    late_tolerance_minutes: int | None = Field(default=None, ge=0, le=120)
+
+
+class SessionSummaryCounters(BaseModel):
+    """Real-time attendance status counters for a session."""
+
+    total_students: int = 0
+    present_count: int = 0
+    late_count: int = 0
+    permit_count: int = 0
+    sick_count: int = 0
+    absent_count: int = 0
+    unrecorded_count: int = 0
+    recorded_count: int = 0
+
+
+class AttendanceSessionSummary(BaseModel):
+    """Summary metadata and counters for an attendance session."""
+
+    id: str
+    class_id: str | None = None
+    class_name: str | None = None
+    teacher_id: str
+    teacher_name: str | None = None
+    schedule_id: str | None = None
+    subject_name: str | None = None
+    session_type: str
+    session_date: date
+    expected_start_time: time | None = None
+    late_tolerance_minutes: int
+    opened_at: datetime
+    closed_at: datetime | None = None
+    status: str
+    total_students: int = 0
+    present_count: int = 0
+    late_count: int = 0
+    permit_count: int = 0
+    sick_count: int = 0
+    absent_count: int = 0
+    unrecorded_count: int = 0
+    recorded_count: int = 0
+
+
+class SessionStudentAttendanceItem(BaseModel):
+    """Per-student real-time attendance status within a session."""
+
+    student_id: str
+    nis: str
+    student_name: str
+    class_id: str
+    class_name: str
+    parent_phone_wa: str
+    attendance_id: str | None = None
+    status: str
+    verification_method: str | None = None
+    scanned_at: datetime | None = None
+    similarity_score: float | None = None
+    wa_status: str | None = None
+    wa_notified_at: datetime | None = None
+
+
+class AttendanceSessionDetailResponse(AttendanceSessionSummary):
+    """Full attendance session detail with summary counters and student statuses."""
+
+    summary: SessionSummaryCounters
+    students: list[SessionStudentAttendanceItem]
+
+
+class TeacherDashboardStats(BaseModel):
+    """Aggregated teacher dashboard statistics for today."""
+
+    present_rate: float
+    present_count: int
+    late_count: int
+    pending_leaves_count: int
+
+
+class TeacherDashboardResponse(BaseModel):
+    """Teacher mobile home dashboard payload."""
+
+    teacher_name: str
+    today_date: date
+    stats: TeacherDashboardStats
+    sessions: list[AttendanceSessionSummary]
+    today_schedules: list[ScheduleResponse]
+
+
+class AttendanceScanResponse(BaseModel):
+    """Structured response returned to the Kiosk scanner after face recognition."""
+
+    matched: bool
+    already_recorded: bool
+    attendance_id: str | None = None
+    student_id: str | None = None
+    student_name: str | None = None
+    nis: str | None = None
+    class_name: str | None = None
+    status: str | None = None
+    scanned_at: datetime | None = None
+    similarity_score: float
+    threshold_used: float
+    wa_status: str | None = None
+    wa_queued: bool
+    message: str
+
+
+class ManualAttendanceRequest(BaseModel):
+    """Teacher PIN-verified manual attendance override request."""
+
+    session_id: str = Field(..., min_length=1)
+    student_id: str = Field(..., min_length=1)
+    status: Literal["present", "late", "permit", "sick", "absent"]
+    kiosk_pin: str = Field(..., min_length=1)
+    notify_wa: bool = True
+
+
+class ManualAttendanceResponse(BaseModel):
+    """Result of manual teacher attendance entry."""
+
+    attendance_id: str
+    session_id: str
+    student_id: str
+    student_name: str
+    nis: str
+    class_name: str
+    status: str
+    verification_method: str
+    scanned_at: datetime | None = None
+    wa_status: str
+    wa_notified_at: datetime | None = None
+    message: str
+
+
+class ResendWaResponse(BaseModel):
+    """Result of retrying a parent WhatsApp attendance notification."""
+
+    attendance_id: str
+    wa_status: str
+    wa_sent: bool
+    wa_notified_at: datetime | None = None
+    message: str

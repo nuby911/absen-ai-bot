@@ -10,6 +10,7 @@ from app.config import Settings, get_settings
 from app.database import Base, create_engine_and_session, get_db
 from app.main import create_app
 from app.models import User
+from app.providers.whatsapp import MockWhatsAppProvider
 from app.security import create_access_token, hash_secret
 
 
@@ -40,12 +41,19 @@ async def db_session() -> AsyncGenerator[AsyncSession, None]:
 
 
 @pytest.fixture
+def mock_wa() -> MockWhatsAppProvider:
+    """Provide an isolated in-memory MockWhatsAppProvider shared with the test client."""
+    return MockWhatsAppProvider()
+
+
+@pytest.fixture
 async def client(
     db_session: AsyncSession,
     test_settings: Settings,
+    mock_wa: MockWhatsAppProvider,
 ) -> AsyncGenerator[httpx.AsyncClient, None]:
     """Provide an async HTTP test client wired to the isolated DB and test settings."""
-    app = create_app(settings=test_settings)
+    app = create_app(settings=test_settings, whatsapp_provider=mock_wa)
 
     async def _override_get_db() -> AsyncGenerator[AsyncSession, None]:
         yield db_session
