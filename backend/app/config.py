@@ -3,6 +3,15 @@ from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+DEFAULT_JWT_SECRET = "smart-school-attendance-dev-secret-key-2026"
+KNOWN_DEFAULT_JWT_SECRETS = frozenset(
+    {
+        DEFAULT_JWT_SECRET,
+        "smart-school-attendance-dev-secret-key-change-in-production",
+    }
+)
+
+
 class Settings(BaseSettings):
     """Application configuration loaded from environment variables."""
 
@@ -13,7 +22,7 @@ class Settings(BaseSettings):
     )
 
     database_url: str = "sqlite+aiosqlite:///./smart_school.db"
-    jwt_secret: str = "smart-school-attendance-dev-secret-key-2026"
+    jwt_secret: str = DEFAULT_JWT_SECRET
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 480
 
@@ -24,6 +33,7 @@ class Settings(BaseSettings):
     waha_base_url: str = "http://localhost:3000"
     waha_api_key: str = ""
     waha_session: str = "default"
+    waha_webhook_secret: str = ""
 
     llm_provider_mode: str = "fallback"
     gemini_api_key: str = ""

@@ -1,3 +1,4 @@
+import asyncio
 import csv
 from datetime import date, datetime, timedelta, timezone
 import io
@@ -55,6 +56,7 @@ from app.schemas import (
     StudentCreate,
     StudentResponse,
     StudentUpdate,
+    UserResponse,
 )
 from app.security import get_current_user, require_admin
 
@@ -67,9 +69,11 @@ MIN_FACE_QUALITY_SCORE = 0.5
 MAX_FACE_IMAGE_BYTES = 10 * 1024 * 1024
 
 _VERIFICATION_METHOD_LABELS_ID: dict[str, str] = {
-    "face_recognition": "Pengenalan Wajah",
-    "manual_teacher": "Manual Guru",
-    "chatbot_leave": "Chatbot Izin",
+    "face_kiosk": "Scan Wajah Kiosk",
+    "manual_teacher": "Input Manual Guru",
+    "leave_approved": "Izin Disetujui Guru",
+    "face_recognition": "Scan Wajah Kiosk",
+    "chatbot_leave": "Izin Disetujui Guru",
 }
 
 _WA_STATUS_LABELS_ID: dict[str, str] = {
@@ -307,6 +311,25 @@ def _to_face_response(face: FaceEmbedding) -> FaceEmbeddingResponse:
         embedding_dim=len(face.embedding),
         created_at=face.created_at,
     )
+
+
+# ---------------------------------------------------------------------------
+# Teachers Listing
+# ---------------------------------------------------------------------------
+
+
+@router.get("/teachers", response_model=list[UserResponse])
+async def list_teachers(
+    _: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> list[UserResponse]:
+    """List all staff users with role 'teacher' ordered alphabetically by name."""
+    teachers = (
+        await db.scalars(
+            select(User).where(User.role == "teacher").order_by(User.name)
+        )
+    ).all()
+    return [UserResponse.from_user(teacher) for teacher in teachers]
 
 
 # ---------------------------------------------------------------------------
@@ -776,7 +799,7 @@ async def register_student_face(
         )
 
     try:
-        result = face_engine.extract_single_face(image_bytes)
+        result = await asyncio.to_thread(face_engine.extract_single_face, image_bytes)
     except FaceValidationError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,

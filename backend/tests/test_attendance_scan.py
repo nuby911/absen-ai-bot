@@ -588,6 +588,108 @@ async def test_manual_attendance_requires_valid_pin_and_close_session_marks_abse
     )
     assert reclose_res.status_code == 400
 
+    # 6. Manual attendance on closed session -> 400 with Indonesian error message
+    closed_manual = await client.post(
+        "/api/v1/attendance/manual",
+        headers=teacher_headers,
+        json={
+            "session_id": session_id,
+            "student_id": student_b.id,
+            "status": "present",
+            "kiosk_pin": "1234",
+            "notify_wa": False,
+        },
+    )
+    assert closed_manual.status_code == 400
+    assert "ditutup" in closed_manual.json()["detail"].lower()
+
+
+def test_resolve_scan_status_compares_against_session_date() -> None:
+    """_resolve_scan_status must anchor the deadline on session_date, not scan_wib.date()."""
+    from app.routers.attendance import _resolve_scan_status
+
+    # Session opened on 2026-11-22 at 07:30 WIB (+15 min tolerance -> deadline 07:45 WIB)
+    session_date = date(2026, 11, 22)
+    expected_start = time(7, 30)
+
+    # Scan on-time on 2026-11-22 07:45 WIB (00:45 UTC) -> present
+    assert (
+        _resolve_scan_status(
+            session_date,
+            expected_start,
+            15,
+            datetime(2026, 11, 22, 0, 45, tzinfo=timezone.utc),
+        )
+        == "present"
+    )
+    # Scan late on 2026-11-22 07:46 WIB (00:46 UTC) -> late
+    assert (
+        _resolve_scan_status(
+            session_date,
+            expected_start,
+            15,
+            datetime(2026, 11, 22, 0, 46, tzinfo=timezone.utc),
+        )
+        == "late"
+    )
+    # Scan next morning 2026-11-23 07:00 WIB (00:00 UTC) must STILL be late vs 2026-11-22!
+    assert (
+        _resolve_scan_status(
+            session_date,
+            expected_start,
+            15,
+            datetime(2026, 11, 23, 0, 0, tzinfo=timezone.utc),
+        )
+        == "late"
+    )
+
+
+async def test_dispatch_attendance_wa_survives_commit_rollback_without_expired_orm_reads(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    teacher_headers: dict[str, str],
+    mock_wa: MockWhatsAppProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If DB commit fails inside _dispatch_attendance_wa, callers must not raise MissingGreenlet."""
+    seeded = await _seed_classroom_with_faces(db_session)
+    class_a: SchoolClass = seeded["class_a"]  # type: ignore[assignment]
+    png_a: bytes = seeded["png_a"]  # type: ignore[assignment]
+
+    open_res = await client.post(
+        "/api/v1/sessions",
+        headers=teacher_headers,
+        json={"class_id": class_a.id, "session_type": "subject"},
+    )
+    assert open_res.status_code == 201
+    session_id = open_res.json()["id"]
+
+    # First commit inside scan_kiosk_face saves attendance; second commit inside _dispatch_attendance_wa fails
+    original_commit = db_session.commit
+    commit_calls = 0
+
+    async def _flaky_commit() -> None:
+        nonlocal commit_calls
+        commit_calls += 1
+        if commit_calls == 2:
+            raise RuntimeError("Simulated DB commit failure on wa_status update")
+        await original_commit()
+
+    monkeypatch.setattr(db_session, "commit", _flaky_commit)
+
+    scan_res = await client.post(
+        "/api/v1/attendance/scan",
+        headers=teacher_headers,
+        data={"session_id": session_id, "liveness_passed": "true"},
+        files={"file": ("a.png", png_a, "image/png")},
+    )
+    assert scan_res.status_code == 200
+    body = scan_res.json()
+    assert body["matched"] is True
+    assert body["student_name"] == "Rubby Pratama"
+    assert body["wa_status"] == "sent"
+    assert len(mock_wa.sent) == 1
+
 
 async def test_teacher_dashboard_returns_today_sessions_and_stats(
     client: httpx.AsyncClient,

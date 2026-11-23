@@ -79,7 +79,16 @@ def _decode_rgb_image(image_bytes: bytes, min_resolution: int = 64) -> Image.Ima
         with Image.open(BytesIO(image_bytes)) as loaded:
             loaded.load()
             rgb = loaded.convert("RGB")
-    except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
+    except Image.DecompressionBombError as exc:
+        raise FaceValidationError(
+            "Ukuran piksel gambar wajah terlalu besar dan ditolak demi keamanan."
+        ) from exc
+    except (
+        UnidentifiedImageError,
+        OSError,
+        SyntaxError,
+        ValueError,
+    ) as exc:
         raise FaceValidationError(
             "File yang diunggah bukan gambar yang valid atau file rusak."
         ) from exc

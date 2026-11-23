@@ -50,6 +50,14 @@ _default_engine: AsyncEngine | None = None
 _default_session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
+def get_default_engine() -> AsyncEngine:
+    """Lazily initialize and return the default async SQLAlchemy engine."""
+    get_default_session_factory()
+    if _default_engine is None:
+        raise RuntimeError("Default async database engine gagal diinisialisasi.")
+    return _default_engine
+
+
 def get_default_session_factory() -> async_sessionmaker[AsyncSession]:
     """Lazily initialize and return the default async session factory."""
     global _default_engine, _default_session_factory
@@ -59,6 +67,15 @@ def get_default_session_factory() -> async_sessionmaker[AsyncSession]:
             settings.database_url
         )
     return _default_session_factory
+
+
+async def dispose_default_engine() -> None:
+    """Dispose and reset the cached default async engine on application shutdown."""
+    global _default_engine, _default_session_factory
+    if _default_engine is not None:
+        await _default_engine.dispose()
+        _default_engine = None
+        _default_session_factory = None
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

@@ -1,4 +1,5 @@
 from io import BytesIO
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -6,11 +7,11 @@ import httpx
 import numpy as np
 from PIL import Image
 import pytest
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import Settings, get_settings
-from app.database import get_db
+from app.config import DEFAULT_JWT_SECRET, Settings, get_settings
+from app.database import create_engine_and_session, get_db
 from app.main import create_app
 from app.models import FaceEmbedding, Parent, SchoolClass, Student, User
 from app.providers.face_engine import (
@@ -22,6 +23,7 @@ from app.providers.face_engine import (
     create_face_engine,
 )
 from app.routers.admin import get_active_face_threshold
+from app.security import hash_secret
 
 
 def _make_textured_png(seed: int = 1, size: tuple[int, int] = (128, 128)) -> bytes:
@@ -589,3 +591,150 @@ async def test_uploads_static_mount_serves_registered_face(
         assert static_res.content == img_bytes
     finally:
         await local_client.aclose()
+
+
+async def test_decompression_bomb_error_converted_to_validation_error_and_422(
+    db_session: AsyncSession,
+    admin_headers: dict[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DecompressionBombError from Pillow must raise FaceValidationError -> HTTP 422."""
+    school_class = SchoolClass(name="XI IPA 3")
+    parent = Parent(name="Bapak Bomb", phone_wa="6281299990001")
+    db_session.add_all([school_class, parent])
+    await db_session.flush()
+
+    student = Student(
+        nis="2026401",
+        name="Uji Bom Piksel",
+        class_id=school_class.id,
+        parent_id=parent.id,
+    )
+    db_session.add(student)
+    await db_session.commit()
+
+    sample_png = _make_textured_png(seed=42, size=(128, 128))
+    # 128 * 128 = 16,384 pixels > 2 * 100 triggers Pillow's DecompressionBombError directly
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 100)
+
+    engine = DeterministicFaceEngine()
+    with pytest.raises(FaceValidationError):
+        engine.extract_single_face(sample_png)
+
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///:memory:",
+        jwt_secret="test-jwt-secret-key-for-smart-school-2026",
+        face_engine_mode="deterministic",
+        upload_dir=str(tmp_path / "uploads_bomb"),
+    )
+    _, local_client = _make_app_client(db_session, settings, face_engine=engine)
+    try:
+        res = await local_client.post(
+            f"/api/v1/students/{student.id}/faces",
+            headers=admin_headers,
+            files={"file": ("bomb.png", sample_png, "image/png")},
+        )
+        assert res.status_code == 422
+    finally:
+        await local_client.aclose()
+
+
+async def test_list_teachers_endpoint_admin_only_and_ordered(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    seeded_admin: User,
+    seeded_teacher: User,
+    admin_headers: dict[str, str],
+    teacher_headers: dict[str, str],
+) -> None:
+    """GET /api/v1/teachers returns only teachers sorted alphabetically for admins."""
+    extra_teacher = User(
+        name="Ani Kartika",
+        email="ani@sekolah.sch.id",
+        password_hash=hash_secret("guru123"),
+        role="teacher",
+        nip="198501012010012001",
+        kiosk_pin_hash=hash_secret("1234"),
+    )
+    db_session.add(extra_teacher)
+    await db_session.commit()
+
+    unauth = await client.get("/api/v1/teachers")
+    assert unauth.status_code == 401
+
+    forbidden = await client.get("/api/v1/teachers", headers=teacher_headers)
+    assert forbidden.status_code == 403
+
+    res = await client.get("/api/v1/teachers", headers=admin_headers)
+    assert res.status_code == 200
+    teachers = res.json()
+    assert [t["name"] for t in teachers] == ["Ani Kartika", seeded_teacher.name]
+    assert all(t["role"] == "teacher" for t in teachers)
+    assert all(t["id"] != seeded_admin.id for t in teachers)
+    assert teachers[0]["has_kiosk_pin"] is True
+    assert teachers[1]["has_kiosk_pin"] is False
+
+
+async def test_fresh_startup_creates_uploads_tables_cors_and_warns_default_jwt(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Fresh app startup creates upload dir + DB tables, disables CORS credentials, and warns on default JWT."""
+    fresh_uploads = tmp_path / "nested" / "uploads"
+    fresh_db_path = tmp_path / "fresh_startup.db"
+    assert not fresh_uploads.exists()
+
+    default_jwt_settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{fresh_db_path.as_posix()}",
+        jwt_secret=DEFAULT_JWT_SECRET,
+        face_engine_mode="deterministic",
+        whatsapp_provider_mode="mock",
+        llm_provider_mode="fallback",
+        upload_dir=str(fresh_uploads),
+    )
+    app_default = create_app(settings=default_jwt_settings)
+    assert fresh_uploads.exists() and fresh_uploads.is_dir()
+
+    with caplog.at_level(logging.WARNING, logger="app.main"):
+        async with app_default.router.lifespan_context(app_default):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app_default),
+                base_url="http://test",
+            ) as async_client:
+                cors_res = await async_client.get(
+                    "/health",
+                    headers={"Origin": "http://localhost:3001"},
+                )
+                assert cors_res.status_code == 200
+                assert cors_res.headers.get("access-control-allow-origin") == "*"
+                assert cors_res.headers.get("access-control-allow-credentials") is None
+
+    assert any("JWT_SECRET" in record.message for record in caplog.records)
+
+    # Verify tables were created by lifespan on the fresh SQLite DB file
+    engine, _ = create_engine_and_session(default_jwt_settings.database_url)
+    try:
+        async with engine.connect() as conn:
+            table_names = set(
+                await conn.run_sync(lambda sync_conn: inspect(sync_conn).get_table_names())
+            )
+    finally:
+        await engine.dispose()
+    assert {"users", "classes", "students", "attendances", "leave_requests"}.issubset(table_names)
+
+    # Custom strong JWT secret must NOT trigger default-secret warning
+    caplog.clear()
+    custom_jwt_settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{fresh_db_path.as_posix()}",
+        jwt_secret="super-strong-production-secret-key-2026-xyz",
+        face_engine_mode="deterministic",
+        whatsapp_provider_mode="mock",
+        llm_provider_mode="fallback",
+        upload_dir=str(fresh_uploads),
+    )
+    app_custom = create_app(settings=custom_jwt_settings)
+    with caplog.at_level(logging.WARNING, logger="app.main"):
+        async with app_custom.router.lifespan_context(app_custom):
+            pass
+    assert not any("JWT_SECRET" in record.message for record in caplog.records)

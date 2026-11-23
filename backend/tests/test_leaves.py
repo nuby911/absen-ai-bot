@@ -495,3 +495,53 @@ async def test_approve_leave_survives_wa_failure(
     assert att_after.status == "permit"
     assert att_after.verification_method == "leave_approved"
     assert att_after.wa_status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_verify_leave_atomic_update_blocks_concurrent_race(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    seeded_teacher: User,
+    teacher_headers: dict[str, str],
+    mock_wa: MockWhatsAppProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Atomic UPDATE WHERE status='pending' rejects a concurrent double-verification race with 400."""
+    data = await _seed_leave_fixtures(db_session)
+    parent_a: Parent = data["parent_a"]  # type: ignore[assignment]
+    student_a: Student = data["student_a"]  # type: ignore[assignment]
+
+    leave = LeaveRequest(
+        student_id=student_a.id,
+        parent_id=parent_a.id,
+        request_type="sick",
+        start_date=date(2026, 11, 24),
+        end_date=date(2026, 11, 24),
+        reason="Demam.",
+        status="pending",
+    )
+    db_session.add(leave)
+    await db_session.commit()
+    leave_id = leave.id
+
+    original_execute = db_session.execute
+
+    class _ZeroRowcountResult:
+        rowcount = 0
+
+    async def _race_execute(statement, *args, **kwargs):
+        # Let the initial SELECT see status='pending', then simulate a rival worker winning the UPDATE
+        if getattr(statement, "is_update", False):
+            return _ZeroRowcountResult()
+        return await original_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db_session, "execute", _race_execute)
+
+    res = await client.patch(
+        f"/api/v1/leave-requests/{leave_id}/verify",
+        json={"decision": "approved"},
+        headers=teacher_headers,
+    )
+    assert res.status_code == 400
+    assert res.json()["detail"] == "Pengajuan izin ini sudah diverifikasi sebelumnya."
+    assert len(mock_wa.sent) == 0

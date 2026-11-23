@@ -896,3 +896,156 @@ async def test_status_questions_with_sick_or_leave_keywords_do_not_create_leave(
     assert leaves_after[0].request_type == "sick"
     assert leaves_after[0].status == "pending"
     assert len(mock_wa.sent) == 5
+
+
+@pytest.mark.asyncio
+async def test_webhook_media_only_payload_returns_200_and_creates_leave(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    seeded_teacher: User,
+    mock_wa: MockWhatsAppProvider,
+) -> None:
+    """Media-only payloads (no message_text) must return 200 without AssertionError."""
+    data = await _seed_two_families(db_session, seeded_teacher)
+    parent_a: Parent = data["parent_a"]
+    student_a: Student = data["student_a"]
+    parent_a_phone = parent_a.phone_wa
+    student_a_id = student_a.id
+
+    # Standard format: phone_wa + media_url, message_text omitted
+    res_std = await client.post(
+        "/api/v1/webhook/whatsapp",
+        json={
+            "phone_wa": parent_a_phone,
+            "media_url": "/uploads/leaves/surat-izin-1.jpg",
+        },
+    )
+    assert res_std.status_code == 200
+    body_std = res_std.json()
+    assert body_std["ignored"] is False
+    assert body_std["wa_sent"] is True
+    assert body_std["tool_called"] == "submit_leave_request"
+
+    # WAHA format: body empty + mediaUrl present
+    res_waha = await client.post(
+        "/api/v1/webhook/whatsapp",
+        json={
+            "event": "message",
+            "payload": {
+                "from": f"{parent_a_phone}@c.us",
+                "body": "",
+                "mediaUrl": "https://cdn.sekolah.sch.id/leaves/surat-dokter-2.jpg",
+                "fromMe": False,
+            },
+        },
+    )
+    assert res_waha.status_code == 200
+    assert res_waha.json()["tool_called"] == "submit_leave_request"
+
+    db_session.expire_all()
+    leaves = (
+        await db_session.scalars(
+            select(LeaveRequest)
+            .where(LeaveRequest.student_id == student_a_id)
+            .order_by(LeaveRequest.created_at.asc())
+        )
+    ).all()
+    assert len(leaves) == 2
+    assert {lr.attachment_url for lr in leaves} == {
+        "/uploads/leaves/surat-izin-1.jpg",
+        "https://cdn.sekolah.sch.id/leaves/surat-dokter-2.jpg",
+    }
+
+
+@pytest.mark.asyncio
+async def test_webhook_secret_enforcement_and_attachment_url_sanitization(
+    db_session: AsyncSession,
+    test_settings: Settings,
+    seeded_teacher: User,
+    mock_wa: MockWhatsAppProvider,
+) -> None:
+    """Webhook rejects missing/wrong X-Webhook-Secret with 401 and drops unsafe attachment URLs."""
+    data = await _seed_two_families(db_session, seeded_teacher)
+    parent_a: Parent = data["parent_a"]
+    student_a: Student = data["student_a"]
+    parent_a_phone = parent_a.phone_wa
+    student_a_id = student_a.id
+
+    secured_settings = test_settings.model_copy(
+        update={"waha_webhook_secret": "rahasia-waha-2026"}
+    )
+    app = create_app(settings=secured_settings, whatsapp_provider=mock_wa)
+
+    async def _override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_get_db
+    app.dependency_overrides[get_settings] = lambda: secured_settings
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
+        # Missing secret header -> 401
+        no_header = await async_client.post(
+            "/api/v1/webhook/whatsapp",
+            json={"phone_wa": parent_a_phone, "message_text": "Apakah anak saya hadir hari ini?"},
+        )
+        assert no_header.status_code == 401
+
+        # Wrong secret header -> 401
+        wrong_header = await async_client.post(
+            "/api/v1/webhook/whatsapp",
+            headers={"X-Webhook-Secret": "salah-secret"},
+            json={"phone_wa": parent_a_phone, "message_text": "Apakah anak saya hadir hari ini?"},
+        )
+        assert wrong_header.status_code == 401
+
+        # Valid secret + unsafe javascript: media_url -> 200 but unsafe URL dropped (stored as None)
+        unsafe_res = await async_client.post(
+            "/api/v1/webhook/whatsapp",
+            headers={"X-Webhook-Secret": "rahasia-waha-2026"},
+            json={
+                "phone_wa": parent_a_phone,
+                "message_text": "Mohon izin hari ini Rubby sakit demam",
+                "media_url": "javascript:alert(1)",
+            },
+        )
+        assert unsafe_res.status_code == 200
+        assert unsafe_res.json()["tool_called"] == "submit_leave_request"
+
+        # Path traversal /uploads/../secret.txt also dropped
+        traversal_res = await async_client.post(
+            "/api/v1/webhook/whatsapp",
+            headers={"X-Webhook-Secret": "rahasia-waha-2026"},
+            json={
+                "phone_wa": parent_a_phone,
+                "message_text": "Mohon izin hari ini Rubby acara keluarga",
+                "media_url": "/uploads/../etc/passwd",
+            },
+        )
+        assert traversal_res.status_code == 200
+        assert traversal_res.json()["tool_called"] == "submit_leave_request"
+
+        # Safe https:// URL preserved
+        safe_res = await async_client.post(
+            "/api/v1/webhook/whatsapp",
+            headers={"X-Webhook-Secret": "rahasia-waha-2026"},
+            json={
+                "phone_wa": parent_a_phone,
+                "message_text": "Mohon izin hari ini Rubby sakit flu",
+                "media_url": "https://files.sekolah.sch.id/surat-flu.jpg",
+            },
+        )
+        assert safe_res.status_code == 200
+        assert safe_res.json()["tool_called"] == "submit_leave_request"
+
+    db_session.expire_all()
+    leaves = (
+        await db_session.scalars(
+            select(LeaveRequest).where(LeaveRequest.student_id == student_a_id)
+        )
+    ).all()
+    assert len(leaves) == 3
+    stored_urls = [lr.attachment_url for lr in leaves]
+    assert stored_urls.count(None) == 2
+    assert "https://files.sekolah.sch.id/surat-flu.jpg" in stored_urls
+    assert all(url is None or not url.startswith("javascript:") for url in stored_urls)

@@ -1,8 +1,10 @@
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta, timezone
 import logging
+from pathlib import PurePosixPath
 import time as time_perf
 from typing import Any
+from urllib.parse import urlsplit
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -110,6 +112,36 @@ def _parse_optional_int(value: Any) -> int | None:
         return None
 
 
+def _sanitize_attachment_url(raw_url: str | None) -> str | None:
+    """Allow only http(s) URLs or normalized local `/uploads/...` paths without traversal."""
+    if raw_url is None:
+        return None
+    cleaned = str(raw_url).strip()
+    if not cleaned:
+        return None
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in cleaned):
+        return None
+    if "\\" in cleaned or any(ch.isspace() for ch in cleaned):
+        return None
+
+    parsed = urlsplit(cleaned)
+    scheme = parsed.scheme.lower()
+    if scheme:
+        if scheme in {"http", "https"} and parsed.netloc:
+            return cleaned
+        return None
+
+    if parsed.netloc:
+        return None
+    if not parsed.path.startswith("/uploads/"):
+        return None
+
+    posix_parts = PurePosixPath(parsed.path).parts
+    if ".." in posix_parts or len(posix_parts) < 3 or posix_parts[:2] != ("/", "uploads"):
+        return None
+    return cleaned
+
+
 def _parse_leave_date(raw: str | None, default_date: date) -> date:
     if raw is None or not str(raw).strip():
         return default_date
@@ -200,11 +232,11 @@ class KeywordFallbackEngine:
 
     async def handle(
         self,
-        message_text: str,
+        message_text: str | None,
         tool_executor: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]],
     ) -> LLMResult:
         """Handle quick menu choices `1`..`4` or present the fallback menu."""
-        cmd = message_text.strip().lower()
+        cmd = (message_text or "").strip().lower()
 
         if cmd in {"1", "menu 1", "status hari ini"}:
             data = await tool_executor("get_today_attendance", {})
@@ -538,11 +570,21 @@ class ChatbotOrchestrator:
                     "error": "Alasan pengajuan izin atau sakit wajib diisi.",
                 }
 
-            resolved_attachment = (
+            explicit_attachment = (
                 str(attachment_url).strip()
                 if attachment_url is not None and str(attachment_url).strip()
-                else (default_media_url.strip() if default_media_url else None)
+                else None
             )
+            if explicit_attachment is not None:
+                resolved_attachment = _sanitize_attachment_url(explicit_attachment)
+                if resolved_attachment is None:
+                    logger.warning(
+                        "URL lampiran izin tidak valid diabaikan untuk siswa %s: %s",
+                        student.id,
+                        explicit_attachment,
+                    )
+            else:
+                resolved_attachment = _sanitize_attachment_url(default_media_url)
 
             student_name = student.name
             student_id_val = student.id
@@ -608,14 +650,22 @@ class ChatbotOrchestrator:
         self,
         db: AsyncSession,
         phone_wa_raw: str,
-        message_text: str,
+        message_text: str | None = None,
         media_url: str | None = None,
     ) -> WhatsAppWebhookResponse:
         """Normalize sender phone, execute parent-isolated chatbot flow, log, and reply WA."""
         started_at = time_perf.perf_counter()
         normalized_phone = normalize_wa_phone(phone_wa_raw)
-        cleaned_message = message_text.strip()
-        if not cleaned_message and media_url:
+        sanitized_media_url = _sanitize_attachment_url(media_url)
+        if media_url is not None and str(media_url).strip() and sanitized_media_url is None:
+            logger.warning(
+                "URL media webhook tidak valid diabaikan dari %s: %s",
+                normalized_phone,
+                media_url,
+            )
+
+        cleaned_message = (message_text or "").strip()
+        if not cleaned_message and sanitized_media_url:
             cleaned_message = "Lampiran surat izin"
 
         parent = await db.scalar(select(Parent).where(Parent.phone_wa == normalized_phone))
@@ -668,7 +718,7 @@ class ChatbotOrchestrator:
             "parent_name": parent_name,
             "today": today_wib.isoformat(),
             "today_day_of_week": today_wib.isoweekday(),
-            "media_url": media_url,
+            "media_url": sanitized_media_url,
             "students": [
                 {
                     "id": stu.id,
@@ -683,7 +733,7 @@ class ChatbotOrchestrator:
         tool_executor = self._build_tool_executor(
             db=db,
             parent_id=parent_id,
-            default_media_url=media_url,
+            default_media_url=sanitized_media_url,
         )
 
         is_fallback = False

@@ -321,13 +321,25 @@ async def test_attendance_csv_export_headers_and_rows(
     db_session.add_all([school_class, parent])
     await db_session.flush()
 
-    student = Student(
+    student_1 = Student(
         nis="24781025",
         name="Rubby Ibnu Anantara",
         class_id=school_class.id,
         parent_id=parent.id,
     )
-    db_session.add(student)
+    student_2 = Student(
+        nis="24781026",
+        name="Siti Nurhaliza",
+        class_id=school_class.id,
+        parent_id=parent.id,
+    )
+    student_3 = Student(
+        nis="24781027",
+        name="Taufik Hidayat",
+        class_id=school_class.id,
+        parent_id=parent.id,
+    )
+    db_session.add_all([student_1, student_2, student_3])
     await db_session.flush()
 
     target_date = date(2026, 11, 23)
@@ -343,16 +355,36 @@ async def test_attendance_csv_export_headers_and_rows(
     db_session.add(session_row)
     await db_session.flush()
 
-    db_session.add(
-        Attendance(
-            session_id=session_row.id,
-            student_id=student.id,
-            status="present",
-            verification_method="face_recognition",
-            scanned_at=datetime(2026, 11, 23, 0, 25, tzinfo=timezone.utc),
-            similarity_score=0.91,
-            wa_status="sent",
-        )
+    db_session.add_all(
+        [
+            Attendance(
+                session_id=session_row.id,
+                student_id=student_1.id,
+                status="present",
+                verification_method="face_kiosk",
+                scanned_at=datetime(2026, 11, 23, 0, 25, tzinfo=timezone.utc),
+                similarity_score=0.91,
+                wa_status="sent",
+            ),
+            Attendance(
+                session_id=session_row.id,
+                student_id=student_2.id,
+                status="late",
+                verification_method="manual_teacher",
+                scanned_at=datetime(2026, 11, 23, 0, 50, tzinfo=timezone.utc),
+                similarity_score=None,
+                wa_status="sent",
+            ),
+            Attendance(
+                session_id=session_row.id,
+                student_id=student_3.id,
+                status="sick",
+                verification_method="leave_approved",
+                scanned_at=None,
+                similarity_score=None,
+                wa_status="sent",
+            ),
+        ]
     )
     await db_session.commit()
 
@@ -381,13 +413,20 @@ async def test_attendance_csv_export_headers_and_rows(
         "Waktu Scan",
         "Status WA",
     ]
-    assert len(rows) == 2
-    assert rows[1][0] == "2026-11-23"
-    assert rows[1][1] == "XI IPA 1"
-    assert rows[1][2] == "24781025"
-    assert rows[1][3] == "Rubby Ibnu Anantara"
-    assert rows[1][4] == "Hadir"
-    assert "07:25" in rows[1][6]
+    assert len(rows) == 4
+    rows_by_nis = {row[2]: row for row in rows[1:]}
+    assert rows_by_nis["24781025"][0] == "2026-11-23"
+    assert rows_by_nis["24781025"][1] == "XI IPA 1"
+    assert rows_by_nis["24781025"][3] == "Rubby Ibnu Anantara"
+    assert rows_by_nis["24781025"][4] == "Hadir"
+    assert rows_by_nis["24781025"][5] == "Scan Wajah Kiosk"
+    assert "07:25" in rows_by_nis["24781025"][6]
+
+    assert rows_by_nis["24781026"][4] == "Terlambat"
+    assert rows_by_nis["24781026"][5] == "Input Manual Guru"
+
+    assert rows_by_nis["24781027"][4] == "Sakit"
+    assert rows_by_nis["24781027"][5] == "Izin Disetujui Guru"
 
 
 async def test_seed_demo_data_is_idempotent(db_session: AsyncSession):
@@ -434,3 +473,8 @@ async def test_seed_demo_data_is_idempotent(db_session: AsyncSession):
     )
     assert sari is not None
     assert sari.role == "teacher"
+
+    seeded_methods = set(
+        (await db_session.scalars(select(Attendance.verification_method))).all()
+    )
+    assert seeded_methods == {"face_kiosk"}

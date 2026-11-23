@@ -211,27 +211,69 @@ async def verify_leave_request(
     teacher_id = current_user.id
     teacher_name = current_user.name
     leave_id_val = leave_req.id
-    parent_phone_wa = parent.phone_wa
+    leave_req_type = leave_req.request_type
+    leave_start_date = leave_req.start_date
+    leave_end_date = leave_req.end_date
+    leave_reason = leave_req.reason
+    leave_attachment_url = leave_req.attachment_url
+    leave_created_at = leave_req.created_at
+    student_id_val = student.id
     student_name = student.name
+    student_nis = student.nis
+    class_id_val = school_class.id
+    class_name = school_class.name
+    parent_id_val = parent.id
+    parent_name = parent.name
+    parent_phone_wa = parent.phone_wa
 
-    leave_req.status = payload.decision
-    leave_req.verified_by = teacher_id
-    leave_req.verified_at = now_utc
+    update_result = await db.execute(
+        update(LeaveRequest)
+        .where(
+            LeaveRequest.id == leave_id_val,
+            LeaveRequest.status == "pending",
+        )
+        .values(
+            status=payload.decision,
+            verified_by=teacher_id,
+            verified_at=now_utc,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if update_result.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Pengajuan izin ini sudah diverifikasi sebelumnya.",
+        )
 
-    leave_response = _to_leave_response(
-        leave_req=leave_req,
-        student=student,
-        school_class=school_class,
-        parent=parent,
+    leave_response = LeaveRequestResponse(
+        id=leave_id_val,
+        student_id=student_id_val,
+        student_name=student_name,
+        student_nis=student_nis,
+        class_id=class_id_val,
+        class_name=class_name,
+        parent_id=parent_id_val,
+        parent_name=parent_name,
+        parent_phone_wa=parent_phone_wa,
+        request_type=leave_req_type,
+        start_date=leave_start_date,
+        end_date=leave_end_date,
+        reason=leave_reason,
+        attachment_url=leave_attachment_url,
+        status=payload.decision,
+        verified_by=teacher_id,
         verified_by_name=teacher_name,
+        verified_at=now_utc,
+        created_at=leave_created_at,
     )
     wa_text = _build_leave_wa_message(
         decision=payload.decision,
-        request_type=leave_req.request_type,
+        request_type=leave_req_type,
         student_name=student_name,
-        class_name=school_class.name,
-        start_date=leave_req.start_date,
-        end_date=leave_req.end_date,
+        class_name=class_name,
+        start_date=leave_start_date,
+        end_date=leave_end_date,
         teacher_name=teacher_name,
         note=payload.note,
     )
@@ -241,10 +283,10 @@ async def verify_leave_request(
         matching_sessions = (
             await db.scalars(
                 select(AttendanceSession).where(
-                    AttendanceSession.session_date >= leave_req.start_date,
-                    AttendanceSession.session_date <= leave_req.end_date,
+                    AttendanceSession.session_date >= leave_start_date,
+                    AttendanceSession.session_date <= leave_end_date,
                     or_(
-                        AttendanceSession.class_id == student.class_id,
+                        AttendanceSession.class_id == class_id_val,
                         AttendanceSession.class_id.is_(None),
                     ),
                 )
@@ -257,7 +299,7 @@ async def verify_leave_request(
                 await db.scalars(
                     select(Attendance).where(
                         Attendance.session_id.in_(session_ids),
-                        Attendance.student_id == student.id,
+                        Attendance.student_id == student_id_val,
                     )
                 )
             ).all()
@@ -266,15 +308,15 @@ async def verify_leave_request(
             for sess in matching_sessions:
                 existing_att = existing_by_session.get(sess.id)
                 if existing_att is not None:
-                    existing_att.status = leave_req.request_type
+                    existing_att.status = leave_req_type
                     existing_att.verification_method = "leave_approved"
                     existing_att.wa_status = "pending"
                     synced_attendances.append(existing_att)
                 else:
                     new_att = Attendance(
                         session_id=sess.id,
-                        student_id=student.id,
-                        status=leave_req.request_type,
+                        student_id=student_id_val,
+                        status=leave_req_type,
                         verification_method="leave_approved",
                         scanned_at=None,
                         similarity_score=None,

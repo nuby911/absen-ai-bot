@@ -1,10 +1,21 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.config import Settings, get_settings
+import app.models  # noqa: F401
+from app.config import KNOWN_DEFAULT_JWT_SECRETS, Settings, get_settings
+from app.database import (
+    Base,
+    create_engine_and_session,
+    dispose_default_engine,
+    get_db,
+    get_default_engine,
+)
 from app.providers.face_engine import FaceEngine, create_face_engine
 from app.providers.llm import LLMProvider, create_llm_provider
 from app.providers.whatsapp import WhatsAppProvider, create_whatsapp_provider
@@ -13,6 +24,8 @@ from app.routers.attendance import router as attendance_router
 from app.routers.auth import router as auth_router
 from app.routers.leaves import router as leaves_router
 from app.routers.webhook import router as webhook_router
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(
@@ -23,9 +36,39 @@ def create_app(
 ) -> FastAPI:
     """Create and configure the FastAPI application instance."""
     cfg = settings or get_settings()
+
+    @asynccontextmanager
+    async def lifespan(fastapi_app: FastAPI) -> AsyncIterator[None]:
+        if cfg.jwt_secret in KNOWN_DEFAULT_JWT_SECRETS:
+            logger.warning(
+                "JWT_SECRET masih menggunakan nilai default development. "
+                "Harap atur JWT_SECRET yang kuat sebelum deployment produksi."
+            )
+
+        if get_db not in fastapi_app.dependency_overrides:
+            if settings is None:
+                engine = get_default_engine()
+                async with engine.begin() as conn:
+                    await conn.run_sync(Base.metadata.create_all)
+                try:
+                    yield
+                finally:
+                    await dispose_default_engine()
+            else:
+                engine, _ = create_engine_and_session(cfg.database_url)
+                try:
+                    async with engine.begin() as conn:
+                        await conn.run_sync(Base.metadata.create_all)
+                finally:
+                    await engine.dispose()
+                yield
+        else:
+            yield
+
     app = FastAPI(
         title="Smart School Attendance API",
         version="0.1.0",
+        lifespan=lifespan,
     )
 
     if settings is not None:
@@ -47,7 +90,7 @@ def create_app(
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -63,8 +106,8 @@ def create_app(
     app.include_router(webhook_router)
 
     upload_path = Path(cfg.upload_dir)
-    if upload_path.exists() and upload_path.is_dir():
-        app.mount("/uploads", StaticFiles(directory=str(upload_path)), name="uploads")
+    upload_path.mkdir(parents=True, exist_ok=True)
+    app.mount("/uploads", StaticFiles(directory=str(upload_path)), name="uploads")
 
     return app
 

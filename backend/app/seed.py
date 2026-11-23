@@ -408,9 +408,9 @@ async def seed_demo_data(db: AsyncSession) -> dict[str, int]:
         await db.flush()
 
     seed_attendances = [
-        (rubby, "present", "face_recognition", 0.89, "sent"),
-        (deni, "late", "face_recognition", 0.83, "sent"),
-        (yoga, "present", "face_recognition", 0.91, "sent"),
+        (rubby, "present", "face_kiosk", 0.89, "sent"),
+        (deni, "late", "face_kiosk", 0.83, "sent"),
+        (yoga, "present", "face_kiosk", 0.91, "sent"),
     ]
     for student, att_status, method, sim_score, wa_status in seed_attendances:
         existing_att = await db.scalar(

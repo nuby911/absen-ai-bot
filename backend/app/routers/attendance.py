@@ -1,3 +1,4 @@
+import asyncio
 from datetime import date, datetime, time, timedelta, timezone
 import logging
 import time as time_perf
@@ -86,15 +87,21 @@ def _build_session_label(session_type: str, subject_name: str | None) -> str:
 
 
 def _resolve_scan_status(
+    session_date: date,
     expected_start_time: time | None,
     late_tolerance_minutes: int,
     scan_dt_utc: datetime,
 ) -> str:
     if expected_start_time is None:
         return "present"
-    scan_wib = scan_dt_utc.astimezone(WIB)
+    target_dt = (
+        scan_dt_utc
+        if scan_dt_utc.tzinfo is not None
+        else scan_dt_utc.replace(tzinfo=timezone.utc)
+    )
+    scan_wib = target_dt.astimezone(WIB)
     deadline = datetime.combine(
-        scan_wib.date(),
+        session_date,
         expected_start_time,
         tzinfo=WIB,
     ) + timedelta(minutes=late_tolerance_minutes)
@@ -397,13 +404,18 @@ async def _dispatch_attendance_wa(
     class_name: str,
     parent_phone_wa: str,
     session_label: str,
-) -> bool:
-    """Send WA notification safely and persist `wa_status` without failing the caller."""
+) -> tuple[bool, str, datetime | None]:
+    """Send WA notification safely and persist `wa_status` without expiring caller scalars."""
+    attendance_id = attendance.id
+    attendance_status = attendance.status
+    scanned_at = attendance.scanned_at
+    existing_wa_notified_at = attendance.wa_notified_at
+
     message_text = build_attendance_wa_message(
         student_name=student_name,
         class_name=class_name,
-        status=attendance.status,
-        scanned_at_str=_format_wib_timestamp(attendance.scanned_at),
+        status=attendance_status,
+        scanned_at_str=_format_wib_timestamp(scanned_at),
         session_label=session_label,
     )
     sent = False
@@ -412,28 +424,31 @@ async def _dispatch_attendance_wa(
     except Exception as exc:
         logger.warning(
             "Exception saat mengirim notifikasi WA untuk attendance %s: %s",
-            attendance.id,
+            attendance_id,
             exc,
         )
         sent = False
 
+    resolved_wa_status = "sent" if sent else "failed"
+    resolved_wa_notified_at = _utc_now() if sent else existing_wa_notified_at
+
+    attendance.wa_status = resolved_wa_status
     if sent:
-        attendance.wa_status = "sent"
-        attendance.wa_notified_at = _utc_now()
-    else:
-        attendance.wa_status = "failed"
+        attendance.wa_notified_at = resolved_wa_notified_at
 
     try:
         await db.commit()
         await db.refresh(attendance)
+        resolved_wa_status = attendance.wa_status
+        resolved_wa_notified_at = attendance.wa_notified_at
     except Exception as exc:
         logger.warning(
             "Gagal menyimpan status WA untuk attendance %s: %s",
-            attendance.id,
+            attendance_id,
             exc,
         )
         await db.rollback()
-    return sent
+    return sent, resolved_wa_status, resolved_wa_notified_at
 
 
 async def _match_best_student(
@@ -759,7 +774,7 @@ async def scan_kiosk_face(
     started_at = time_perf.perf_counter()
 
     try:
-        extraction = face_engine.extract_single_face(image_bytes)
+        extraction = await asyncio.to_thread(face_engine.extract_single_face, image_bytes)
     except FaceValidationError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -772,6 +787,12 @@ async def scan_kiosk_face(
             detail="Foto harus menampilkan tepat satu wajah yang jelas.",
         )
 
+    session_id_val = session_row.id
+    session_type_val = session_row.session_type
+    session_date_val = session_row.session_date
+    expected_start_time_val = session_row.expected_start_time
+    late_tolerance_minutes_val = session_row.late_tolerance_minutes
+
     best_student, best_class, best_parent, top_score = await _match_best_student(
         db, extraction.embedding, session_row.class_id
     )
@@ -782,7 +803,7 @@ async def scan_kiosk_face(
     if best_student is None or best_class is None or best_parent is None or top_score < threshold:
         db.add(
             FaceRecognitionLog(
-                session_id=session_row.id,
+                session_id=session_id_val,
                 predicted_student_id=None,
                 top_similarity_score=rounded_score,
                 threshold_used=threshold,
@@ -802,17 +823,27 @@ async def scan_kiosk_face(
             message="Wajah tidak dikenali. Silakan posisikan ulang wajah Anda.",
         )
 
+    best_student_id = best_student.id
+    best_student_name = best_student.name
+    best_student_nis = best_student.nis
+    best_class_name = best_class.name
+    best_parent_phone_wa = best_parent.phone_wa
+
     existing_attendance = await db.scalar(
         select(Attendance).where(
-            Attendance.session_id == session_row.id,
-            Attendance.student_id == best_student.id,
+            Attendance.session_id == session_id_val,
+            Attendance.student_id == best_student_id,
         )
     )
     if existing_attendance is not None:
+        existing_att_id = existing_attendance.id
+        existing_att_status = existing_attendance.status
+        existing_att_scanned_at = existing_attendance.scanned_at
+        existing_att_wa_status = existing_attendance.wa_status
         db.add(
             FaceRecognitionLog(
-                session_id=session_row.id,
-                predicted_student_id=best_student.id,
+                session_id=session_id_val,
+                predicted_student_id=best_student_id,
                 top_similarity_score=rounded_score,
                 threshold_used=threshold,
                 liveness_passed=True,
@@ -825,29 +856,30 @@ async def scan_kiosk_face(
         return AttendanceScanResponse(
             matched=True,
             already_recorded=True,
-            attendance_id=existing_attendance.id,
-            student_id=best_student.id,
-            student_name=best_student.name,
-            nis=best_student.nis,
-            class_name=best_class.name,
-            status=existing_attendance.status,
-            scanned_at=existing_attendance.scanned_at,
+            attendance_id=existing_att_id,
+            student_id=best_student_id,
+            student_name=best_student_name,
+            nis=best_student_nis,
+            class_name=best_class_name,
+            status=existing_att_status,
+            scanned_at=existing_att_scanned_at,
             similarity_score=rounded_score,
             threshold_used=threshold,
-            wa_status=existing_attendance.wa_status,
+            wa_status=existing_att_wa_status,
             wa_queued=False,
-            message=f"{best_student.name} sudah tercatat presensi pada sesi ini.",
+            message=f"{best_student_name} sudah tercatat presensi pada sesi ini.",
         )
 
     scanned_at = _utc_now()
     attendance_status = _resolve_scan_status(
-        session_row.expected_start_time,
-        session_row.late_tolerance_minutes,
+        session_date_val,
+        expected_start_time_val,
+        late_tolerance_minutes_val,
         scanned_at,
     )
     attendance = Attendance(
-        session_id=session_row.id,
-        student_id=best_student.id,
+        session_id=session_id_val,
+        student_id=best_student_id,
         status=attendance_status,
         verification_method="face_kiosk",
         scanned_at=scanned_at,
@@ -855,8 +887,8 @@ async def scan_kiosk_face(
         wa_status="pending",
     )
     face_log = FaceRecognitionLog(
-        session_id=session_row.id,
-        predicted_student_id=best_student.id,
+        session_id=session_id_val,
+        predicted_student_id=best_student_id,
         top_similarity_score=rounded_score,
         threshold_used=threshold,
         liveness_passed=True,
@@ -871,15 +903,19 @@ async def scan_kiosk_face(
         await db.rollback()
         concurrent_existing = await db.scalar(
             select(Attendance).where(
-                Attendance.session_id == session_row.id,
-                Attendance.student_id == best_student.id,
+                Attendance.session_id == session_id_val,
+                Attendance.student_id == best_student_id,
             )
         )
         if concurrent_existing is not None:
+            concurrent_att_id = concurrent_existing.id
+            concurrent_att_status = concurrent_existing.status
+            concurrent_att_scanned_at = concurrent_existing.scanned_at
+            concurrent_att_wa_status = concurrent_existing.wa_status
             db.add(
                 FaceRecognitionLog(
-                    session_id=session_row.id,
-                    predicted_student_id=best_student.id,
+                    session_id=session_id_val,
+                    predicted_student_id=best_student_id,
                     top_similarity_score=rounded_score,
                     threshold_used=threshold,
                     liveness_passed=True,
@@ -892,50 +928,53 @@ async def scan_kiosk_face(
             return AttendanceScanResponse(
                 matched=True,
                 already_recorded=True,
-                attendance_id=concurrent_existing.id,
-                student_id=best_student.id,
-                student_name=best_student.name,
-                nis=best_student.nis,
-                class_name=best_class.name,
-                status=concurrent_existing.status,
-                scanned_at=concurrent_existing.scanned_at,
+                attendance_id=concurrent_att_id,
+                student_id=best_student_id,
+                student_name=best_student_name,
+                nis=best_student_nis,
+                class_name=best_class_name,
+                status=concurrent_att_status,
+                scanned_at=concurrent_att_scanned_at,
                 similarity_score=rounded_score,
                 threshold_used=threshold,
-                wa_status=concurrent_existing.wa_status,
+                wa_status=concurrent_att_wa_status,
                 wa_queued=False,
-                message=f"{best_student.name} sudah tercatat presensi pada sesi ini.",
+                message=f"{best_student_name} sudah tercatat presensi pada sesi ini.",
             )
         raise
 
     await db.refresh(attendance)
+    attendance_id_val = attendance.id
+    attendance_status_val = attendance.status
+    attendance_scanned_at = attendance.scanned_at
 
-    session_label = _build_session_label(session_row.session_type, subject_name)
-    await _dispatch_attendance_wa(
+    session_label = _build_session_label(session_type_val, subject_name)
+    _, wa_status_val, _ = await _dispatch_attendance_wa(
         db=db,
         whatsapp_provider=whatsapp_provider,
         attendance=attendance,
-        student_name=best_student.name,
-        class_name=best_class.name,
-        parent_phone_wa=best_parent.phone_wa,
+        student_name=best_student_name,
+        class_name=best_class_name,
+        parent_phone_wa=best_parent_phone_wa,
         session_label=session_label,
     )
 
-    status_label = ATTENDANCE_STATUS_LABELS_ID.get(attendance.status, attendance.status)
+    status_label = ATTENDANCE_STATUS_LABELS_ID.get(attendance_status_val, attendance_status_val)
     return AttendanceScanResponse(
         matched=True,
         already_recorded=False,
-        attendance_id=attendance.id,
-        student_id=best_student.id,
-        student_name=best_student.name,
-        nis=best_student.nis,
-        class_name=best_class.name,
-        status=attendance.status,
-        scanned_at=attendance.scanned_at,
+        attendance_id=attendance_id_val,
+        student_id=best_student_id,
+        student_name=best_student_name,
+        nis=best_student_nis,
+        class_name=best_class_name,
+        status=attendance_status_val,
+        scanned_at=attendance_scanned_at,
         similarity_score=rounded_score,
         threshold_used=threshold,
-        wa_status=attendance.wa_status,
+        wa_status=wa_status_val,
         wa_queued=True,
-        message=f"Presensi {best_student.name} berhasil dicatat ({status_label}).",
+        message=f"Presensi {best_student_name} berhasil dicatat ({status_label}).",
     )
 
 
@@ -963,6 +1002,11 @@ async def create_manual_attendance(
         )
 
     session_row, _, _, subject_name = await _get_session_with_meta(db, payload.session_id)
+    if session_row.status != "open":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Sesi presensi sudah ditutup. Tidak dapat mencatat presensi manual.",
+        )
 
     student_row = (
         await db.execute(
@@ -991,17 +1035,25 @@ async def create_manual_attendance(
             detail="Siswa tidak terdaftar pada kelas sesi ini.",
         )
 
+    session_id_val = session_row.id
+    session_type_val = session_row.session_type
+    student_id_val = student.id
+    student_name_val = student.name
+    student_nis_val = student.nis
+    class_name_val = school_class.name
+    parent_phone_wa_val = parent.phone_wa
+
     now_utc = _utc_now()
     attendance = await db.scalar(
         select(Attendance).where(
-            Attendance.session_id == session_row.id,
-            Attendance.student_id == student.id,
+            Attendance.session_id == session_id_val,
+            Attendance.student_id == student_id_val,
         )
     )
     if attendance is None:
         attendance = Attendance(
-            session_id=session_row.id,
-            student_id=student.id,
+            session_id=session_id_val,
+            student_id=student_id_val,
             status=payload.status,
             verification_method="manual_teacher",
             scanned_at=now_utc,
@@ -1022,31 +1074,39 @@ async def create_manual_attendance(
     await db.commit()
     await db.refresh(attendance)
 
+    attendance_id_val = attendance.id
+    attendance_session_id = attendance.session_id
+    attendance_status_val = attendance.status
+    attendance_method_val = attendance.verification_method
+    attendance_scanned_at = attendance.scanned_at
+    attendance_wa_status = attendance.wa_status
+    attendance_wa_notified_at = attendance.wa_notified_at
+
     if payload.notify_wa:
-        session_label = _build_session_label(session_row.session_type, subject_name)
-        await _dispatch_attendance_wa(
+        session_label = _build_session_label(session_type_val, subject_name)
+        _, attendance_wa_status, attendance_wa_notified_at = await _dispatch_attendance_wa(
             db=db,
             whatsapp_provider=whatsapp_provider,
             attendance=attendance,
-            student_name=student.name,
-            class_name=school_class.name,
-            parent_phone_wa=parent.phone_wa,
+            student_name=student_name_val,
+            class_name=class_name_val,
+            parent_phone_wa=parent_phone_wa_val,
             session_label=session_label,
         )
 
     return ManualAttendanceResponse(
-        attendance_id=attendance.id,
-        session_id=attendance.session_id,
-        student_id=student.id,
-        student_name=student.name,
-        nis=student.nis,
-        class_name=school_class.name,
-        status=attendance.status,
-        verification_method=attendance.verification_method,
-        scanned_at=attendance.scanned_at,
-        wa_status=attendance.wa_status,
-        wa_notified_at=attendance.wa_notified_at,
-        message=f"Presensi manual untuk {student.name} berhasil disimpan.",
+        attendance_id=attendance_id_val,
+        session_id=attendance_session_id,
+        student_id=student_id_val,
+        student_name=student_name_val,
+        nis=student_nis_val,
+        class_name=class_name_val,
+        status=attendance_status_val,
+        verification_method=attendance_method_val,
+        scanned_at=attendance_scanned_at,
+        wa_status=attendance_wa_status,
+        wa_notified_at=attendance_wa_notified_at,
+        message=f"Presensi manual untuk {student_name_val} berhasil disimpan.",
     )
 
 
@@ -1083,23 +1143,27 @@ async def resend_attendance_wa(
         )
 
     attendance, session_row, student, school_class, parent, subject_name = row
+    attendance_id_val = attendance.id
+    student_name_val = student.name
+    class_name_val = school_class.name
+    parent_phone_wa_val = parent.phone_wa
     session_label = _build_session_label(session_row.session_type, subject_name)
 
-    sent = await _dispatch_attendance_wa(
+    sent, wa_status_val, wa_notified_at_val = await _dispatch_attendance_wa(
         db=db,
         whatsapp_provider=whatsapp_provider,
         attendance=attendance,
-        student_name=student.name,
-        class_name=school_class.name,
-        parent_phone_wa=parent.phone_wa,
+        student_name=student_name_val,
+        class_name=class_name_val,
+        parent_phone_wa=parent_phone_wa_val,
         session_label=session_label,
     )
 
     return ResendWaResponse(
-        attendance_id=attendance.id,
-        wa_status=attendance.wa_status,
+        attendance_id=attendance_id_val,
+        wa_status=wa_status_val,
         wa_sent=sent,
-        wa_notified_at=attendance.wa_notified_at,
+        wa_notified_at=wa_notified_at_val,
         message=(
             "Notifikasi WhatsApp berhasil dikirim ulang ke orang tua siswa."
             if sent

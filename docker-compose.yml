@@ -45,6 +45,7 @@ services:
       WAHA_BASE_URL: http://waha:3000
       WAHA_API_KEY: ${WAHA_API_KEY:-}
       WAHA_SESSION: ${WAHA_SESSION:-default}
+      WAHA_WEBHOOK_SECRET: ${WAHA_WEBHOOK_SECRET:-}
       LLM_PROVIDER_MODE: ${LLM_PROVIDER_MODE:-fallback}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.0-flash}
