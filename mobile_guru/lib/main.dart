@@ -4,7 +4,10 @@ import 'core/api_client.dart';
 import 'core/theme.dart';
 import 'models/models.dart';
 import 'screens/home_screen.dart';
+import 'screens/kiosk_scanner_screen.dart';
+import 'screens/leave_verification_screen.dart';
 import 'screens/login_screen.dart';
+import 'widgets/kiosk_pin_sheet.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -44,11 +47,54 @@ class _SmartSchoolGuruAppState extends State<SmartSchoolGuruApp> {
     });
   }
 
+  Widget _buildKioskScanner(
+    BuildContext context,
+    SessionDetail session,
+    VoidCallback onAttendanceChanged,
+  ) {
+    return KioskScannerScreen(
+      apiClient: _apiClient,
+      session: session,
+      onAttendanceRecorded: onAttendanceChanged,
+    );
+  }
+
+  Widget _buildLeaveVerificationTab(
+    BuildContext context,
+    VoidCallback onLeaveChanged,
+  ) {
+    return LeaveVerificationScreen(
+      apiClient: _apiClient,
+      onLeaveChanged: onLeaveChanged,
+    );
+  }
+
+  Future<String?> _showKioskPinPrompt(
+    BuildContext context, {
+    required String title,
+    required String subtitle,
+    required String confirmLabel,
+  }) {
+    return KioskPinSheet.show(
+      context,
+      title: title,
+      subtitle: subtitle,
+      confirmLabel: confirmLabel,
+      cancelLabel: 'Batal',
+      onVerify: _apiClient.verifyKioskPin,
+    );
+  }
+
   void _handleUnauthorized() {
     _apiClient.logout();
     _navigatorKey.currentState?.pushAndRemoveUntil(
       MaterialPageRoute<void>(
-        builder: (_) => LoginScreen(apiClient: _apiClient),
+        builder: (_) => LoginScreen(
+          apiClient: _apiClient,
+          kioskScannerBuilder: _buildKioskScanner,
+          leaveVerificationBuilder: _buildLeaveVerificationTab,
+          pinPromptBuilder: _showKioskPinPrompt,
+        ),
       ),
       (route) => false,
     );
@@ -67,8 +113,16 @@ class _SmartSchoolGuruAppState extends State<SmartSchoolGuruApp> {
               ? HomeScreen(
                   apiClient: _apiClient,
                   initialUser: _initialUser!,
+                  kioskScannerBuilder: _buildKioskScanner,
+                  leaveVerificationBuilder: _buildLeaveVerificationTab,
+                  pinPromptBuilder: _showKioskPinPrompt,
                 )
-              : LoginScreen(apiClient: _apiClient)),
+              : LoginScreen(
+                  apiClient: _apiClient,
+                  kioskScannerBuilder: _buildKioskScanner,
+                  leaveVerificationBuilder: _buildLeaveVerificationTab,
+                  pinPromptBuilder: _showKioskPinPrompt,
+                )),
     );
   }
 }

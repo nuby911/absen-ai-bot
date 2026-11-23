@@ -5,6 +5,7 @@ import '../core/api_client.dart';
 import '../core/formatters.dart';
 import '../core/theme.dart';
 import '../models/models.dart';
+import 'leave_verification_screen.dart';
 import 'login_screen.dart';
 import 'session_detail_screen.dart';
 
@@ -52,6 +53,7 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   int _currentTab = 0;
+  int _leaveRefreshTick = 0;
   late UserProfile _user;
   TeacherDashboardData? _dashboard;
   bool _isLoading = true;
@@ -183,7 +185,12 @@ class _HomeScreenState extends State<HomeScreen> {
         backgroundColor: AppColors.card,
         indicatorColor: AppColors.primaryTint,
         onDestinationSelected: (index) {
-          setState(() => _currentTab = index);
+          setState(() {
+            _currentTab = index;
+            if (index == 1) {
+              _leaveRefreshTick += 1;
+            }
+          });
           if (index == 0) {
             _loadDashboard();
           }
@@ -221,10 +228,10 @@ class _HomeScreenState extends State<HomeScreen> {
       return widget.leaveVerificationBuilder!(context, _loadDashboard);
     }
 
-    return _LeavePlaceholderTab(
+    return LeaveVerificationScreen(
       apiClient: widget.apiClient,
-      pendingCount: _dashboard?.stats.pendingLeavesCount ?? 0,
-      onRefreshParent: _loadDashboard,
+      onLeaveChanged: _loadDashboard,
+      refreshTrigger: _leaveRefreshTick,
     );
   }
 
@@ -1206,180 +1213,6 @@ class _CreateSessionDialogState extends State<_CreateSessionDialog> {
               : const Text('Buka Sesi'),
         ),
       ],
-    );
-  }
-}
-
-class _LeavePlaceholderTab extends StatefulWidget {
-  const _LeavePlaceholderTab({
-    required this.apiClient,
-    required this.pendingCount,
-    required this.onRefreshParent,
-  });
-
-  final ApiClient apiClient;
-  final int pendingCount;
-  final VoidCallback onRefreshParent;
-
-  @override
-  State<_LeavePlaceholderTab> createState() => _LeavePlaceholderTabState();
-}
-
-class _LeavePlaceholderTabState extends State<_LeavePlaceholderTab> {
-  List<LeaveRequestItem> _pendingLeaves = const [];
-  bool _loading = false;
-  String? _error;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadPending();
-  }
-
-  Future<void> _loadPending() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
-    try {
-      final items = await widget.apiClient.getLeaveRequests(status: 'pending');
-      if (!mounted) return;
-      setState(() {
-        _pendingLeaves = items;
-        _loading = false;
-      });
-    } on ApiException catch (exc) {
-      if (!mounted) return;
-      setState(() {
-        _error = exc.message;
-        _loading = false;
-      });
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Text('Verifikasi Izin (${widget.pendingCount} Menunggu)'),
-        actions: [
-          IconButton(
-            onPressed: _loading
-                ? null
-                : () {
-                    _loadPending();
-                    widget.onRefreshParent();
-                  },
-            icon: const Icon(Icons.refresh_rounded),
-          ),
-        ],
-      ),
-      body: RefreshIndicator(
-        onRefresh: _loadPending,
-        child: ListView(
-          padding: const EdgeInsets.all(16),
-          children: [
-            if (_error != null)
-              Container(
-                padding: const EdgeInsets.all(12),
-                margin: const EdgeInsets.only(bottom: 12),
-                decoration: BoxDecoration(
-                  color: AppColors.dangerTint,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Text(_error!, style: const TextStyle(color: AppColors.danger)),
-              ),
-            if (_loading && _pendingLeaves.isEmpty)
-              const Center(
-                child: Padding(
-                  padding: EdgeInsets.all(32),
-                  child: CircularProgressIndicator(),
-                ),
-              )
-            else if (_pendingLeaves.isEmpty)
-              Container(
-                padding: const EdgeInsets.all(24),
-                decoration: BoxDecoration(
-                  color: AppColors.card,
-                  borderRadius: BorderRadius.circular(18),
-                  border: Border.all(color: AppColors.border),
-                ),
-                child: const Column(
-                  children: [
-                    Icon(Icons.inbox_outlined, size: 42, color: AppColors.textMuted),
-                    SizedBox(height: 10),
-                    Text(
-                      'Tidak ada pengajuan izin menunggu',
-                      style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
-                    ),
-                    SizedBox(height: 4),
-                    Text(
-                      'Pengajuan izin/sakit dari WhatsApp orang tua akan muncul di sini.',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(fontSize: 13, color: AppColors.textSecondary),
-                    ),
-                  ],
-                ),
-              )
-            else
-              ..._pendingLeaves.map(
-                (leave) => Container(
-                  margin: const EdgeInsets.only(bottom: 12),
-                  padding: const EdgeInsets.all(14),
-                  decoration: BoxDecoration(
-                    color: AppColors.card,
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: AppColors.border),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          Expanded(
-                            child: Text(
-                              '${leave.studentName} (${leave.className})',
-                              style: const TextStyle(
-                                fontWeight: FontWeight.w700,
-                                fontSize: 14.5,
-                              ),
-                            ),
-                          ),
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 8,
-                              vertical: 3,
-                            ),
-                            decoration: BoxDecoration(
-                              color: AppColors.warningTint,
-                              borderRadius: BorderRadius.circular(999),
-                            ),
-                            child: Text(
-                              leave.requestType == 'sick' ? 'SAKIT' : 'IZIN',
-                              style: const TextStyle(
-                                fontSize: 11,
-                                fontWeight: FontWeight.w800,
-                                color: AppColors.warning,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 6),
-                      Text(
-                        leave.reason,
-                        style: const TextStyle(
-                          fontSize: 13,
-                          color: AppColors.textSecondary,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-          ],
-        ),
-      ),
     );
   }
 }

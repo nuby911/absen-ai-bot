@@ -5,7 +5,9 @@ import '../core/api_client.dart';
 import '../core/formatters.dart';
 import '../core/theme.dart';
 import '../models/models.dart';
+import '../widgets/kiosk_pin_sheet.dart';
 import 'home_screen.dart';
+import 'kiosk_scanner_screen.dart';
 
 /// Layar 03 Figma: Detail Sesi Presensi, CTA Mode Kiosk, Daftar Siswa & Aksi Guru.
 class SessionDetailScreen extends StatefulWidget {
@@ -78,19 +80,36 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
       return;
     }
 
-    if (widget.kioskScannerBuilder == null) {
-      _showSnackBar('Mode Kiosk kamera belum terhubung pada build ini.');
-      return;
-    }
-
     await Navigator.of(context).push<void>(
       MaterialPageRoute(
-        builder: (ctx) => widget.kioskScannerBuilder!(ctx, detail, _loadSessionDetail),
+        builder: (ctx) => widget.kioskScannerBuilder != null
+            ? widget.kioskScannerBuilder!(ctx, detail, _loadSessionDetail)
+            : KioskScannerScreen(
+                apiClient: widget.apiClient,
+                session: detail,
+                onAttendanceRecorded: _loadSessionDetail,
+              ),
       ),
     );
     if (mounted) {
       await _loadSessionDetail();
     }
+  }
+
+  Future<String?> _defaultPinPrompt(
+    BuildContext context, {
+    required String title,
+    required String subtitle,
+    required String confirmLabel,
+  }) {
+    return KioskPinSheet.show(
+      context,
+      title: title,
+      subtitle: subtitle,
+      confirmLabel: confirmLabel,
+      cancelLabel: 'Batal',
+      onVerify: widget.apiClient.verifyKioskPin,
+    );
   }
 
   Future<void> _openManualAttendanceModal({StudentAttendanceItem? presetStudent}) async {
@@ -107,25 +126,21 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
       builder: (dialogContext) => _ManualAttendanceDialog(
         students: detail.students,
         presetStudent: presetStudent,
-        requireInlinePin: widget.pinPromptBuilder == null,
+        requireInlinePin: false,
       ),
     );
 
     if (selection == null || !mounted) return;
 
-    String? pin = selection.inlinePin;
-    if (widget.pinPromptBuilder != null) {
-      pin = await widget.pinPromptBuilder!(
-        context,
-        title: 'Konfirmasi Absen Manual',
-        subtitle:
-            'Masukkan PIN Kiosk Guru untuk mencatat status "${AppFormatters.attendanceStatusLabel(selection.status)}" bagi ${selection.studentName}.',
-        confirmLabel: 'Konfirmasi Absen Manual',
-      );
-      if (pin == null || pin.isEmpty || !mounted) return;
-    }
-
-    if (pin == null || pin.isEmpty) return;
+    final pinPrompt = widget.pinPromptBuilder ?? _defaultPinPrompt;
+    final pin = await pinPrompt(
+      context,
+      title: 'Konfirmasi Absen Manual',
+      subtitle:
+          'Masukkan PIN Kiosk Guru untuk mencatat status "${AppFormatters.attendanceStatusLabel(selection.status)}" bagi ${selection.studentName}.',
+      confirmLabel: 'Konfirmasi Absen Manual',
+    );
+    if (pin == null || pin.isEmpty || !mounted) return;
 
     setState(() => _isMutating = true);
     try {
