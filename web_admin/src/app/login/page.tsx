@@ -1,0 +1,279 @@
+"use client";
+
+import { useEffect, useState, type FormEvent } from "react";
+import { useRouter } from "next/navigation";
+import {
+  AlertCircle,
+  Eye,
+  EyeOff,
+  KeyRound,
+  Lock,
+  Mail,
+  ShieldCheck,
+  Sparkles,
+} from "lucide-react";
+import {
+  ApiError,
+  clearAuthSession,
+  getAccessToken,
+  getMe,
+  loginAdmin,
+  setAuthSession,
+} from "@/lib/api";
+
+export default function LoginPage() {
+  const router = useRouter();
+  const [identifier, setIdentifier] = useState("");
+  const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function checkExistingSession() {
+      const token = getAccessToken();
+      if (!token) return;
+      try {
+        const user = await getMe();
+        if (cancelled) return;
+        if (user.role === "admin") {
+          setAuthSession(token, user);
+          router.replace("/");
+        } else {
+          clearAuthSession();
+        }
+      } catch {
+        if (!cancelled) {
+          clearAuthSession();
+        }
+      }
+    }
+    void checkExistingSession();
+    return () => {
+      cancelled = true;
+    };
+  }, [router]);
+
+  function handleFillDemo() {
+    setIdentifier("admin@sekolah.sch.id");
+    setPassword("admin123");
+    setErrorMessage(null);
+  }
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setErrorMessage(null);
+
+    if (!identifier.trim() || !password) {
+      setErrorMessage("Email/NIP dan kata sandi wajib diisi.");
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      const response = await loginAdmin({
+        identifier: identifier.trim(),
+        password,
+      });
+
+      if (response.user.role !== "admin") {
+        clearAuthSession();
+        setErrorMessage(
+          `Akses ditolak. Akun "${response.user.name}" memiliki peran "${response.user.role}", bukan Admin Sekolah. Gunakan aplikasi Mobile Guru untuk akun guru.`
+        );
+        return;
+      }
+
+      setAuthSession(response.access_token, response.user);
+      router.replace("/");
+    } catch (err) {
+      if (err instanceof ApiError) {
+        setErrorMessage(err.message);
+      } else {
+        setErrorMessage("Terjadi kesalahan saat memproses login. Silakan coba lagi.");
+      }
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="min-h-screen bg-[#F8FAFC] flex flex-col lg:flex-row">
+      {/* Left Brand Panel */}
+      <div className="bg-[#0F172A] text-white px-6 py-10 sm:px-12 lg:w-[44%] lg:flex lg:flex-col lg:justify-between lg:py-14">
+        <div className="flex items-center gap-3">
+          <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-[#1D4ED8] shadow-sm ring-1 ring-blue-400/30">
+            <ShieldCheck className="h-6 w-6 text-white" aria-hidden="true" />
+          </div>
+          <div>
+            <p className="text-lg font-bold tracking-tight">SmartSchool AI</p>
+            <p className="text-xs font-medium text-slate-400">
+              Admin Panel • Politeknik Negeri Lampung
+            </p>
+          </div>
+        </div>
+
+        <div className="my-10 space-y-6 lg:my-0">
+          <div className="inline-flex items-center gap-2 rounded-full border border-blue-500/30 bg-blue-500/10 px-3 py-1 text-xs font-semibold text-blue-300">
+            <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
+            <span>InsightFace 512-d & WhatsApp AI Chatbot</span>
+          </div>
+          <h1 className="text-3xl font-extrabold tracking-tight text-white sm:text-4xl leading-tight">
+            Pusat Kontrol Absensi Biometrik Sekolah
+          </h1>
+          <p className="max-w-md text-sm leading-relaxed text-slate-300">
+            Kelola data master siswa, orang tua WhatsApp, jadwal pelajaran,
+            registrasi dataset wajah 5-slot, serta evaluasi ilmiah Confusion
+            Matrix (FAR/FRR) secara terpusat.
+          </p>
+
+          <div className="grid grid-cols-2 gap-3 pt-2 max-w-md">
+            <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-3.5">
+              <p className="text-xs font-medium text-slate-400">Model Wajah</p>
+              <p className="mt-1 text-sm font-bold text-white">
+                InsightFace ONNX
+              </p>
+              <p className="text-[11px] text-emerald-400">512-d Cosine Match</p>
+            </div>
+            <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-3.5">
+              <p className="text-xs font-medium text-slate-400">Notifikasi & AI</p>
+              <p className="mt-1 text-sm font-bold text-white">
+                WhatsApp Gateway
+              </p>
+              <p className="text-[11px] text-blue-300">Gemini Function Calling</p>
+            </div>
+          </div>
+        </div>
+
+        <p className="text-xs text-slate-500">
+          © 2026 SmartSchool Attendance System • Akses terbatas khusus Admin Sekolah
+        </p>
+      </div>
+
+      {/* Right Login Card */}
+      <div className="flex flex-1 items-center justify-center p-6 sm:p-10">
+        <div className="w-full max-w-md rounded-2xl border border-[#E2E8F0] bg-white p-7 shadow-sm sm:p-9">
+          <div className="space-y-1.5">
+            <h2 className="text-2xl font-bold tracking-tight text-[#0F172A]">
+              Masuk Panel Admin
+            </h2>
+            <p className="text-sm text-slate-500">
+              Gunakan akun administrator sekolah untuk mengakses dashboard.
+            </p>
+          </div>
+
+          {errorMessage ? (
+            <div
+              role="alert"
+              className="mt-5 flex items-start gap-2.5 rounded-xl border border-red-200 bg-[#FEF2F2] p-3.5 text-sm text-[#DC2626]"
+            >
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+              <span>{errorMessage}</span>
+            </div>
+          ) : null}
+
+          <form onSubmit={handleSubmit} className="mt-6 space-y-5">
+            <div className="space-y-1.5">
+              <label
+                htmlFor="identifier"
+                className="block text-sm font-semibold text-[#0F172A]"
+              >
+                Email atau NIP
+              </label>
+              <div className="relative">
+                <Mail
+                  className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400"
+                  aria-hidden="true"
+                />
+                <input
+                  id="identifier"
+                  name="identifier"
+                  type="text"
+                  autoComplete="username"
+                  required
+                  value={identifier}
+                  onChange={(e) => setIdentifier(e.target.value)}
+                  placeholder="admin@sekolah.sch.id"
+                  className="w-full rounded-xl border border-[#E2E8F0] bg-white py-2.5 pl-10 pr-4 text-sm text-[#0F172A] placeholder:text-slate-400 focus:border-[#1D4ED8] focus:outline-none focus:ring-2 focus:ring-[#1D4ED8]/20"
+                />
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <label
+                htmlFor="password"
+                className="block text-sm font-semibold text-[#0F172A]"
+              >
+                Kata Sandi
+              </label>
+              <div className="relative">
+                <Lock
+                  className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400"
+                  aria-hidden="true"
+                />
+                <input
+                  id="password"
+                  name="password"
+                  type={showPassword ? "text" : "password"}
+                  autoComplete="current-password"
+                  required
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Masukkan kata sandi"
+                  className="w-full rounded-xl border border-[#E2E8F0] bg-white py-2.5 pl-10 pr-11 text-sm text-[#0F172A] placeholder:text-slate-400 focus:border-[#1D4ED8] focus:outline-none focus:ring-2 focus:ring-[#1D4ED8]/20"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword((prev) => !prev)}
+                  aria-label={
+                    showPassword
+                      ? "Sembunyikan kata sandi"
+                      : "Tampilkan kata sandi"
+                  }
+                  className="absolute right-3 top-1/2 -translate-y-1/2 rounded-lg p-1 text-slate-400 hover:text-slate-700"
+                >
+                  {showPassword ? (
+                    <EyeOff className="h-4 w-4" />
+                  ) : (
+                    <Eye className="h-4 w-4" />
+                  )}
+                </button>
+              </div>
+            </div>
+
+            <button
+              type="submit"
+              disabled={isSubmitting}
+              className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#1D4ED8] px-4 py-3 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-[#1E3A8A] disabled:cursor-not-allowed disabled:opacity-60 focus:outline-none focus:ring-2 focus:ring-[#1D4ED8] focus:ring-offset-2"
+            >
+              {isSubmitting ? "Memverifikasi..." : "Masuk ke Dashboard Admin"}
+            </button>
+          </form>
+
+          {/* Demo Account Hint */}
+          <div className="mt-6 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-4">
+            <div className="flex items-start justify-between gap-3">
+              <div className="space-y-1">
+                <p className="flex items-center gap-1.5 text-xs font-bold text-[#0F172A]">
+                  <KeyRound className="h-3.5 w-3.5 text-[#1D4ED8]" aria-hidden="true" />
+                  <span>Akun Demo Seeder</span>
+                </p>
+                <p className="font-mono text-xs text-slate-600">
+                  admin@sekolah.sch.id / admin123
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={handleFillDemo}
+                className="shrink-0 rounded-lg border border-blue-200 bg-[#EFF6FF] px-2.5 py-1.5 text-xs font-semibold text-[#1D4ED8] transition-colors hover:bg-blue-100"
+              >
+                Isi Otomatis
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
