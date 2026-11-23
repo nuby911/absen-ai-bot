@@ -1,4 +1,5 @@
 from collections.abc import AsyncGenerator
+from pathlib import Path
 
 import httpx
 import pytest
@@ -13,13 +14,15 @@ from app.security import create_access_token, hash_secret
 
 
 @pytest.fixture
-def test_settings() -> Settings:
+def test_settings(tmp_path: Path) -> Settings:
     """Provide isolated test settings without mutating the cached get_settings()."""
     return Settings(
         database_url="sqlite+aiosqlite:///:memory:",
         jwt_secret="test-jwt-secret-key-for-smart-school-2026",
+        face_engine_mode="deterministic",
         whatsapp_provider_mode="mock",
         llm_provider_mode="fallback",
+        upload_dir=str(tmp_path / "uploads"),
     )
 
 
