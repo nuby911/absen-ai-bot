@@ -832,3 +832,67 @@ async def test_gemini_out_of_domain_marker_and_max_iteration_guard() -> None:
             context={},
             tool_executor=noop_tool,
         )
+
+
+@pytest.mark.asyncio
+async def test_status_questions_with_sick_or_leave_keywords_do_not_create_leave(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    seeded_teacher: User,
+    mock_wa: MockWhatsAppProvider,
+) -> None:
+    """Status inquiries mentioning sakit/izin check attendance instead of mutating LeaveRequest."""
+    data = await _seed_two_families(db_session, seeded_teacher)
+    parent_a: Parent = data["parent_a"]
+    student_a: Student = data["student_a"]
+    parent_a_phone = parent_a.phone_wa
+    student_a_id = student_a.id
+
+    for query in [
+        "Apakah Rubby sakit hari ini?",
+        "Apakah anak saya izin hari ini?",
+        "Cek status sakit anak hari ini",
+        "Sudah izin hari ini?",
+    ]:
+        res = await client.post(
+            "/api/v1/webhook/whatsapp",
+            json={"phone_wa": parent_a_phone, "message_text": query},
+        )
+        assert res.status_code == 200
+        body = res.json()
+        assert body["tool_called"] == "get_today_attendance"
+        assert body["is_in_domain"] is True
+        assert body["wa_sent"] is True
+        assert "Rubby Pratama" in body["reply_text"]
+
+    db_session.expire_all()
+    leaves_before = (
+        await db_session.scalars(
+            select(LeaveRequest).where(LeaveRequest.student_id == student_a_id)
+        )
+    ).all()
+    assert leaves_before == []
+
+    # Genuine leave submission with request verb still calls submit_leave_request
+    res_submit = await client.post(
+        "/api/v1/webhook/whatsapp",
+        json={
+            "phone_wa": parent_a_phone,
+            "message_text": "Mohon izin hari ini Rubby sakit demam",
+        },
+    )
+    assert res_submit.status_code == 200
+    submit_body = res_submit.json()
+    assert submit_body["tool_called"] == "submit_leave_request"
+    assert submit_body["wa_sent"] is True
+
+    db_session.expire_all()
+    leaves_after = (
+        await db_session.scalars(
+            select(LeaveRequest).where(LeaveRequest.student_id == student_a_id)
+        )
+    ).all()
+    assert len(leaves_after) == 1
+    assert leaves_after[0].request_type == "sick"
+    assert leaves_after[0].status == "pending"
+    assert len(mock_wa.sent) == 5

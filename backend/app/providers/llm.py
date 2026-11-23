@@ -673,11 +673,31 @@ class RuleBasedLLMProvider:
             "acara keluarga",
             "cuti",
         )
-        is_status_question = (
-            lower_msg.startswith("apakah ")
-            and _has_any_phrase(lower_msg, ("hadir", "absen", "presensi", "datang", "pulang"))
-            and not _has_any_phrase(lower_msg, ("ajukan", "mohon", "tolong"))
+        request_verbs = (
+            "mohon",
+            "ajukan",
+            "mengajukan",
+            "tolong",
+            "minta",
+            "buatkan",
+            "daftarkan",
+            "kirimkan",
+            "laporkan",
         )
+        status_question_prefixes = (
+            "apakah",
+            "apa",
+            "cek",
+            "sudah",
+            "bagaimana",
+            "gimana",
+            "status",
+        )
+        has_request_verb = _has_any_phrase(lower_msg, request_verbs)
+        looks_like_question = lower_msg.endswith("?") or any(
+            re.match(rf"^{prefix}\b", lower_msg) for prefix in status_question_prefixes
+        )
+        is_status_question = looks_like_question and not has_request_verb
         has_sick = _has_any_phrase(lower_msg, sick_keywords)
         has_leave = _has_any_phrase(lower_msg, leave_keywords)
         if not is_status_question and (has_sick or has_leave):
@@ -767,8 +787,10 @@ class RuleBasedLLMProvider:
             "status anak",
             "gerbang",
         )
-        if _has_any_phrase(lower_msg, today_attendance_keywords) or (
-            student_id is not None and _has_any_phrase(lower_msg, ("hari ini", "status", "sudah"))
+        if (
+            _has_any_phrase(lower_msg, today_attendance_keywords)
+            or (is_status_question and (has_sick or has_leave))
+            or (student_id is not None and _has_any_phrase(lower_msg, ("hari ini", "status", "sudah")))
         ):
             result = await tool_executor(
                 "get_today_attendance",
