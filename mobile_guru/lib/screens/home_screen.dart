@@ -893,13 +893,33 @@ class _CreateSessionDialogState extends State<_CreateSessionDialog> {
     super.initState();
     final preset = widget.presetSchedule;
     _sessionType = 'subject';
-    _selectedScheduleId = preset?.id;
-    _selectedClassId = preset?.classId ??
-        (widget.classes.isNotEmpty ? widget.classes.first.id : null);
+
+    final presetClassValid =
+        preset != null && _resolveValidClassId(preset.classId) != null;
+    final presetScheduleValid = preset != null &&
+        widget.todaySchedules.any((s) => s.id == preset.id) &&
+        presetClassValid;
+
+    _selectedScheduleId = presetScheduleValid ? preset.id : null;
+    _selectedClassId = presetClassValid
+        ? preset.classId
+        : (widget.classes.isNotEmpty ? widget.classes.first.id : null);
     _expectedStartTime = _parseTimeOfDay(preset?.startTime) ?? TimeOfDay.now();
     _toleranceController = TextEditingController(
       text: '${preset?.lateToleranceMinutes ?? 15}',
     );
+  }
+
+  String? _resolveValidClassId(String? candidate) {
+    if (candidate == null || candidate.isEmpty) return null;
+    final exists = widget.classes.any((c) => c.id == candidate);
+    return exists ? candidate : null;
+  }
+
+  String? _resolveValidScheduleId(String? candidate) {
+    if (candidate == null || candidate.isEmpty) return null;
+    final exists = widget.todaySchedules.any((s) => s.id == candidate);
+    return exists ? candidate : null;
   }
 
   @override
@@ -932,12 +952,21 @@ class _CreateSessionDialogState extends State<_CreateSessionDialog> {
 
   void _onScheduleChanged(String? scheduleId) {
     setState(() {
-      _selectedScheduleId = scheduleId;
-      if (scheduleId != null) {
-        final match = widget.todaySchedules.where((s) => s.id == scheduleId);
+      _selectedScheduleId = _resolveValidScheduleId(scheduleId);
+      _error = null;
+      if (_selectedScheduleId != null) {
+        final match = widget.todaySchedules.where((s) => s.id == _selectedScheduleId);
         if (match.isNotEmpty) {
           final sch = match.first;
-          _selectedClassId = sch.classId;
+          final validClass = _resolveValidClassId(sch.classId);
+          if (validClass != null) {
+            _selectedClassId = validClass;
+          } else {
+            _selectedScheduleId = null;
+            _selectedClassId =
+                widget.classes.isNotEmpty ? widget.classes.first.id : null;
+            _error = 'Kelas dari jadwal tidak ditemukan di daftar kelas.';
+          }
           _expectedStartTime = _parseTimeOfDay(sch.startTime);
           _toleranceController.text = '${sch.lateToleranceMinutes}';
         }
@@ -946,9 +975,13 @@ class _CreateSessionDialogState extends State<_CreateSessionDialog> {
   }
 
   Future<void> _submit() async {
-    if (_sessionType == 'subject' &&
-        (_selectedClassId == null || _selectedClassId!.isEmpty)) {
-      setState(() => _error = 'Pilih kelas terlebih dahulu untuk sesi mata pelajaran.');
+    final validClassId = _resolveValidClassId(_selectedClassId);
+    if (_sessionType == 'subject' && validClassId == null) {
+      setState(
+        () => _error = widget.classes.isEmpty
+            ? 'Belum ada kelas terdaftar. Tambahkan kelas di Web Admin atau pilih sesi Gerbang.'
+            : 'Pilih kelas terlebih dahulu untuk sesi mata pelajaran.',
+      );
       return;
     }
 
@@ -966,8 +999,10 @@ class _CreateSessionDialogState extends State<_CreateSessionDialog> {
     try {
       final created = await widget.apiClient.createSession(
         sessionType: _sessionType,
-        classId: _selectedClassId,
-        scheduleId: _sessionType == 'subject' ? _selectedScheduleId : null,
+        classId: validClassId,
+        scheduleId: _sessionType == 'subject'
+            ? _resolveValidScheduleId(_selectedScheduleId)
+            : null,
         expectedStartTime:
             _expectedStartTime != null ? _formatTimeForApi(_expectedStartTime!) : null,
         lateToleranceMinutes: tolerance,
@@ -991,6 +1026,11 @@ class _CreateSessionDialogState extends State<_CreateSessionDialog> {
 
   @override
   Widget build(BuildContext context) {
+    final validClassId = _resolveValidClassId(_selectedClassId);
+    final validScheduleId = _resolveValidScheduleId(_selectedScheduleId);
+    final missingClassesForSubject =
+        _sessionType == 'subject' && widget.classes.isEmpty;
+
     return AlertDialog(
       title: const Text('Buka Sesi Presensi Baru'),
       content: SingleChildScrollView(
@@ -1024,9 +1064,11 @@ class _CreateSessionDialogState extends State<_CreateSessionDialog> {
                 if (val == null) return;
                 setState(() {
                   _sessionType = val;
+                  _error = null;
                   if (val != 'subject') {
                     _selectedScheduleId = null;
-                  } else if (_selectedClassId == null && widget.classes.isNotEmpty) {
+                  } else if (_resolveValidClassId(_selectedClassId) == null &&
+                      widget.classes.isNotEmpty) {
                     _selectedClassId = widget.classes.first.id;
                   }
                 });
@@ -1035,7 +1077,8 @@ class _CreateSessionDialogState extends State<_CreateSessionDialog> {
             if (_sessionType == 'subject' && widget.todaySchedules.isNotEmpty) ...[
               const SizedBox(height: 12),
               DropdownButtonFormField<String?>(
-                initialValue: _selectedScheduleId,
+                key: ValueKey('schedule_${validScheduleId ?? "none"}'),
+                initialValue: validScheduleId,
                 isExpanded: true,
                 decoration: const InputDecoration(
                   labelText: 'Jadwal Hari Ini (Opsional)',
@@ -1059,37 +1102,54 @@ class _CreateSessionDialogState extends State<_CreateSessionDialog> {
               ),
             ],
             const SizedBox(height: 12),
-            DropdownButtonFormField<String?>(
-              initialValue: _selectedClassId,
-              isExpanded: true,
-              decoration: const InputDecoration(labelText: 'Kelas'),
-              items: [
-                if (_sessionType != 'subject')
-                  const DropdownMenuItem<String?>(
-                    value: null,
-                    child: Text('Semua Kelas (Gerbang Umum)'),
-                  ),
-                ...widget.classes.map(
-                  (c) => DropdownMenuItem<String?>(
-                    value: c.id,
-                    child: Text('${c.name} (${c.studentCount} siswa)'),
+            if (missingClassesForSubject)
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: AppColors.warningTint,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: AppColors.warning.withValues(alpha: 0.4),
                   ),
                 ),
-              ],
-              onChanged: (val) {
-                setState(() {
-                  _selectedClassId = val;
-                  if (_selectedScheduleId != null) {
-                    final match = widget.todaySchedules.where(
-                      (s) => s.id == _selectedScheduleId,
-                    );
-                    if (match.isNotEmpty && match.first.classId != val) {
-                      _selectedScheduleId = null;
+                child: const Text(
+                  'Belum ada data kelas tersedia. Tambahkan kelas melalui Web Admin atau pilih jenis sesi Gerbang.',
+                  style: TextStyle(fontSize: 12.5, color: AppColors.textPrimary),
+                ),
+              )
+            else
+              DropdownButtonFormField<String?>(
+                key: ValueKey('class_${_sessionType}_${validClassId ?? "all"}'),
+                initialValue: validClassId,
+                isExpanded: true,
+                decoration: const InputDecoration(labelText: 'Kelas'),
+                items: [
+                  if (_sessionType != 'subject')
+                    const DropdownMenuItem<String?>(
+                      value: null,
+                      child: Text('Semua Kelas (Gerbang Umum)'),
+                    ),
+                  ...widget.classes.map(
+                    (c) => DropdownMenuItem<String?>(
+                      value: c.id,
+                      child: Text('${c.name} (${c.studentCount} siswa)'),
+                    ),
+                  ),
+                ],
+                onChanged: (val) {
+                  setState(() {
+                    _selectedClassId = val;
+                    if (_selectedScheduleId != null) {
+                      final match = widget.todaySchedules.where(
+                        (s) => s.id == _selectedScheduleId,
+                      );
+                      if (match.isNotEmpty && match.first.classId != val) {
+                        _selectedScheduleId = null;
+                      }
                     }
-                  }
-                });
-              },
-            ),
+                  });
+                },
+              ),
             const SizedBox(height: 12),
             Row(
               children: [
@@ -1136,7 +1196,7 @@ class _CreateSessionDialogState extends State<_CreateSessionDialog> {
           child: const Text('Batal'),
         ),
         ElevatedButton(
-          onPressed: _isSaving ? null : _submit,
+          onPressed: (_isSaving || missingClassesForSubject) ? null : _submit,
           child: _isSaving
               ? const SizedBox(
                   height: 18,

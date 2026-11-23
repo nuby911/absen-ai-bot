@@ -253,4 +253,179 @@ void main() {
     );
     expect(find.text('Deni Prawira'), findsOneWidget);
   });
+
+  testWidgets('LoginScreen server config dialog opens, updates URL, and disposes cleanly', (
+    WidgetTester tester,
+  ) async {
+    final apiClient = ApiClient(storage: MemoryKeyValueStorage());
+
+    await tester.pumpWidget(SmartSchoolGuruApp(apiClient: apiClient));
+    await tester.pumpAndSettle();
+
+    final serverBtn = find.textContaining('Server: ');
+    await tester.ensureVisible(serverBtn);
+    await tester.tap(serverBtn);
+    await tester.pumpAndSettle();
+
+    expect(find.text('Alamat Server Backend'), findsOneWidget);
+
+    await tester.enterText(
+      find.byType(TextField).last,
+      'http://192.168.1.50:8000/api/v1',
+    );
+    await tester.tap(find.text('Simpan'));
+    await tester.pumpAndSettle();
+
+    expect(apiClient.baseUrl, 'http://192.168.1.50:8000/api/v1');
+    expect(tester.takeException(), isNull);
+
+    // Wait for SnackBar to disappear before tapping the bottom server button again
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pumpAndSettle();
+
+    // Re-open and cancel dialog to verify cancel disposal path is also clean
+    final serverBtnAgain = find.textContaining('Server: ');
+    await tester.ensureVisible(serverBtnAgain);
+    await tester.tap(serverBtnAgain);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Batal'));
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('CreateSessionDialog handles empty classes safely', (
+    WidgetTester tester,
+  ) async {
+    const teacher = UserProfile(
+      id: 'tch-1',
+      name: 'Ibu Sari Wulandari, S.Pd',
+      email: 'sari.wulandari@sekolah.sch.id',
+      role: 'teacher',
+      nip: '198901012015032001',
+      hasKioskPin: true,
+    );
+
+    final emptyClassesApi = _createStubApiClient((options) {
+      if (options.path == '/teacher/dashboard') {
+        return {
+          'teacher_name': teacher.name,
+          'today_date': '2026-11-23',
+          'stats': {
+            'present_rate': 0.0,
+            'present_count': 0,
+            'late_count': 0,
+            'pending_leaves_count': 0,
+          },
+          'sessions': const <dynamic>[],
+          'today_schedules': const <dynamic>[],
+        };
+      }
+      if (options.path == '/classes' || options.path == '/leave-requests') {
+        return const <dynamic>[];
+      }
+      return <String, dynamic>{};
+    });
+
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: AppTheme.light(),
+        home: HomeScreen(apiClient: emptyClassesApi, initialUser: teacher),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('+ Buka Sesi Presensi Baru'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Buka Sesi Presensi Baru'), findsOneWidget);
+    expect(
+      find.textContaining('Belum ada data kelas tersedia'),
+      findsOneWidget,
+    );
+    final openButton = tester.widget<ElevatedButton>(
+      find.widgetWithText(ElevatedButton, 'Buka Sesi'),
+    );
+    expect(openButton.onPressed, isNull);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('CreateSessionDialog handles unmatched preset schedule safely', (
+    WidgetTester tester,
+  ) async {
+    const teacher = UserProfile(
+      id: 'tch-1',
+      name: 'Ibu Sari Wulandari, S.Pd',
+      email: 'sari.wulandari@sekolah.sch.id',
+      role: 'teacher',
+      nip: '198901012015032001',
+      hasKioskPin: true,
+    );
+
+    final unmatchedPresetApi = _createStubApiClient((options) {
+      if (options.path == '/teacher/dashboard') {
+        return {
+          'teacher_name': teacher.name,
+          'today_date': '2026-11-23',
+          'stats': {
+            'present_rate': 0.0,
+            'present_count': 0,
+            'late_count': 0,
+            'pending_leaves_count': 0,
+          },
+          'sessions': const <dynamic>[],
+          'today_schedules': [
+            {
+              'id': 'sch-missing-cls',
+              'class_id': 'cls-deleted',
+              'class_name': 'Kelas Terhapus',
+              'teacher_id': 'tch-1',
+              'teacher_name': teacher.name,
+              'subject_name': 'Fisika',
+              'day_of_week': 1,
+              'start_time': '08:00:00',
+              'end_time': '09:30:00',
+              'late_tolerance_minutes': 10,
+            },
+          ],
+        };
+      }
+      if (options.path == '/classes') {
+        return [
+          {
+            'id': 'cls-real',
+            'name': 'XI IPA 1',
+            'homeroom_teacher_id': 'tch-1',
+            'homeroom_teacher_name': teacher.name,
+            'student_count': 30,
+            'created_at': '2026-11-23T00:00:00Z',
+          },
+        ];
+      }
+      if (options.path == '/leave-requests') {
+        return const <dynamic>[];
+      }
+      return <String, dynamic>{};
+    });
+
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: AppTheme.light(),
+        home: HomeScreen(apiClient: unmatchedPresetApi, initialUser: teacher),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.scrollUntilVisible(
+      find.text('Buka Sesi'),
+      200,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.tap(find.text('Buka Sesi'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Buka Sesi Presensi Baru'), findsOneWidget);
+    expect(find.text('XI IPA 1 (30 siswa)'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
 }

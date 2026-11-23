@@ -112,46 +112,10 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   Future<void> _showServerConfigDialog() async {
-    final controller = TextEditingController(text: widget.apiClient.baseUrl);
     final updated = await showDialog<String>(
       context: context,
-      builder: (dialogContext) {
-        return AlertDialog(
-          title: const Text('Alamat Server Backend'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                'Gunakan 10.0.2.2 untuk emulator Android atau alamat IP lokal laptop untuk perangkat fisik.',
-                style: TextStyle(fontSize: 13, color: AppColors.textSecondary),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: controller,
-                keyboardType: TextInputType.url,
-                decoration: const InputDecoration(
-                  labelText: 'API Base URL',
-                  hintText: 'http://10.0.2.2:8000/api/v1',
-                ),
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(dialogContext).pop(),
-              child: const Text('Batal'),
-            ),
-            ElevatedButton(
-              onPressed: () =>
-                  Navigator.of(dialogContext).pop(controller.text.trim()),
-              child: const Text('Simpan'),
-            ),
-          ],
-        );
-      },
+      builder: (_) => _ServerConfigDialog(initialUrl: widget.apiClient.baseUrl),
     );
-    controller.dispose();
 
     if (updated != null && updated.isNotEmpty) {
       await widget.apiClient.setBaseUrl(updated);
@@ -470,6 +434,73 @@ class _LoginScreenState extends State<LoginScreen> {
           ],
         ),
       ),
+    );
+  }
+}
+
+class _ServerConfigDialog extends StatefulWidget {
+  const _ServerConfigDialog({required this.initialUrl});
+
+  final String initialUrl;
+
+  @override
+  State<_ServerConfigDialog> createState() => _ServerConfigDialogState();
+}
+
+class _ServerConfigDialogState extends State<_ServerConfigDialog> {
+  late final TextEditingController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.initialUrl);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _save() {
+    Navigator.of(context).pop(_controller.text.trim());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Alamat Server Backend'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Gunakan 10.0.2.2 untuk emulator Android atau alamat IP lokal laptop untuk perangkat fisik.',
+            style: TextStyle(fontSize: 13, color: AppColors.textSecondary),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _controller,
+            keyboardType: TextInputType.url,
+            textInputAction: TextInputAction.done,
+            onSubmitted: (_) => _save(),
+            decoration: const InputDecoration(
+              labelText: 'API Base URL',
+              hintText: 'http://10.0.2.2:8000/api/v1',
+            ),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Batal'),
+        ),
+        ElevatedButton(
+          onPressed: _save,
+          child: const Text('Simpan'),
+        ),
+      ],
     );
   }
 }
