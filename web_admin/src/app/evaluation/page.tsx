@@ -178,8 +178,10 @@ export default function EvaluationPage() {
               aria-label="Tanggal rekap harian"
               value={recapDate || evaluation?.recap_date || ""}
               onChange={(e) => {
+                const next = e.target.value;
+                if (next === recapDate) return;
                 setLoading(true);
-                setRecapDate(e.target.value);
+                setRecapDate(next);
               }}
               className="text-xs font-semibold text-[#0F172A] focus:outline-none"
             />
