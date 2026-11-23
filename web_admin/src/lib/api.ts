@@ -432,8 +432,12 @@ export async function getMe(): Promise<UserProfile> {
 }
 
 // ---------------------------------------------------------------------------
-// Master Data API: Classes, Parents, Students, Schedules
+// Master Data API: Teachers, Classes, Parents, Students, Schedules
 // ---------------------------------------------------------------------------
+
+export async function getTeachers(): Promise<UserProfile[]> {
+  return apiRequest<UserProfile[]>("/teachers", { method: "GET" });
+}
 
 export async function getClasses(): Promise<SchoolClass[]> {
   return apiRequest<SchoolClass[]>("/classes", { method: "GET" });
@@ -692,7 +696,7 @@ export async function downloadAttendanceCsv(filters?: {
   document.body.appendChild(link);
   link.click();
   link.remove();
-  URL.revokeObjectURL(objectUrl);
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
 }
 
 export async function getLeaveRequests(

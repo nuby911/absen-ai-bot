@@ -75,7 +75,12 @@ class _LoginScreenState extends State<LoginScreen> {
       var activeUser = result.user;
       final pinText = _pinController.text.trim();
       if (pinText.isNotEmpty) {
-        await widget.apiClient.updateKioskPin(pinText);
+        try {
+          await widget.apiClient.updateKioskPin(pinText);
+        } catch (_) {
+          await widget.apiClient.logout();
+          rethrow;
+        }
         activeUser = activeUser.copyWith(hasKioskPin: true);
       }
 

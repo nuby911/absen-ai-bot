@@ -23,6 +23,7 @@ import { DAY_NAMES_ID, formatTimeShort } from "@/lib/format";
 export interface TeacherOption {
   id: string;
   name: string;
+  nip?: string | null;
 }
 
 interface StudentModalProps {
@@ -452,7 +453,7 @@ export function ClassFormModal({
               <option value="">-- Tanpa Wali Kelas --</option>
               {teachers.map((teacher) => (
                 <option key={teacher.id} value={teacher.id}>
-                  {teacher.name}
+                  {teacher.nip ? `${teacher.name} (NIP ${teacher.nip})` : teacher.name}
                 </option>
               ))}
             </select>
@@ -508,7 +509,11 @@ export function ScheduleFormModal({
 }: ScheduleModalProps) {
   const [classId, setClassId] = useState(editing?.class_id ?? classes[0]?.id ?? "");
   const [teacherMode, setTeacherMode] = useState<"list" | "manual">(
-    teachers.length === 0 ? "manual" : "list"
+    teachers.length === 0 ||
+      (editing?.teacher_id &&
+        !teachers.some((t) => t.id === editing.teacher_id))
+      ? "manual"
+      : "list"
   );
   const [teacherId, setTeacherId] = useState(
     editing?.teacher_id ?? teachers[0]?.id ?? ""
@@ -668,7 +673,7 @@ export function ScheduleFormModal({
               <option value="">-- Pilih Guru --</option>
               {teachers.map((teacher) => (
                 <option key={teacher.id} value={teacher.id}>
-                  {teacher.name}
+                  {teacher.nip ? `${teacher.name} (NIP ${teacher.nip})` : teacher.name}
                 </option>
               ))}
             </select>

@@ -37,10 +37,12 @@ import {
   getParents,
   getSchedules,
   getStudents,
+  getTeachers,
   type Parent,
   type Schedule,
   type SchoolClass,
   type Student,
+  type UserProfile,
 } from "@/lib/api";
 import {
   DAY_NAMES_ID,
@@ -64,6 +66,7 @@ export default function MasterDataPage() {
   const [parents, setParents] = useState<Parent[]>([]);
   const [classes, setClasses] = useState<SchoolClass[]>([]);
   const [schedules, setSchedules] = useState<Schedule[]>([]);
+  const [teachers, setTeachers] = useState<UserProfile[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
@@ -87,26 +90,28 @@ export default function MasterDataPage() {
   const [deleting, setDeleting] = useState(false);
 
   const fetchAllMasterData = useCallback(async () => {
-    const [studentsRes, parentsRes, classesRes, schedulesRes] =
+    const [studentsRes, parentsRes, classesRes, schedulesRes, teachersRes] =
       await Promise.all([
         getStudents(),
         getParents(),
         getClasses(),
         getSchedules(),
+        getTeachers(),
       ]);
-    return { studentsRes, parentsRes, classesRes, schedulesRes };
+    return { studentsRes, parentsRes, classesRes, schedulesRes, teachersRes };
   }, []);
 
   const loadAllData = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const { studentsRes, parentsRes, classesRes, schedulesRes } =
+      const { studentsRes, parentsRes, classesRes, schedulesRes, teachersRes } =
         await fetchAllMasterData();
       setStudents(studentsRes);
       setParents(parentsRes);
       setClasses(classesRes);
       setSchedules(schedulesRes);
+      setTeachers(teachersRes);
     } catch (err) {
       setError(
         err instanceof ApiError
@@ -122,13 +127,14 @@ export default function MasterDataPage() {
     let cancelled = false;
     async function init() {
       try {
-        const { studentsRes, parentsRes, classesRes, schedulesRes } =
+        const { studentsRes, parentsRes, classesRes, schedulesRes, teachersRes } =
           await fetchAllMasterData();
         if (cancelled) return;
         setStudents(studentsRes);
         setParents(parentsRes);
         setClasses(classesRes);
         setSchedules(schedulesRes);
+        setTeachers(teachersRes);
         setError(null);
       } catch (err) {
         if (cancelled) return;
@@ -147,23 +153,38 @@ export default function MasterDataPage() {
     };
   }, [fetchAllMasterData]);
 
-  // Derive known teachers from existing classes and schedules
+  // Build teacher dropdown options from GET /api/v1/teachers, preserving any legacy references
   const knownTeachers = useMemo<TeacherOption[]>(() => {
-    const map = new Map<string, string>();
+    const map = new Map<string, TeacherOption>();
+    for (const teacher of teachers) {
+      map.set(teacher.id, {
+        id: teacher.id,
+        name: teacher.name,
+        nip: teacher.nip,
+      });
+    }
     for (const cls of classes) {
-      if (cls.homeroom_teacher_id && cls.homeroom_teacher_name) {
-        map.set(cls.homeroom_teacher_id, cls.homeroom_teacher_name);
+      if (
+        cls.homeroom_teacher_id &&
+        cls.homeroom_teacher_name &&
+        !map.has(cls.homeroom_teacher_id)
+      ) {
+        map.set(cls.homeroom_teacher_id, {
+          id: cls.homeroom_teacher_id,
+          name: cls.homeroom_teacher_name,
+        });
       }
     }
     for (const sched of schedules) {
-      if (sched.teacher_id && sched.teacher_name) {
-        map.set(sched.teacher_id, sched.teacher_name);
+      if (sched.teacher_id && sched.teacher_name && !map.has(sched.teacher_id)) {
+        map.set(sched.teacher_id, {
+          id: sched.teacher_id,
+          name: sched.teacher_name,
+        });
       }
     }
-    return Array.from(map.entries())
-      .map(([id, name]) => ({ id, name }))
-      .sort((a, b) => a.name.localeCompare(b.name));
-  }, [classes, schedules]);
+    return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
+  }, [teachers, classes, schedules]);
 
   const filteredStudents = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();

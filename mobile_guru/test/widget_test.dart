@@ -428,4 +428,84 @@ void main() {
     expect(find.text('XI IPA 1 (30 siswa)'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets(
+    'LoginScreen logs out and clears token when updateKioskPin fails right after login',
+    (WidgetTester tester) async {
+      final storage = MemoryKeyValueStorage();
+      final dio = Dio(BaseOptions(baseUrl: 'http://localhost:8000/api/v1'));
+      dio.httpClientAdapter = _StatusStubHttpAdapter((options) {
+        if (options.path == '/auth/login') {
+          return (
+            statusCode: 200,
+            body: {
+              'access_token': 'temp-jwt-token',
+              'token_type': 'bearer',
+              'user': {
+                'id': 'tch-1',
+                'name': 'Ibu Sari Wulandari, S.Pd',
+                'email': 'sari.wulandari@sekolah.sch.id',
+                'role': 'teacher',
+                'nip': '198901012015032001',
+                'has_kiosk_pin': false,
+              },
+            },
+          );
+        }
+        if (options.path == '/auth/kiosk-pin') {
+          return (
+            statusCode: 500,
+            body: {'detail': 'Gagal menyimpan PIN Kiosk pada server.'},
+          );
+        }
+        return (statusCode: 200, body: <String, dynamic>{});
+      });
+
+      final apiClient = ApiClient(
+        baseUrl: 'http://localhost:8000/api/v1',
+        dio: dio,
+        storage: storage,
+      );
+
+      await tester.pumpWidget(SmartSchoolGuruApp(apiClient: apiClient));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Isi Akun Demo Ibu Sari'));
+      await tester.pump();
+      await tester.tap(find.text('Masuk ke Beranda Guru'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Gagal menyimpan PIN Kiosk pada server.'), findsOneWidget);
+      expect(find.text('Login Akun Guru'), findsOneWidget);
+      expect(apiClient.accessToken, isNull);
+      expect(apiClient.currentUser, isNull);
+      expect(await storage.read('smartschool_guru_token'), isNull);
+    },
+  );
+}
+
+class _StatusStubHttpAdapter implements HttpClientAdapter {
+  _StatusStubHttpAdapter(this.handler);
+
+  final ({int statusCode, dynamic body}) Function(RequestOptions options) handler;
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    final result = handler(options);
+    final bytes = utf8.encode(jsonEncode(result.body));
+    return ResponseBody.fromBytes(
+      bytes,
+      result.statusCode,
+      headers: {
+        Headers.contentTypeHeader: [Headers.jsonContentType],
+      },
+    );
+  }
 }

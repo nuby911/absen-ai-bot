@@ -820,12 +820,15 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
     }
 
     if (result.alreadyRecorded) {
+      final statusLabel = result.status != null && result.status!.isNotEmpty
+          ? AppFormatters.attendanceStatusLabel(result.status!)
+          : 'Tercatat';
       return _BannerMessageCard(
         icon: Icons.info_outline_rounded,
         accentColor: AppColors.kioskCyan,
-        title: '${result.studentName ?? 'Siswa'} • Sudah tercatat hadir',
+        title: '${result.studentName ?? 'Siswa'} • Sudah tercatat ($statusLabel)',
         message:
-            'Kehadiran pada sesi ${widget.session.displayTitle} sudah tersimpan sebelumnya.',
+            'Status $statusLabel pada sesi ${widget.session.displayTitle} sudah tersimpan sebelumnya.',
       );
     }
 

@@ -417,6 +417,42 @@ void main() {
                 'message': 'Deni Prawira sudah tercatat presensi pada sesi ini.',
               };
             }
+            if (scanAttempt == 2) {
+              return {
+                'matched': true,
+                'already_recorded': true,
+                'attendance_id': 'att-102',
+                'student_id': 'stu-2',
+                'student_name': 'Septi Rahmawati',
+                'nis': '24781008',
+                'class_name': 'XI IPA 1',
+                'status': 'sick',
+                'scanned_at': null,
+                'similarity_score': 0.88,
+                'threshold_used': 0.55,
+                'wa_status': 'sent',
+                'wa_queued': false,
+                'message': 'Septi Rahmawati sudah tercatat presensi pada sesi ini.',
+              };
+            }
+            if (scanAttempt == 3) {
+              return {
+                'matched': true,
+                'already_recorded': true,
+                'attendance_id': 'att-103',
+                'student_id': 'stu-3',
+                'student_name': 'Ahmad Fauzi',
+                'nis': '24781009',
+                'class_name': 'XI IPA 1',
+                'status': 'permit',
+                'scanned_at': null,
+                'similarity_score': 0.87,
+                'threshold_used': 0.55,
+                'wa_status': 'sent',
+                'wa_queued': false,
+                'message': 'Ahmad Fauzi sudah tercatat presensi pada sesi ini.',
+              };
+            }
             return {
               'matched': false,
               'already_recorded': false,
@@ -479,17 +515,33 @@ void main() {
           await tester.pump(const Duration(milliseconds: 50));
         }
 
-        // Scan 1: already_recorded == true
+        // Scan 1: already_recorded == true dengan status late -> Terlambat
         final t1 = DateTime(2026, 11, 23, 7, 30, 0);
         await triggerBlink(t1);
-        expect(find.textContaining('Sudah tercatat hadir'), findsOneWidget);
+        expect(find.textContaining('Sudah tercatat (Terlambat)'), findsOneWidget);
         expect(find.textContaining('Deni Prawira'), findsOneWidget);
 
         await tester.pump(const Duration(milliseconds: 2600));
 
-        // Scan 2: matched == false
+        // Scan 2: already_recorded == true dengan status sick -> Sakit
         final t2 = t1.add(const Duration(seconds: 4));
         await triggerBlink(t2);
+        expect(find.textContaining('Sudah tercatat (Sakit)'), findsOneWidget);
+        expect(find.textContaining('Septi Rahmawati'), findsOneWidget);
+
+        await tester.pump(const Duration(milliseconds: 2600));
+
+        // Scan 3: already_recorded == true dengan status permit -> Izin
+        final t3 = t2.add(const Duration(seconds: 4));
+        await triggerBlink(t3);
+        expect(find.textContaining('Sudah tercatat (Izin)'), findsOneWidget);
+        expect(find.textContaining('Ahmad Fauzi'), findsOneWidget);
+
+        await tester.pump(const Duration(milliseconds: 2600));
+
+        // Scan 4: matched == false
+        final t4 = t3.add(const Duration(seconds: 4));
+        await triggerBlink(t4);
         expect(find.textContaining('Wajah tidak dikenali'), findsOneWidget);
 
         await tester.pump(const Duration(milliseconds: 2600));

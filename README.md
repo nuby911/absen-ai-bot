@@ -67,9 +67,10 @@ smart-school-attendance/
 
 2. Sesuaikan variabel pada `.env` jika diperlukan:
    - `WHATSAPP_PROVIDER_MODE=mock` (ubah ke `waha` jika sudah menghubungkan sesi WhatsApp QR di WAHA)
+   - `WAHA_WEBHOOK_SECRET=` (opsional namun direkomendasikan di produksi; jika diisi, setiap request `POST /api/v1/webhook/whatsapp` wajib menyertakan header `X-Webhook-Secret` yang cocok)
    - `LLM_PROVIDER_MODE=fallback` (ubah ke `gemini` dan isi `GEMINI_API_KEY` untuk respons LLM Gemini aktif)
    - `FACE_SIMILARITY_THRESHOLD=0.55`
-   - `FACE_ENGINE_MODE=auto`
+   - `FACE_ENGINE_MODE=auto` *(untuk pengujian ilmiah/produksi dengan model ONNX InsightFace asli, pasang ekstra ML dan set `FACE_ENGINE_MODE=insightface` — lihat catatan di bawah)*
 
 3. Jalankan seluruh service Docker (`postgres`, `waha`, `backend`):
    ```bash
@@ -81,11 +82,20 @@ smart-school-attendance/
    - **WAHA WhatsApp Gateway**: `http://localhost:3000`
 
 4. *(Alternatif tanpa Docker)* Menjalankan backend secara lokal dengan SQLite/PostgreSQL:
-   ```bash
-   cd backend
-   uv sync
-   uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-   ```
+   - **Mode pengembangan/demo ringan** (menggunakan `DeterministicFaceEngine` tanpa bobot ONNX):
+     ```bash
+     cd backend
+     uv sync
+     uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+     ```
+   - **Mode InsightFace asli (wajib untuk evaluasi FAR/FRR ilmiah & produksi):**
+     Pasang dependensi opsional grup `ml` (`insightface` + `onnxruntime`) dan tetapkan `FACE_ENGINE_MODE=insightface` agar backend benar-benar memakai model pengenalan wajah InsightFace (`buffalo_l`), bukan jatuh kembali (*fallback*) ke `DeterministicFaceEngine`:
+     ```bash
+     cd backend
+     uv sync --extra ml
+     FACE_ENGINE_MODE=insightface uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+     ```
+     *(Di PowerShell Windows: `$env:FACE_ENGINE_MODE="insightface"; uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000`)*
 
 ---
 
@@ -171,6 +181,14 @@ Data demo yang ikut dibuat oleh seeder:
 ## 7. Pengambilan Data Confusion Matrix (FAR/FRR) & Latency untuk Bab Pengujian Laporan
 
 Sistem menyediakan instrumen evaluasi ilmiah bawaan pada tabel `face_recognition_logs` dan `chatbot_logs` yang terhubung ke halaman **Evaluasi & Laporan** di Web Admin (`/evaluation`).
+
+### Prasyarat Engine Pengenalan Wajah untuk Pengujian Ilmiah
+> **Penting:** Secara bawaan, `uv sync` tidak memasang paket ML (`insightface` dan `onnxruntime`), sehingga `FACE_ENGINE_MODE=auto` akan otomatis jatuh kembali ke `DeterministicFaceEngine` (hanya untuk pengujian unit/demo offline). Sebelum mengambil data Confusion Matrix (**FAR/FRR**) dan latensi untuk bab pengujian laporan, pastikan Anda memasang ekstra ML dan mengunci mode InsightFace asli:
+> ```bash
+> cd backend
+> uv sync --extra ml
+> ```
+> Lalu atur `FACE_ENGINE_MODE=insightface` pada berkas `.env` (atau environment variable server) agar evaluasi benar-benar mengukur performa model **InsightFace** (`buffalo_l` ONNX), bukan `DeterministicFaceEngine`.
 
 ### Langkah Pengambilan Data Pengujian Pengenalan Wajah
 1. **Jalankan skenario uji Kiosk** (melalui Mode Kiosk Flutter atau endpoint `POST /api/v1/attendance/scan`), termasuk variasi kondisi pencahayaan/kacamata dan sampel uji **impostor** (wajah tidak terdaftar / foto cetak). Opsional: kirim parameter form `condition_note` (mis. `pencahayaan_redup`, `kacamata`, `jarak_1m`).
