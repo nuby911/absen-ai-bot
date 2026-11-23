@@ -1,227 +1,302 @@
-# SmartSchool AI — Sistem Presensi Wajah Kiosk & Chatbot WhatsApp Orang Tua
+# SmartSchool AI — Aplikasi Absensi Sekolah Cerdas Berbasis Face Recognition & AI Chatbot WhatsApp
 
-Sistem informasi presensi sekolah terpadu berbasis **Face Recognition + Liveness Detection (kedipan mata)** dan **Asisten AI WhatsApp Orang Tua**. Proyek ini dibangun sebagai monorepo yang terdiri dari layanan **Backend API (FastAPI)**, **Web Admin Dashboard (Next.js)**, dan **Mobile App Guru & Mode Kiosk (Flutter)**.
+![FastAPI](https://img.shields.io/badge/Backend-FastAPI%20%7C%20Python%203.10+-009688?style=flat-square)
+![Next.js](https://img.shields.io/badge/Web%20Admin-Next.js%2016%20%7C%20TypeScript-000000?style=flat-square)
+![Flutter](https://img.shields.io/badge/Mobile%20Guru-Flutter%203%20%7C%20ML%20Kit-02569B?style=flat-square)
+![PostgreSQL](https://img.shields.io/badge/Database-PostgreSQL%2016-336791?style=flat-square)
+![WhatsApp AI](https://img.shields.io/badge/Chatbot-WhatsApp%20WAHA%20%2B%20Gemini%20AI-25D366?style=flat-square)
+
+**SmartSchool AI** adalah sistem absensi sekolah cerdas *end-to-end* yang menggabungkan **pengenalan wajah otomatis (*Face Recognition*)**, **deteksi keaktifan anti-pemalsuan (*Blink Liveness Detection*)**, dan **Asisten Virtual AI Chatbot di WhatsApp** untuk orang tua/wali murid.
 
 ---
 
-## 1. Arsitektur Monorepo
+## Mengapa Aplikasi Ini Dibuat?
 
-```text
-smart-school-attendance/
-├── backend/                 # FastAPI, SQLAlchemy Async, Face Engine, WAHA & Gemini Chatbot
-│   ├── app/
-│   │   ├── main.py          # Entrypoint FastAPI + static /uploads
-│   │   ├── config.py        # Konfigurasi environment (pydantic-settings)
-│   │   ├── models.py        # 12 tabel ORM (users, classes, parents, students, schedules,
-│   │   │                    #   face_embeddings, attendance_sessions, attendances,
-│   │   │                    #   leave_requests, face_recognition_logs, chatbot_logs, system_settings)
-│   │   ├── routers/         # auth, admin, attendance, leaves, webhook
-│   │   ├── providers/       # FaceEngine (InsightFace/auto), WhatsApp (WAHA/mock), LLM (Gemini/fallback)
-│   │   ├── services/        # Orkestrator Chatbot & evaluasi metrik
-│   │   └── seed.py          # Seeder data demo idempoten
-│   └── tests/               # Pytest suite
-├── web_admin/               # Next.js 16 + Tailwind CSS v4 (Dashboard Admin, Dataset Wajah, Evaluasi)
-│   └── src/app/
-│       ├── page.tsx         # Ringkasan & manajemen kelas/guru/jadwal
-│       ├── login/           # Login Admin
-│       ├── students/        # CRUD Siswa & Orang Tua
-│       ├── faces/           # Registrasi Dataset Wajah (maks. 5 slot foto/siswa)
-│       └── evaluation/      # Confusion Matrix FAR/FRR, Latency, Chatbot Logs & Ekspor CSV
-├── mobile_guru/             # Flutter 3 (Android/iOS) — Aplikasi Guru & Mode Kiosk Hands-Free
-│   ├── lib/
-│   │   ├── core/            # Theme, Formatters WIB, ApiClient (Dio + SecureStorage)
-│   │   ├── models/          # Data models sesuai skema backend
-│   │   ├── services/        # BlinkLivenessDetector (open -> closed -> open + cooldown 2.5 dtk)
-│   │   ├── widgets/         # KioskPinSheet (modal PIN 4–6 digit)
-│   │   └── screens/         # Login, Home, SessionDetail, KioskScanner, LeaveVerification
-│   └── test/                # Unit & widget tests (liveness, kiosk PIN lock, leave verification)
-├── docker-compose.yml       # Orkestrasi PostgreSQL 16 + WAHA + FastAPI Backend
-└── .env.example             # Template variabel lingkungan
+Pencatatan kehadiran di sekolah umumnya masih menggunakan lembar tanda tangan manual atau kartu pelajar fisik yang menyita waktu pelajaran, rentan tertinggal/hilang, serta mudah disalahgunakan (*titip absen*). Selain itu, orang tua sering kali baru mengetahui ketidakhadiran anaknya di akhir pekan atau akhir semester.
+
+**SmartSchool AI** menyelesaikan masalah tersebut dengan:
+1. **Absensi Nirkontak & Anti-Titip Absen:** Siswa cukup berdiri di depan perangkat **Mode Kiosk** milik Guru/Petugas Piket (jarak ideal 30–80 cm) dan berkedip sekali untuk mencegah kecurangan memakai foto cetak atau layar ponsel.
+2. **Notifikasi WhatsApp Real-Time Otomatis:** Begitu wajah siswa terverifikasi di Kiosk, sistem langsung mengirimkan pesan WhatsApp otomatis ke nomor orang tua (*nama siswa, kelas, jam masuk, dan status Tepat Waktu/Terlambat*).
+3. **Asisten AI Chatbot 24 Jam di WhatsApp:** Orang tua tidak perlu menginstal aplikasi tambahan. Cukup lewat WhatsApp, orang tua bisa menanyakan status kehadiran hari ini, rekap persentase kehadiran bulanan, jadwal pelajaran, hingga mengajukan izin/sakit lengkap dengan foto surat dokter — dengan isolasi data ketat sehingga setiap orang tua hanya bisa mengakses data anaknya sendiri.
+4. **Instrumen Evaluasi Ilmiah Bawaan:** Dashboard Admin menyediakan pencatatan otomatis untuk menghitung **Confusion Matrix (Accuracy, FAR, FRR)**, pengatur *threshold* *cosine similarity*, serta pengukuran **Response Accuracy & Latency** AI Chatbot untuk kebutuhan evaluasi sistem dan laporan akademik.
+
+---
+
+## Peran Pengguna & Fitur Utama
+
+| Aktor | Platform | Fitur Utama |
+| :--- | :--- | :--- |
+| **Admin Sekolah** | **Web Dashboard** (`web_admin/` — Next.js) | • CRUD Data Master (Siswa, Orang Tua/No. WA, Kelas, Jadwal)<br>• Registrasi **3–5 sampel foto wajah** per siswa (via Webcam langsung atau Upload file) dengan validasi otomatis tepat 1 wajah jelas<br>• Pengaturan *Cosine Similarity Threshold* (`0.30–0.85`)<br>• Dashboard **Evaluasi Ilmiah** (Confusion Matrix TP/FP/FN/TN, Accuracy, FAR, FRR, Log Chatbot & Latency)<br>• Rekap kehadiran harian per kelas & **Ekspor CSV** |
+| **Guru / Petugas Piket** | **Mobile App** (`mobile_guru/` — Flutter) | • Login akun Guru (Email/NIP) & pengaturan **PIN Kiosk** (4–6 digit)<br>• Beranda KPI harian & daftar sesi kelas/gerbang<br>• **Mode Kiosk Hands-Free** (layar gelap penuh, deteksi wajah + kedipan mata *on-device* via Google ML Kit, overlay konfirmasi + status WA terkirim, auto-reset 2,5 detik)<br>• Proteksi keluar Kiosk terkunci PIN (`PopScope(canPop: false)`) & **Input Manual Darurat (PIN)**<br>• Tab **Verifikasi Izin & Sakit** dari WhatsApp (Setujui/Tolak -> otomatis sinkron ke absensi & kabari WA orang tua) |
+| **Siswa** | **Tanpa Aplikasi** (Hadir di Kiosk) | • Cukup menghadap kamera Kiosk Guru dan berkedip sekali saat jam masuk/pulang atau pergantian mata pelajaran |
+| **Orang Tua / Wali Murid** | **WhatsApp AI Chatbot** (WAHA / Cloud API) | • Menerima notifikasi kehadiran anak secara otomatis begitu anak selesai scan<br>• Tanya jawab bahasa alami (*"Hari ini anak saya sudah absen?"*, *"Rekap bulan ini berapa persen?"*, *"Jadwal pelajaran hari Selasa?"*)<br>• Pengajuan izin/sakit via chat WA + lampiran foto surat dokter -> otomatis dapat balasan hasil verifikasi Guru |
+
+---
+
+## Arsitektur Sistem (*Hybrid Smart-Edge*)
+
+```mermaid
+flowchart TB
+    subgraph Mobile["Mobile App Guru (Flutter)"]
+        M1["Camera + Google ML Kit (On-Device)"]
+        M2["Blink Liveness & Pose Check (60fps)"]
+        M3["Mode Kiosk Hands-Free + Kunci PIN"]
+        M4["Verifikasi Izin / Sakit"]
+        M1 --> M2 --> M3
+    end
+
+    subgraph Web["Web Dashboard Admin (Next.js)"]
+        W1["Master Data CRUD"]
+        W2["Registrasi 3-5 Foto Wajah (Webcam/Upload)"]
+        W3["Dashboard Evaluasi FAR / FRR / Latency & CSV"]
+    end
+
+    subgraph Backend["Backend Core (Python FastAPI)"]
+        B1["Auth JWT + Kiosk PIN + RBAC"]
+        B2["Face Engine (InsightFace ONNX 512-d / Cosine Similarity)"]
+        B3["Chatbot Orchestrator (Gemini Function Calling + Keyword Fallback)"]
+        B4["Notification Worker (Auto WA + Retry)"]
+    end
+
+    DB[("PostgreSQL 16\n(12 Tabel Relasional +\nFace Embeddings + Log Evaluasi)")]
+    WA["WhatsApp Gateway\n(WAHA Docker / Cloud API)"]
+    Parent["WhatsApp Orang Tua / Wali Murid"]
+
+    Mobile -->|"HTTPS REST / Multipart"| Backend
+    Web -->|"HTTPS REST / Multipart"| Backend
+    Backend <--> DB
+    B4 --> WA --> Parent
+    Parent --> WA -->|"Webhook POST /api/v1/webhook/whatsapp"| B3
 ```
 
-### Alur Kerja Utama
-1. **Admin (`web_admin`)** mengelola data guru, kelas, siswa, orang tua, jadwal pelajaran, serta mendaftarkan hingga 5 foto dataset wajah per siswa (`/faces`).
-2. **Guru (`mobile_guru`)** login, mengatur PIN Kiosk (4–6 digit), membuka sesi presensi kelas/gerbang, dan mengaktifkan **Mode Kiosk Hands-Free** yang terkunci dengan `PopScope(canPop: false)`.
-3. **Siswa** menghadap kamera depan Kiosk dan berkedip sekali (`BlinkLivenessDetector` memvalidasi anti-spoofing foto statis). Foto dikirim ke `POST /api/v1/attendance/scan`, dicatat sebagai `Hadir`/`Terlambat`, dan memicu notifikasi WhatsApp otomatis ke orang tua melalui WAHA.
-4. **Orang Tua** berinteraksi dengan **Chatbot AI WhatsApp** (`POST /api/v1/webhook/whatsapp`) untuk menanyakan kehadiran hari ini, melihat jadwal pelajaran, atau mengajukan izin/sakit beserta lampiran surat dokter.
-5. **Guru** memverifikasi izin masuk pada tab **Verifikasi Izin** (`PATCH /api/v1/leave-requests/{id}/verify`) yang langsung menyinkronkan data sesi dan mengirim konfirmasi WhatsApp ke orang tua.
+**Kenapa *Hybrid Smart-Edge*?**
+- **Deteksi wajah & kedipan mata (*liveness*) berjalan *on-device*** di HP Guru memakai Google ML Kit sehingga antrean kelas lancar tanpa mengirim *streaming* video ke server.
+- **Ekstraksi *face embedding* (512-dimensi) berjalan terpusat di Python FastAPI (InsightFace ONNX)**, sehingga foto registrasi dari Web Admin dan foto scan dari Kiosk diproses oleh model & *preprocessing* yang 100% identik.
 
 ---
 
-## 2. Prasyarat Sistem
+## Tech Stack
 
-- **Docker & Docker Compose** (untuk menjalankan PostgreSQL, WAHA, dan Backend secara terisolasi)
-- **Python 3.10+** & **`uv`** (opsional jika menjalankan backend secara lokal tanpa Docker)
-- **Node.js 20+** & **npm** (untuk Web Admin Next.js)
-- **Flutter SDK 3.x** & Android Studio / Emulator / Perangkat Android fisik (untuk Mobile App Guru)
-
----
-
-## 3. Menjalankan Backend + PostgreSQL + WAHA via Docker Compose
-
-1. Salin berkas template environment di root repositori:
-   ```bash
-   cp .env.example .env
-   ```
-   *(Di PowerShell Windows: `Copy-Item .env.example .env`)*
-
-2. Sesuaikan variabel pada `.env` jika diperlukan:
-   - `WHATSAPP_PROVIDER_MODE=mock` (ubah ke `waha` jika sudah menghubungkan sesi WhatsApp QR di WAHA)
-   - `WAHA_WEBHOOK_SECRET=` (opsional namun direkomendasikan di produksi; jika diisi, setiap request `POST /api/v1/webhook/whatsapp` wajib menyertakan header `X-Webhook-Secret` yang cocok)
-   - `LLM_PROVIDER_MODE=fallback` (ubah ke `gemini` dan isi `GEMINI_API_KEY` untuk respons LLM Gemini aktif)
-   - `FACE_SIMILARITY_THRESHOLD=0.55`
-   - `FACE_ENGINE_MODE=auto` *(untuk pengujian ilmiah/produksi dengan model ONNX InsightFace asli, pasang ekstra ML dan set `FACE_ENGINE_MODE=insightface` — lihat catatan di bawah)*
-
-3. Jalankan seluruh service Docker (`postgres`, `waha`, `backend`):
-   ```bash
-   docker compose up --build -d
-   ```
-   Layanan akan aktif pada port lokal:
-   - **Backend FastAPI**: `http://localhost:8000` (Swagger UI: `http://localhost:8000/docs`, Health: `http://localhost:8000/health`)
-   - **PostgreSQL 16**: `localhost:5432` (database: `smart_school_attendance`)
-   - **WAHA WhatsApp Gateway**: `http://localhost:3000`
-
-4. *(Alternatif tanpa Docker)* Menjalankan backend secara lokal dengan SQLite/PostgreSQL:
-   - **Mode pengembangan/demo ringan** (menggunakan `DeterministicFaceEngine` tanpa bobot ONNX):
-     ```bash
-     cd backend
-     uv sync
-     uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-     ```
-   - **Mode InsightFace asli (wajib untuk evaluasi FAR/FRR ilmiah & produksi):**
-     Pasang dependensi opsional grup `ml` (`insightface` + `onnxruntime`) dan tetapkan `FACE_ENGINE_MODE=insightface` agar backend benar-benar memakai model pengenalan wajah InsightFace (`buffalo_l`), bukan jatuh kembali (*fallback*) ke `DeterministicFaceEngine`:
-     ```bash
-     cd backend
-     uv sync --extra ml
-     FACE_ENGINE_MODE=insightface uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-     ```
-     *(Di PowerShell Windows: `$env:FACE_ENGINE_MODE="insightface"; uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000`)*
+| Subsistem | Teknologi Utama |
+| :--- | :--- |
+| **Backend API & AI Engine** | Python 3.10+, FastAPI, SQLAlchemy (Async), Pydantic v2, PyJWT, NumPy, Pillow, InsightFace + ONNX Runtime (opsional via `--extra ml`), `uv`, Pytest |
+| **Database** | PostgreSQL 16 (produksi/Docker), SQLite + `aiosqlite` (pengembangan lokal/unit test) |
+| **AI Chatbot & WhatsApp** | Google Gemini API (*Function Calling* + `RuleBased` & *Keyword Fallback* menu `1`–`4`), WAHA (*WhatsApp HTTP API* Docker) |
+| **Web Dashboard Admin** | Next.js 16 (App Router), React, TypeScript, Tailwind CSS v4 |
+| **Mobile App Guru & Kiosk** | Flutter 3 (Dart), `camera`, `google_mlkit_face_detection`, `dio`, `flutter_secure_storage`, `audioplayers`, `intl` |
+| **Infrastruktur** | Docker & Docker Compose (`postgres`, `waha`, `backend`) |
 
 ---
 
-## 4. Mengisi Data Demo (`python -m app.seed`)
+## Struktur Direktori
 
-Seeder bersifat **idempoten** (aman dijalankan berulang kali tanpa menduplikasi data).
+```text
+absen-ai-bot/
+├── backend/                     # FastAPI Backend, Face Engine, Chatbot & Evaluasi
+│   ├── app/
+│   │   ├── main.py              # Entrypoint FastAPI, lifespan DB init, static /uploads
+│   │   ├── config.py            # Environment settings (pydantic-settings)
+│   │   ├── database.py          # Async SQLAlchemy engine & session factory
+│   │   ├── models.py            # 12 tabel ORM (master, biometrik, absensi, izin, log evaluasi)
+│   │   ├── schemas.py           # Kontrak request/response Pydantic v2
+│   │   ├── security.py          # JWT, PBKDF2-HMAC-SHA256 password/PIN, normalisasi nomor WA
+│   │   ├── providers/           # FaceEngine (InsightFace/Deterministic), WhatsApp (WAHA/Mock), LLM (Gemini/RuleBased)
+│   │   ├── services/chatbot.py  # ChatbotOrchestrator (4 tool terisolasi parent_id + keyword fallback)
+│   │   ├── routers/             # auth, admin, attendance, leaves, webhook
+│   │   └── seed.py              # Seeder data demo idempoten
+│   ├── tests/                   # 52 automated tests (Pytest)
+│   ├── Dockerfile               # Multi-stage Docker build (uv + non-root user)
+│   └── pyproject.toml           # Dependensi Python & optional group [ml]
+├── web_admin/                   # Web Dashboard Admin (Next.js App Router + TypeScript)
+│   └── src/
+│       ├── lib/                 # Typed API client & formatter WIB/WA
+│       ├── components/          # Sidebar, AdminShell, Modal Master Data, WebcamCapture, Label Evaluasi
+│       └── app/                 # /login, /, /students, /faces, /evaluation
+├── mobile_guru/                 # Mobile App Guru & Kiosk (Flutter)
+│   ├── lib/
+│   │   ├── core/                # AppTheme, AppColors, ApiClient, Formatters
+│   │   ├── models/              # Typed Dart models sesuai skema backend
+│   │   ├── services/            # BlinkLivenessDetector (state machine kedipan + cooldown 2.5d)
+│   │   ├── widgets/             # KioskPinSheet (keypad numerik PIN 4-6 digit)
+│   │   └── screens/             # Login, Home, SessionDetail, KioskScanner, LeaveVerification
+│   └── test/                    # 23 unit & widget tests Flutter
+├── docker-compose.yml           # Orkestrasi PostgreSQL 16 + WAHA + FastAPI Backend
+└── .env.example                 # Template variabel lingkungan
+```
 
-- **Jika Backend berjalan via Docker Compose:**
-  ```bash
-  docker compose exec backend python -m app.seed
-  ```
-- **Jika Backend berjalan secara lokal di folder `backend/`:**
+---
+
+## Ringkasan Database & Endpoint API Utama
+
+### 12 Tabel Database (`backend/app/models.py`)
+`users`, `classes`, `parents`, `students`, `schedules`, `face_embeddings`, `attendance_sessions`, `attendances` (`UNIQUE(session_id, student_id)`), `leave_requests`, `face_recognition_logs`, `chatbot_logs`, dan `system_settings`.
+
+### Endpoint API Inti (`/api/v1`)
+Dokumentasi interaktif Swagger tersedia otomatis di `http://localhost:8000/docs` saat backend berjalan.
+- **Auth & PIN:** `POST /auth/login`, `GET /auth/me`, `PUT /auth/kiosk-pin`, `POST /auth/verify-pin`
+- **Admin & Dataset Wajah:** `CRUD /classes`, `CRUD /parents`, `CRUD /students`, `CRUD /schedules`, `GET /teachers`, `GET/POST/DELETE /students/{id}/faces`, `GET/PUT /settings/face-threshold`
+- **Guru & Kiosk:** `GET /teacher/dashboard`, `POST /sessions`, `GET /sessions/{id}`, `POST /sessions/{id}/close`, `POST /attendance/scan`, `POST /attendance/manual`, `POST /attendance/{id}/resend-wa`
+- **Verifikasi Izin:** `GET /leave-requests`, `PATCH /leave-requests/{id}/verify`
+- **WhatsApp AI Webhook:** `POST /webhook/whatsapp` (mendukung payload standar & webhook WAHA)
+- **Evaluasi & Laporan:** `GET /evaluation/metrics`, `POST /evaluation/face-logs/{log_id}/label`, `GET /reports/attendance.csv`
+
+---
+
+## Panduan Menjalankan Aplikasi
+
+### Prasyarat
+- **Git**
+- **Docker & Docker Compose** *(direkomendasikan untuk PostgreSQL + WAHA + Backend)*
+- **Python 3.10+** & **[`uv`](https://docs.astral.sh/uv/)** *(jika menjalankan backend secara lokal)*
+- **Node.js 20+** & **npm** *(untuk Web Admin Next.js)*
+- **Flutter SDK 3.x** & Android Studio / Emulator / HP Android *(untuk Mobile App Guru)*
+
+### 1. Clone Repositori & Siapkan Environment
+```bash
+git clone https://github.com/nuby911/absen-ai-bot.git
+cd absen-ai-bot
+cp .env.example .env
+```
+*(Di Windows PowerShell: `Copy-Item .env.example .env`)*
+
+### 2. Jalankan Backend
+
+#### Opsi A — Menggunakan Docker Compose (PostgreSQL 16 + WAHA + FastAPI)
+```bash
+docker compose up --build -d
+```
+Layanan yang aktif:
+- **Backend FastAPI & Swagger Docs:** `http://localhost:8000` / `http://localhost:8000/docs`
+- **PostgreSQL 16:** `localhost:5432` (`smart_school_attendance`)
+- **WAHA WhatsApp Gateway:** `http://localhost:3000`
+
+#### Opsi B — Menjalankan Backend Secara Lokal (Tanpa Docker)
+- **Mode demo / pengembangan ringan** (memakai `DeterministicFaceEngine` tanpa mengunduh bobot ONNX):
   ```bash
   cd backend
-  uv run python -m app.seed
+  uv sync
+  uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   ```
+- **Mode InsightFace ONNX Asli** *(wajib untuk pengujian akurasi FAR/FRR sesungguhnya & produksi)*:
+  ```bash
+  cd backend
+  uv sync --extra ml
+  FACE_ENGINE_MODE=insightface uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+  ```
+  *(Di PowerShell Windows: `$env:FACE_ENGINE_MODE="insightface"; uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000`)*
 
-### Daftar Akun Demo & Kredensial Default
+### 3. Isi Data Demo (Seeder Idempoten)
+Aman dijalankan berulang kali tanpa menduplikasi data:
+```bash
+# Jika lewat Docker Compose:
+docker compose exec backend python -m app.seed
 
+# Jika lokal di folder backend/:
+cd backend
+uv run python -m app.seed
+```
+
+#### Akun Demo Default
 | Peran | Nama | Email | NIP | Kata Sandi | PIN Kiosk |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Admin** | Admin Sekolah | `admin@sekolah.sch.id` | `198001012010011001` | `admin123` | - |
+| **Admin** | Admin Sekolah | `admin@sekolah.sch.id` | `198001012010011001` | `admin123` | — |
 | **Guru** | Ibu Sari Wulandari, S.Pd | `sari.wulandari@sekolah.sch.id` | `198901012015032001` | `guru123` | `1234` |
 | **Guru** | Bapak Budi Hartono, M.Pd | `budi.hartono@sekolah.sch.id` | `198504122012011002` | `guru123` | `1234` |
 | **Guru** | Ibu Dewi Anggraini, S.Pd | `dewi.anggraini@sekolah.sch.id` | `199008202016032003` | `guru123` | `1234` |
 | **Guru** | Bapak Dwi Handoko, M.T.I | `dwi.handoko@sekolah.sch.id` | `198711052014021004` | `guru123` | `1234` |
 
-Data demo yang ikut dibuat oleh seeder:
-- 4 kelas (`XI IPA 1`, `XI IPA 2`, `XI IPS 1`, `XII IPA 1`) dan 8 siswa beserta akun orang tua.
-- Sampel embedding wajah awal untuk 5 siswa kelas `XI IPA 1`.
-- 1 sesi presensi aktif hari ini (`XI IPA 1 — Pemrograman Mobile`) beserta catatan hadir/terlambat awal.
-- 2 pengajuan izin menunggu verifikasi (`Septi Cahyaningtias` - Sakit, `Ahmad Fauzi` - Izin).
-- 8 log evaluasi pengenalan wajah (`TP`, `FP`, `FN`, `TN`) dan 4 log interaksi chatbot untuk halaman Evaluasi.
+### 4. Jalankan Web Dashboard Admin (Next.js)
+```bash
+cd web_admin
+cp .env.local.example .env.local
+npm install
+npm run dev -- -p 3001
+```
+> **Catatan:** Menggunakan port `3001` menghindari bentrok dengan WAHA yang memakai port `3000`. Jika WAHA tidak dijalankan, Anda bisa memakai `npm run dev` pada port `3000`.
+
+Buka `http://localhost:3001` lalu masuk dengan akun Admin (`admin@sekolah.sch.id` / `admin123`).
+
+### 5. Jalankan Mobile App Guru & Kiosk (Flutter)
+```bash
+cd mobile_guru
+flutter pub get
+
+# Android Emulator:
+flutter run --dart-define=API_BASE_URL=http://10.0.2.2:8000/api/v1
+
+# Perangkat Android Fisik (ganti IP dengan IP lokal Wi-Fi laptop/server):
+flutter run --dart-define=API_BASE_URL=http://192.168.1.10:8000/api/v1
+```
+Alamat server API juga bisa diubah langsung di aplikasi lewat tombol **Server** di layar Login atau tab **Profil & PIN**.
 
 ---
 
-## 5. Menjalankan Web Admin (Next.js)
+## Mengaktifkan WhatsApp Sungguhan (WAHA) & Gemini AI
 
-1. Masuk ke folder `web_admin` dan salin konfigurasi environment:
-   ```bash
-   cd web_admin
-   cp .env.local.example .env.local
-   ```
-   Pastikan `NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1`.
+Secara default aplikasi berjalan dalam mode aman tanpa API key (`WHATSAPP_PROVIDER_MODE=mock`, `LLM_PROVIDER_MODE=fallback`). Untuk mengaktifkan layanan nyata di `.env`:
 
-2. Pasang dependensi dan jalankan server pengembangan:
-   ```bash
-   npm install
-   npm run dev
-   ```
-   > **Catatan Port:** Jika service **WAHA** sedang aktif pada port `3000` di Docker Compose, jalankan Next.js pada port `3001`:
-   > ```bash
-   > npm run dev -- -p 3001
-   > ```
-
-3. Buka browser ke `http://localhost:3000` (atau `http://localhost:3001`) lalu login menggunakan akun demo Admin (`admin@sekolah.sch.id` / `admin123`).
-
----
-
-## 6. Menjalankan Mobile App Guru (Flutter)
-
-1. Masuk ke folder `mobile_guru` dan ambil paket Flutter:
-   ```bash
-   cd mobile_guru
-   flutter pub get
-   ```
-
-2. Jalankan aplikasi dengan parameter `--dart-define=API_BASE_URL` sesuai perangkat target:
-   - **Android Emulator** (mengakses localhost host machine melalui `10.0.2.2`):
-     ```bash
-     flutter run --dart-define=API_BASE_URL=http://10.0.2.2:8000/api/v1
+1. **Google Gemini API (Gratis di Google AI Studio):**
+   - Dapatkan API Key di [aistudio.google.com](https://aistudio.google.com/).
+   - Set di `.env`:
+     ```env
+     LLM_PROVIDER_MODE=gemini
+     GEMINI_API_KEY=your_gemini_api_key
+     GEMINI_MODEL=gemini-2.0-flash
      ```
-   - **Perangkat Android Fisik** (dalam satu jaringan Wi-Fi dengan laptop/server):
-     ```bash
-     flutter run --dart-define=API_BASE_URL=http://192.168.1.10:8000/api/v1
+2. **WhatsApp Gateway (WAHA):**
+   - Jalankan container `waha` via `docker compose up -d waha`.
+   - Buka dashboard WAHA di `http://localhost:3000`, buat session `default`, lalu scan QR Code menggunakan akun WhatsApp bot sekolah.
+   - Arahkan webhook event `message` WAHA ke `http://backend:8000/api/v1/webhook/whatsapp` (atau URL publik/tunnel jika backend lokal).
+   - Set di `.env`:
+     ```env
+     WHATSAPP_PROVIDER_MODE=waha
+     WAHA_BASE_URL=http://waha:3000
+     WAHA_SESSION=default
+     WAHA_WEBHOOK_SECRET=rahasia_webhook_anda
      ```
-     *(Ganti `192.168.1.10` dengan IP lokal laptop Anda. Alamat server juga dapat diubah langsung saat runtime melalui tombol **Server** di layar Login atau kartu **Konfigurasi Server API** pada tab **Profil & PIN**).*
-
-3. Masuk menggunakan akun demo Guru (`sari.wulandari@sekolah.sch.id` / `guru123`, PIN Kiosk `1234`, atau tekan tombol **"Isi Akun Demo Ibu Sari"** di layar Login).
 
 ---
 
-## 7. Pengambilan Data Confusion Matrix (FAR/FRR) & Latency untuk Bab Pengujian Laporan
+## Panduan Pengambilan Data Evaluasi Ilmiah (FAR, FRR, Accuracy & Latency)
 
-Sistem menyediakan instrumen evaluasi ilmiah bawaan pada tabel `face_recognition_logs` dan `chatbot_logs` yang terhubung ke halaman **Evaluasi & Laporan** di Web Admin (`/evaluation`).
+> **Penting:** Untuk pengujian ilmiah pengenalan wajah yang valid, pastikan backend berjalan dengan **InsightFace asli** (`uv sync --extra ml` dan `FACE_ENGINE_MODE=insightface`), bukan `DeterministicFaceEngine`.
 
-### Prasyarat Engine Pengenalan Wajah untuk Pengujian Ilmiah
-> **Penting:** Secara bawaan, `uv sync` tidak memasang paket ML (`insightface` dan `onnxruntime`), sehingga `FACE_ENGINE_MODE=auto` akan otomatis jatuh kembali ke `DeterministicFaceEngine` (hanya untuk pengujian unit/demo offline). Sebelum mengambil data Confusion Matrix (**FAR/FRR**) dan latensi untuk bab pengujian laporan, pastikan Anda memasang ekstra ML dan mengunci mode InsightFace asli:
-> ```bash
-> cd backend
-> uv sync --extra ml
-> ```
-> Lalu atur `FACE_ENGINE_MODE=insightface` pada berkas `.env` (atau environment variable server) agar evaluasi benar-benar mengukur performa model **InsightFace** (`buffalo_l` ONNX), bukan `DeterministicFaceEngine`.
-
-### Langkah Pengambilan Data Pengujian Pengenalan Wajah
-1. **Jalankan skenario uji Kiosk** (melalui Mode Kiosk Flutter atau endpoint `POST /api/v1/attendance/scan`), termasuk variasi kondisi pencahayaan/kacamata dan sampel uji **impostor** (wajah tidak terdaftar / foto cetak). Opsional: kirim parameter form `condition_note` (mis. `pencahayaan_redup`, `kacamata`, `jarak_1m`).
-2. **Beri label ground-truth pada log hasil scan** melalui halaman Web Admin **`/evaluation`** (tombol **Beri Label** pada tabel *Log Pengenalan Wajah*) atau API `POST /api/v1/evaluation/face-logs/{log_id}/label`:
-   - Pilih siswa sebenarnya (`actual_student_id`) untuk sampel siswa terdaftar -> sistem mengklasifikasikan otomatis ke **TP** (cocok & benar), **FP** (cocok ke siswa yang salah), atau **FN** (tidak dikenali).
-   - Tandai sebagai **Impostor** (`is_impostor: true`) untuk penguji non-siswa -> sistem mengklasifikasikan ke **FP** (lolos sebagai siswa) atau **TN** (ditolak dengan benar).
-3. **Atur Threshold Cosine Similarity** (`0.30` – `0.85`, default `0.55`) langsung dari slider di halaman `/evaluation` (`PUT /api/v1/settings/face-threshold`) untuk menguji kurva perbandingan **FAR vs FRR** pada berbagai nilai ambang batas.
-4. **Catat Metrik Evaluasi** yang dihitung otomatis oleh `GET /api/v1/evaluation/metrics`:
-   - **Confusion Matrix**: `TP`, `FP`, `FN`, `TN`
-   - **Accuracy**: `(TP + TN) / (TP + FP + FN + TN) × 100%`
-   - **False Acceptance Rate (FAR)**: `FP / (FP + TN) × 100%`
-   - **False Rejection Rate (FRR)**: `FN / (FN + TP) × 100%`
-   - **Rata-rata Latency Scan**: `avg_scan_latency_ms` (ms)
-   - **Metrik Chatbot AI**: `total_messages`, `in_domain_rate`, `fallback_rate`, dan `avg_latency_ms`
-5. **Ekspor Rekap Presensi CSV** untuk lampiran laporan menggunakan tombol **Ekspor CSV** pada halaman `/evaluation` atau langsung melalui endpoint `GET /api/v1/reports/attendance.csv` (menghasilkan berkas `rekap-absensi.csv` berformat UTF-8).
+1. Lakukan uji scan wajah melalui Mode Kiosk (siswa terdaftar pada variasi jarak 30–80 cm, pencahayaan, kacamata, serta uji **impostor**/foto cetak).
+2. Buka Web Admin menu **Laporan & Evaluasi** (`/evaluation`), lalu klik **Beri Label** pada tabel *Log Pengenalan Wajah* untuk mengisi *ground-truth* (`actual_student_id` atau tandai **Impostor**).
+3. Sesuaikan slider **Threshold Cosine Similarity** (`0.30–0.85`, default `0.55`) untuk membandingkan trade-off **FAR vs FRR**.
+4. Sistem otomatis menghitung:
+   - **Accuracy** = `(TP + TN) / (TP + FP + FN + TN) × 100%`
+   - **FAR (False Acceptance Rate)** = `FP / (FP + TN) × 100%`
+   - **FRR (False Rejection Rate)** = `FN / (FN + TP) × 100%`
+   - **Avg Scan Latency (ms)** & **Chatbot In-Domain Rate / Fallback Rate / Avg Latency (ms)**
+5. Klik **Ekspor CSV** untuk mengunduh rekap absensi siap lampir (`rekap-absensi.csv`).
 
 ---
 
-## 8. Pengujian Otomatis (Verification Commands)
+## Menjalankan Pengujian Otomatis
 
-- **Backend (Pytest):**
-  ```bash
-  cd backend
-  uv run pytest
-  ```
-- **Web Admin (TypeScript, ESLint, Production Build):**
-  ```bash
-  cd web_admin
-  npx tsc --noEmit && npm run lint && npm run build
-  ```
-- **Mobile Guru (Flutter Analyzer & Widget/Unit Tests):**
-  ```bash
-  cd mobile_guru
-  flutter analyze
-  flutter test
-  ```
+```bash
+# 1. Backend (52 unit & integration tests, zero warnings)
+cd backend
+uv run pytest -v -W error
+
+# 2. Web Admin (TypeScript type-check, ESLint, production build)
+cd web_admin
+npx tsc --noEmit && npm run lint && npm run build
+
+# 3. Mobile Guru (23 unit & widget tests + static analyzer)
+cd mobile_guru
+flutter analyze && flutter test
+```
+
+---
+
+## Tim Pengembang
+
+Proyek Mata Kuliah **Pemrograman Berbasis Mobile** — Program Studi Manajemen Informatika, Jurusan Teknologi Informasi, **Politeknik Negeri Lampung (2026)**:
+- **Deni Prawira** (`24781007`)
+- **Rubby Ibnu Anantara** (`24781025`)
+- **Septi Cahyaningtias** (`24781026`)
+- **Yoga Ricky Pasaribu** (`24781030`)
+
+Dosen Pengampu: **Dwi Handoko, S.Kom., M.T.I**

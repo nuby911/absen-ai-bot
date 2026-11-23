@@ -15,22 +15,30 @@ htmlcov/
 node_modules/
 .next/
 out/
+tsconfig.tsbuildinfo
+next-env.d.ts
 
-# Flutter / Dart / Builds
+# Flutter / Dart / Android Builds
 build/
 .dart_tool/
 .flutter-plugins
 .flutter-plugins-dependencies
 .packages
+local.properties
 
 # Secrets & local runtime data
 .env
 .env.local
+.env.*.local
 uploads/
 *.db
 *.sqlite
 *.sqlite3
+*.log
 
-# OS / Editor
+# IDE / OS
+.idea/
+*.iml
+.vscode/
 .DS_Store
 Thumbs.db
