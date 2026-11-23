@@ -62,10 +62,12 @@ class _SmartSchoolGuruAppState extends State<SmartSchoolGuruApp> {
   Widget _buildLeaveVerificationTab(
     BuildContext context,
     VoidCallback onLeaveChanged,
+    int refreshTrigger,
   ) {
     return LeaveVerificationScreen(
       apiClient: _apiClient,
       onLeaveChanged: onLeaveChanged,
+      refreshTrigger: refreshTrigger,
     );
   }
 

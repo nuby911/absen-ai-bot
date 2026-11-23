@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:smart_school_guru/core/api_client.dart';
 import 'package:smart_school_guru/core/theme.dart';
+import 'package:smart_school_guru/main.dart';
 import 'package:smart_school_guru/models/models.dart';
 import 'package:smart_school_guru/screens/leave_verification_screen.dart';
 
@@ -293,6 +294,102 @@ void main() {
         await tester.tap(find.text('Disetujui'));
         await tester.pumpAndSettle();
         expect(find.text('Septi Cahyaningtias'), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'berpindah ke tab Verifikasi Izin pada SmartSchoolGuruApp memicu refreshTrigger dan fetch ulang daftar izin',
+      (WidgetTester tester) async {
+        var leaveFetchCount = 0;
+        var includeNewLeave = false;
+
+        final apiClient = _createStubApiClient((options) {
+          if (options.path == '/auth/me') {
+            return {
+              'id': 'tch-1',
+              'name': 'Ibu Sari Wulandari, S.Pd',
+              'email': 'sari.wulandari@sekolah.sch.id',
+              'role': 'teacher',
+              'nip': '198901012015032001',
+              'has_kiosk_pin': true,
+            };
+          }
+          if (options.path == '/teacher/dashboard') {
+            return {
+              'teacher_name': 'Ibu Sari Wulandari, S.Pd',
+              'today_date': '2026-11-23',
+              'stats': {
+                'present_rate': 90.0,
+                'present_count': 27,
+                'late_count': 1,
+                'pending_leaves_count': includeNewLeave ? 1 : 0,
+              },
+              'sessions': const <dynamic>[],
+              'today_schedules': const <dynamic>[],
+            };
+          }
+          if (options.path == '/leave-requests' && options.method == 'GET') {
+            leaveFetchCount += 1;
+            if (!includeNewLeave) {
+              return const <dynamic>[];
+            }
+            return [
+              {
+                'id': 'leave-new-1',
+                'student_id': 'stu-6',
+                'student_name': 'Nadia Pratama',
+                'student_nis': '24781040',
+                'class_id': 'cls-2',
+                'class_name': 'XI IPA 2',
+                'parent_id': 'par-6',
+                'parent_name': 'Ibu Pratama',
+                'parent_phone_wa': '6281279001239',
+                'request_type': 'permit',
+                'start_date': '2026-11-23',
+                'end_date': '2026-11-23',
+                'reason': 'Keperluan keluarga mendadak',
+                'attachment_url': null,
+                'status': 'pending',
+                'verified_by': null,
+                'verified_by_name': null,
+                'verified_at': null,
+                'created_at': '2026-11-23T01:15:00Z',
+              },
+            ];
+          }
+          return <String, dynamic>{};
+        });
+
+        const teacher = UserProfile(
+          id: 'tch-1',
+          name: 'Ibu Sari Wulandari, S.Pd',
+          email: 'sari.wulandari@sekolah.sch.id',
+          role: 'teacher',
+          nip: '198901012015032001',
+          hasKioskPin: true,
+        );
+        await apiClient.saveSession('token-guru', teacher);
+
+        await tester.pumpWidget(SmartSchoolGuruApp(apiClient: apiClient));
+        await tester.pumpAndSettle();
+
+        expect(leaveFetchCount, 1);
+
+        // Simulasikan ada pengajuan izin baru masuk sebelum guru berpindah ke tab Verifikasi Izin
+        includeNewLeave = true;
+        await tester.tap(find.text('Verifikasi Izin'));
+        await tester.pumpAndSettle();
+
+        expect(leaveFetchCount, 2);
+        expect(find.text('Nadia Pratama'), findsOneWidget);
+
+        // Kembali ke Beranda lalu tekan kartu KPI Izin Pending -> juga memicu refreshTrigger
+        await tester.tap(find.text('Beranda'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Izin Pending'));
+        await tester.pumpAndSettle();
+
+        expect(leaveFetchCount, 3);
       },
     );
   });

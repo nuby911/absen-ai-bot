@@ -20,6 +20,7 @@ typedef KioskScannerBuilder = Widget Function(
 typedef LeaveVerificationTabBuilder = Widget Function(
   BuildContext context,
   VoidCallback onLeaveChanged,
+  int refreshTrigger,
 );
 
 /// Callback opsional untuk menampilkan modal PIN Kiosk (`KioskPinSheet`) di Task 10.
@@ -145,6 +146,18 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  void _selectTab(int index) {
+    setState(() {
+      _currentTab = index;
+      if (index == 1) {
+        _leaveRefreshTick += 1;
+      }
+    });
+    if (index == 0) {
+      _loadDashboard();
+    }
+  }
+
   Future<void> _logout() async {
     await widget.apiClient.logout();
     if (!mounted) return;
@@ -184,17 +197,7 @@ class _HomeScreenState extends State<HomeScreen> {
         selectedIndex: _currentTab,
         backgroundColor: AppColors.card,
         indicatorColor: AppColors.primaryTint,
-        onDestinationSelected: (index) {
-          setState(() {
-            _currentTab = index;
-            if (index == 1) {
-              _leaveRefreshTick += 1;
-            }
-          });
-          if (index == 0) {
-            _loadDashboard();
-          }
-        },
+        onDestinationSelected: _selectTab,
         destinations: [
           const NavigationDestination(
             icon: Icon(Icons.home_outlined),
@@ -225,7 +228,11 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _buildLeaveTab() {
     if (widget.leaveVerificationBuilder != null) {
-      return widget.leaveVerificationBuilder!(context, _loadDashboard);
+      return widget.leaveVerificationBuilder!(
+        context,
+        _loadDashboard,
+        _leaveRefreshTick,
+      );
     }
 
     return LeaveVerificationScreen(
@@ -435,7 +442,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _buildPinWarningBanner() {
     return InkWell(
-      onTap: () => setState(() => _currentTab = 2),
+      onTap: () => _selectTab(2),
       borderRadius: BorderRadius.circular(14),
       child: Container(
         padding: const EdgeInsets.all(12),
@@ -523,7 +530,7 @@ class _HomeScreenState extends State<HomeScreen> {
         const SizedBox(width: 10),
         Expanded(
           child: InkWell(
-            onTap: () => setState(() => _currentTab = 1),
+            onTap: () => _selectTab(1),
             borderRadius: BorderRadius.circular(16),
             child: _KpiCard(
               title: 'Izin Pending',
