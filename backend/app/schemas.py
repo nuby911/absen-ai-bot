@@ -1,9 +1,9 @@
 from datetime import date, datetime, time
 import math
 import re
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.models import User
 from app.security import normalize_wa_phone
@@ -533,3 +533,81 @@ class LeaveVerifyResponse(BaseModel):
     synced_sessions_count: int
     wa_sent: bool
     message: str
+
+
+# ---------------------------------------------------------------------------
+# WhatsApp AI Chatbot Webhook Schemas (Task 6)
+# ---------------------------------------------------------------------------
+
+
+class WahaMessagePayload(BaseModel):
+    """Nested WAHA webhook message payload (`{from, body, mediaUrl?, fromMe?}`)."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    from_: str | None = Field(default=None, alias="from")
+    body: str = ""
+    media_url: str | None = Field(default=None, alias="mediaUrl")
+    media: dict[str, Any] | None = None
+    from_me: bool = Field(default=False, alias="fromMe")
+
+
+class WhatsAppWebhookRequest(BaseModel):
+    """Incoming webhook payload supporting both standard and WAHA formats."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    phone_wa: str | None = None
+    message_text: str | None = None
+    media_url: str | None = None
+
+    event: str | None = None
+    payload: WahaMessagePayload | None = None
+
+    @model_validator(mode="after")
+    def validate_payload_shape(self) -> "WhatsAppWebhookRequest":
+        phone_raw, msg_text, media, ignored = self.extract_normalized_fields()
+        if not ignored:
+            if not phone_raw or not phone_raw.strip():
+                raise ValueError("Nomor WhatsApp pengirim wajib diisi.")
+            normalize_wa_phone(phone_raw)
+            if (not msg_text or not msg_text.strip()) and not (media and media.strip()):
+                raise ValueError("Isi pesan WhatsApp wajib diisi.")
+        return self
+
+    def extract_normalized_fields(self) -> tuple[str | None, str | None, str | None, bool]:
+        """Return `(phone_wa_raw, message_text, media_url, ignored)` for standard or WAHA input."""
+        if self.payload is not None:
+            if self.event is not None and self.event != "message":
+                return None, None, None, True
+            if self.payload.from_me:
+                return None, None, None, True
+            sender_raw = (self.payload.from_ or "").strip()
+            if sender_raw == "status@broadcast" or sender_raw.lower().endswith("@g.us"):
+                return None, None, None, True
+
+            media_val = self.payload.media_url
+            if not media_val and isinstance(self.payload.media, dict):
+                raw_url = self.payload.media.get("url")
+                if isinstance(raw_url, str) and raw_url.strip():
+                    media_val = raw_url.strip()
+
+            return sender_raw, self.payload.body, media_val, False
+
+        if self.event is not None and self.event != "message":
+            return None, None, None, True
+
+        return self.phone_wa, self.message_text, self.media_url, False
+
+
+class WhatsAppWebhookResponse(BaseModel):
+    """Structured response returned by the WhatsApp AI chatbot webhook."""
+
+    reply_text: str = ""
+    is_in_domain: bool = True
+    is_fallback: bool = False
+    tool_called: str | None = None
+    detected_intent: str | None = None
+    latency_ms: int = 0
+    wa_sent: bool = False
+    ignored: bool = False
