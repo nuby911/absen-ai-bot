@@ -1,3 +1,6 @@
+import csv
+from datetime import date, datetime, timedelta, timezone
+import io
 from pathlib import Path
 from typing import TypeVar
 import uuid
@@ -10,7 +13,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings, get_settings
 from app.database import get_db
 from app.models import (
+    Attendance,
+    AttendanceSession,
+    ChatbotLog,
     FaceEmbedding,
+    FaceRecognitionLog,
     Parent,
     Schedule,
     SchoolClass,
@@ -24,8 +31,16 @@ from app.providers.face_engine import (
     FaceValidationError,
     get_face_engine,
 )
+from app.providers.whatsapp import ATTENDANCE_STATUS_LABELS_ID
 from app.schemas import (
+    ChatbotEvaluationMetrics,
+    ChatbotLogItem,
+    ClassDailyRecap,
+    EvaluationDashboardResponse,
     FaceEmbeddingResponse,
+    FaceEvaluationMetrics,
+    FaceLogLabelRequest,
+    FaceRecognitionLogItem,
     FaceThresholdResponse,
     FaceThresholdUpdateRequest,
     ParentCreate,
@@ -45,10 +60,24 @@ from app.security import get_current_user, require_admin
 
 router = APIRouter(prefix="/api/v1", tags=["admin"])
 
+WIB = timezone(timedelta(hours=7))
 FACE_THRESHOLD_SETTING_KEY = "face_similarity_threshold"
 MAX_FACES_PER_STUDENT = 5
 MIN_FACE_QUALITY_SCORE = 0.5
 MAX_FACE_IMAGE_BYTES = 10 * 1024 * 1024
+
+_VERIFICATION_METHOD_LABELS_ID: dict[str, str] = {
+    "face_recognition": "Pengenalan Wajah",
+    "manual_teacher": "Manual Guru",
+    "chatbot_leave": "Chatbot Izin",
+}
+
+_WA_STATUS_LABELS_ID: dict[str, str] = {
+    "sent": "Terkirim",
+    "failed": "Gagal",
+    "pending": "Menunggu",
+    "skipped": "Dilewati",
+}
 
 ModelT = TypeVar("ModelT")
 
@@ -874,3 +903,357 @@ async def update_face_threshold_setting(
 
     await db.commit()
     return FaceThresholdResponse(threshold=payload.threshold)
+
+
+# ---------------------------------------------------------------------------
+# Scientific Evaluation Metrics, Lab Labeling & CSV Export (Task 7)
+# ---------------------------------------------------------------------------
+
+
+def _is_impostor_note(condition_note: str | None) -> bool:
+    return bool(condition_note and condition_note.strip().lower().startswith("impostor"))
+
+
+def _classify_face_log(log: FaceRecognitionLog) -> str:
+    """Classify one face scan log into TP, FP, FN, TN, or unlabeled."""
+    if log.actual_student_id is not None:
+        if log.is_match and log.predicted_student_id == log.actual_student_id:
+            return "TP"
+        if log.is_match:
+            return "FP"
+        return "FN"
+
+    if _is_impostor_note(log.condition_note):
+        return "FP" if log.is_match else "TN"
+    return "unlabeled"
+
+
+def _to_face_log_item(
+    log: FaceRecognitionLog,
+    student_names: dict[str, str],
+) -> FaceRecognitionLogItem:
+    return FaceRecognitionLogItem(
+        id=log.id,
+        session_id=log.session_id,
+        predicted_student_id=log.predicted_student_id,
+        predicted_student_name=(
+            student_names.get(log.predicted_student_id)
+            if log.predicted_student_id is not None
+            else None
+        ),
+        actual_student_id=log.actual_student_id,
+        actual_student_name=(
+            student_names.get(log.actual_student_id)
+            if log.actual_student_id is not None
+            else None
+        ),
+        top_similarity_score=log.top_similarity_score,
+        threshold_used=log.threshold_used,
+        liveness_passed=log.liveness_passed,
+        is_match=log.is_match,
+        latency_ms=log.latency_ms,
+        condition_note=log.condition_note,
+        is_impostor=log.actual_student_id is None and _is_impostor_note(log.condition_note),
+        classification=_classify_face_log(log),
+        created_at=log.created_at,
+    )
+
+
+def _format_wib_csv_timestamp(dt: datetime | None) -> str:
+    if dt is None:
+        return "-"
+    target = dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+    return target.astimezone(WIB).strftime("%d/%m/%Y %H:%M WIB")
+
+
+@router.get("/evaluation/metrics", response_model=EvaluationDashboardResponse)
+async def get_evaluation_metrics(
+    recap_date: date | None = Query(default=None),
+    _: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> EvaluationDashboardResponse:
+    """Return Confusion Matrix (FAR/FRR), chatbot metrics, and daily class recaps."""
+    target_date = recap_date or datetime.now(WIB).date()
+
+    face_logs = (
+        await db.scalars(
+            select(FaceRecognitionLog).order_by(
+                FaceRecognitionLog.created_at.desc(),
+                FaceRecognitionLog.id.desc(),
+            )
+        )
+    ).all()
+
+    student_rows = (await db.execute(select(Student.id, Student.name))).all()
+    student_names = {student_id: name for student_id, name in student_rows}
+
+    tp = fp = fn = tn = 0
+    total_face_latency = 0
+    for log in face_logs:
+        total_face_latency += log.latency_ms
+        label = _classify_face_log(log)
+        if label == "TP":
+            tp += 1
+        elif label == "FP":
+            fp += 1
+        elif label == "FN":
+            fn += 1
+        elif label == "TN":
+            tn += 1
+
+    total_scans = len(face_logs)
+    total_labeled = tp + fp + fn + tn
+    accuracy = round((tp + tn) / total_labeled * 100.0, 2) if total_labeled > 0 else 0.0
+    far = round(fp / (fp + tn) * 100.0, 2) if (fp + tn) > 0 else 0.0
+    frr = round(fn / (fn + tp) * 100.0, 2) if (fn + tp) > 0 else 0.0
+    avg_scan_latency_ms = (
+        round(total_face_latency / total_scans, 2) if total_scans > 0 else 0.0
+    )
+    active_threshold = await get_active_face_threshold(
+        db,
+        default=settings.face_similarity_threshold,
+    )
+
+    face_metrics = FaceEvaluationMetrics(
+        total_scans=total_scans,
+        total_labeled=total_labeled,
+        tp=tp,
+        fp=fp,
+        fn=fn,
+        tn=tn,
+        accuracy=accuracy,
+        far=far,
+        frr=frr,
+        avg_scan_latency_ms=avg_scan_latency_ms,
+        threshold=active_threshold,
+    )
+
+    chatbot_logs = (
+        await db.scalars(
+            select(ChatbotLog).order_by(
+                ChatbotLog.created_at.desc(),
+                ChatbotLog.id.desc(),
+            )
+        )
+    ).all()
+    total_messages = len(chatbot_logs)
+    in_domain_count = sum(1 for row in chatbot_logs if row.is_in_domain)
+    fallback_count = sum(1 for row in chatbot_logs if row.is_fallback)
+    in_domain_rate = (
+        round(in_domain_count / total_messages * 100.0, 2) if total_messages > 0 else 0.0
+    )
+    fallback_rate = (
+        round(fallback_count / total_messages * 100.0, 2) if total_messages > 0 else 0.0
+    )
+    avg_chatbot_latency_ms = (
+        round(sum(row.latency_ms for row in chatbot_logs) / total_messages, 2)
+        if total_messages > 0
+        else 0.0
+    )
+
+    chatbot_metrics = ChatbotEvaluationMetrics(
+        total_messages=total_messages,
+        in_domain_count=in_domain_count,
+        in_domain_rate=in_domain_rate,
+        fallback_count=fallback_count,
+        fallback_rate=fallback_rate,
+        avg_latency_ms=avg_chatbot_latency_ms,
+        recent_logs=[
+            ChatbotLogItem(
+                id=row.id,
+                created_at=row.created_at,
+                phone_wa=row.phone_wa,
+                user_message=row.user_message,
+                detected_intent=row.detected_intent,
+                tool_called=row.tool_called,
+                is_in_domain=row.is_in_domain,
+                is_fallback=row.is_fallback,
+                latency_ms=row.latency_ms,
+            )
+            for row in chatbot_logs[:20]
+        ],
+    )
+
+    class_rows = (
+        await db.execute(
+            select(SchoolClass, User.name.label("homeroom_teacher_name"))
+            .outerjoin(User, SchoolClass.homeroom_teacher_id == User.id)
+            .order_by(SchoolClass.name)
+        )
+    ).all()
+
+    recap_map: dict[str, ClassDailyRecap] = {
+        school_class.id: ClassDailyRecap(
+            class_id=school_class.id,
+            class_name=school_class.name,
+            homeroom_teacher_name=teacher_name,
+        )
+        for school_class, teacher_name in class_rows
+    }
+
+    attendance_rows = (
+        await db.execute(
+            select(Student.class_id, Attendance.status, Attendance.wa_status)
+            .join(AttendanceSession, Attendance.session_id == AttendanceSession.id)
+            .join(Student, Attendance.student_id == Student.id)
+            .where(AttendanceSession.session_date == target_date)
+        )
+    ).all()
+
+    for cls_id, att_status, wa_status in attendance_rows:
+        recap = recap_map.get(cls_id)
+        if recap is None:
+            continue
+        if att_status == "present":
+            recap.present_count += 1
+        elif att_status == "late":
+            recap.late_count += 1
+        elif att_status in ("permit", "sick"):
+            recap.permit_or_sick_count += 1
+        elif att_status == "absent":
+            recap.absent_count += 1
+
+        if wa_status != "skipped":
+            recap.wa_total_count += 1
+            if wa_status == "sent":
+                recap.wa_sent_count += 1
+
+    return EvaluationDashboardResponse(
+        recap_date=target_date,
+        face_metrics=face_metrics,
+        chatbot_metrics=chatbot_metrics,
+        class_recaps=list(recap_map.values()),
+        recent_face_logs=[_to_face_log_item(log, student_names) for log in face_logs[:20]],
+    )
+
+
+@router.post(
+    "/evaluation/face-logs/{log_id}/label",
+    response_model=FaceRecognitionLogItem,
+)
+async def label_face_recognition_log(
+    log_id: str,
+    payload: FaceLogLabelRequest,
+    _: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> FaceRecognitionLogItem:
+    """Assign ground-truth student or impostor label to a face recognition log."""
+    log = await _get_or_404(
+        db,
+        FaceRecognitionLog,
+        log_id,
+        "Log pengenalan wajah tidak ditemukan.",
+    )
+
+    if payload.is_impostor:
+        log.actual_student_id = None
+        note = payload.condition_note or ""
+        if not note:
+            log.condition_note = "impostor"
+        elif _is_impostor_note(note):
+            log.condition_note = note
+        else:
+            log.condition_note = f"impostor:{note}"
+    else:
+        if payload.actual_student_id is not None:
+            await _get_or_404(
+                db,
+                Student,
+                payload.actual_student_id,
+                "Siswa tidak ditemukan.",
+            )
+        log.actual_student_id = payload.actual_student_id
+        if "condition_note" in payload.model_fields_set:
+            log.condition_note = payload.condition_note
+        elif payload.actual_student_id is not None and _is_impostor_note(log.condition_note):
+            log.condition_note = None
+
+    await db.commit()
+    await db.refresh(log)
+
+    student_ids = {
+        sid for sid in (log.predicted_student_id, log.actual_student_id) if sid is not None
+    }
+    student_names: dict[str, str] = {}
+    if student_ids:
+        rows = (
+            await db.execute(
+                select(Student.id, Student.name).where(Student.id.in_(student_ids))
+            )
+        ).all()
+        student_names = {sid: name for sid, name in rows}
+
+    return _to_face_log_item(log, student_names)
+
+
+@router.get("/reports/attendance.csv")
+async def export_attendance_csv(
+    class_id: str | None = Query(default=None),
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+    _: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Export attendance records as a downloadable UTF-8 CSV report."""
+    if start_date is not None and end_date is not None and end_date < start_date:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Tanggal akhir tidak boleh lebih awal dari tanggal mulai.",
+        )
+
+    stmt = (
+        select(Attendance, AttendanceSession, Student, SchoolClass)
+        .join(AttendanceSession, Attendance.session_id == AttendanceSession.id)
+        .join(Student, Attendance.student_id == Student.id)
+        .join(SchoolClass, Student.class_id == SchoolClass.id)
+        .order_by(
+            AttendanceSession.session_date.desc(),
+            SchoolClass.name.asc(),
+            Student.name.asc(),
+        )
+    )
+    if class_id is not None:
+        stmt = stmt.where(Student.class_id == class_id)
+    if start_date is not None:
+        stmt = stmt.where(AttendanceSession.session_date >= start_date)
+    if end_date is not None:
+        stmt = stmt.where(AttendanceSession.session_date <= end_date)
+
+    rows = (await db.execute(stmt)).all()
+
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow(
+        [
+            "Tanggal",
+            "Kelas",
+            "NIS",
+            "Nama Siswa",
+            "Status",
+            "Metode Verifikasi",
+            "Waktu Scan",
+            "Status WA",
+        ]
+    )
+    for att, session_row, student, school_class in rows:
+        writer.writerow(
+            [
+                session_row.session_date.isoformat(),
+                school_class.name,
+                student.nis,
+                student.name,
+                ATTENDANCE_STATUS_LABELS_ID.get(att.status, att.status),
+                _VERIFICATION_METHOD_LABELS_ID.get(
+                    att.verification_method, att.verification_method
+                ),
+                _format_wib_csv_timestamp(att.scanned_at),
+                _WA_STATUS_LABELS_ID.get(att.wa_status, att.wa_status),
+            ]
+        )
+
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="rekap-absensi.csv"'},
+    )

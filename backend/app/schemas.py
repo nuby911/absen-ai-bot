@@ -611,3 +611,110 @@ class WhatsAppWebhookResponse(BaseModel):
     latency_ms: int = 0
     wa_sent: bool = False
     ignored: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Scientific Evaluation Metrics & Lab Labeling Schemas (Task 7)
+# ---------------------------------------------------------------------------
+
+
+class FaceLogLabelRequest(BaseModel):
+    """Payload for labeling a kiosk face recognition log as a student or impostor."""
+
+    actual_student_id: str | None = None
+    is_impostor: bool = False
+    condition_note: str | None = Field(default=None, max_length=255)
+
+    @field_validator("condition_note")
+    @classmethod
+    def normalize_condition_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+
+class FaceRecognitionLogItem(BaseModel):
+    """Individual face recognition scan log with confusion matrix classification."""
+
+    id: str
+    session_id: str | None = None
+    predicted_student_id: str | None = None
+    predicted_student_name: str | None = None
+    actual_student_id: str | None = None
+    actual_student_name: str | None = None
+    top_similarity_score: float
+    threshold_used: float
+    liveness_passed: bool
+    is_match: bool
+    latency_ms: int
+    condition_note: str | None = None
+    is_impostor: bool = False
+    classification: str = "unlabeled"
+    created_at: datetime
+
+
+class FaceEvaluationMetrics(BaseModel):
+    """Face recognition confusion matrix metrics (TP/FP/FN/TN, FAR, FRR, latency)."""
+
+    total_scans: int = 0
+    total_labeled: int = 0
+    tp: int = 0
+    fp: int = 0
+    fn: int = 0
+    tn: int = 0
+    accuracy: float = 0.0
+    far: float = 0.0
+    frr: float = 0.0
+    avg_scan_latency_ms: float = 0.0
+    threshold: float = 0.55
+
+
+class ChatbotLogItem(BaseModel):
+    """Individual WhatsApp AI chatbot evaluation log item."""
+
+    id: str
+    created_at: datetime
+    phone_wa: str
+    user_message: str
+    detected_intent: str | None = None
+    tool_called: str | None = None
+    is_in_domain: bool
+    is_fallback: bool
+    latency_ms: int
+
+
+class ChatbotEvaluationMetrics(BaseModel):
+    """Aggregated WhatsApp AI chatbot domain accuracy, fallback rate, and latency."""
+
+    total_messages: int = 0
+    in_domain_count: int = 0
+    in_domain_rate: float = 0.0
+    fallback_count: int = 0
+    fallback_rate: float = 0.0
+    avg_latency_ms: float = 0.0
+    recent_logs: list[ChatbotLogItem] = Field(default_factory=list)
+
+
+class ClassDailyRecap(BaseModel):
+    """Daily attendance and WhatsApp notification recap for one academic class."""
+
+    class_id: str
+    class_name: str
+    homeroom_teacher_name: str | None = None
+    present_count: int = 0
+    late_count: int = 0
+    permit_or_sick_count: int = 0
+    absent_count: int = 0
+    wa_sent_count: int = 0
+    wa_total_count: int = 0
+
+
+class EvaluationDashboardResponse(BaseModel):
+    """Combined scientific evaluation metrics and daily class recap for admin dashboard."""
+
+    recap_date: date
+    face_metrics: FaceEvaluationMetrics
+    chatbot_metrics: ChatbotEvaluationMetrics
+    class_recaps: list[ClassDailyRecap] = Field(default_factory=list)
+    recent_face_logs: list[FaceRecognitionLogItem] = Field(default_factory=list)
