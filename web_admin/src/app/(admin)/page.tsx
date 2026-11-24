@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import {
   Activity,
@@ -9,13 +9,16 @@ import {
   BarChart3,
   CheckCircle2,
   ClipboardList,
+  ExternalLink,
   MessageSquare,
+  Paperclip,
   RefreshCw,
   ScanFace,
   SlidersHorizontal,
   Users,
 } from "lucide-react";
-import { AdminShell } from "@/components/AdminShell";
+import { AdminPageHeader } from "@/components/AdminShell";
+import { Modal } from "@/components/Modal";
 import { StatusBadge } from "@/components/StatusBadge";
 import {
   ApiError,
@@ -23,11 +26,24 @@ import {
   getEvaluationMetrics,
   getLeaveRequests,
   getStudents,
+  resolveAssetUrl,
   type EvaluationDashboardResponse,
   type LeaveRequestItem,
   type SchoolClass,
   type Student,
 } from "@/lib/api";
+import {
+  formatWaPhoneDisplay,
+  formatWibDate,
+  formatWibDateTime,
+} from "@/lib/format";
+
+function formatLeaveDateRange(startDate: string, endDate: string): string {
+  if (!endDate || startDate === endDate) {
+    return formatWibDate(startDate);
+  }
+  return `${formatWibDate(startDate)} – ${formatWibDate(endDate)}`;
+}
 
 export default function DashboardPage() {
   const [students, setStudents] = useState<Student[]>([]);
@@ -35,6 +51,7 @@ export default function DashboardPage() {
   const [evaluation, setEvaluation] =
     useState<EvaluationDashboardResponse | null>(null);
   const [pendingLeaves, setPendingLeaves] = useState<LeaveRequestItem[]>([]);
+  const [leavesModalOpen, setLeavesModalOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -98,12 +115,22 @@ export default function DashboardPage() {
     };
   }, [fetchDashboard]);
 
-  const activeStudents = students.filter((s) => s.is_active);
-  const readyDatasetStudents = students.filter((s) => s.face_count >= 3);
-  const anyFaceStudents = students.filter((s) => s.face_count > 0);
+  // Compute dataset readiness strictly over active students
+  const activeStudents = useMemo(
+    () => students.filter((s) => s.is_active),
+    [students]
+  );
+  const readyDatasetStudents = useMemo(
+    () => activeStudents.filter((s) => s.face_count >= 3),
+    [activeStudents]
+  );
+  const anyFaceStudents = useMemo(
+    () => activeStudents.filter((s) => s.face_count > 0),
+    [activeStudents]
+  );
   const datasetReadinessPct =
-    students.length > 0
-      ? Math.round((readyDatasetStudents.length / students.length) * 100)
+    activeStudents.length > 0
+      ? Math.round((readyDatasetStudents.length / activeStudents.length) * 100)
       : 0;
 
   const totalPresent =
@@ -117,6 +144,8 @@ export default function DashboardPage() {
     ) ?? 0;
   const totalAbsent =
     evaluation?.class_recaps.reduce((sum, c) => sum + c.absent_count, 0) ?? 0;
+  const totalAttendanceRecords =
+    totalPresent + totalLate + totalPermitSick + totalAbsent;
   const totalWaSent =
     evaluation?.class_recaps.reduce((sum, c) => sum + c.wa_sent_count, 0) ?? 0;
   const totalWaQueued =
@@ -124,26 +153,34 @@ export default function DashboardPage() {
 
   const faceMetrics = evaluation?.face_metrics;
   const chatbotMetrics = evaluation?.chatbot_metrics;
+  const hasLabeledFaceLogs = (faceMetrics?.total_labeled ?? 0) > 0;
+
+  const headerActions = useMemo(
+    () => (
+      <button
+        type="button"
+        onClick={() => void loadDashboard()}
+        disabled={loading}
+        className="inline-flex items-center gap-2 rounded-xl border border-[#E2E8F0] bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-50 disabled:opacity-60"
+      >
+        <RefreshCw
+          className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`}
+          aria-hidden="true"
+        />
+        <span>Muat Ulang</span>
+      </button>
+    ),
+    [loadDashboard, loading]
+  );
 
   return (
-    <AdminShell
-      title="Dashboard Ringkasan"
-      subtitle="Pemantauan kesiapan dataset biometrik, kehadiran harian, dan layanan AI WhatsApp."
-      headerActions={
-        <button
-          type="button"
-          onClick={() => void loadDashboard()}
-          disabled={loading}
-          className="inline-flex items-center gap-2 rounded-xl border border-[#E2E8F0] bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-50 disabled:opacity-60"
-        >
-          <RefreshCw
-            className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`}
-            aria-hidden="true"
-          />
-          <span>Muat Ulang</span>
-        </button>
-      }
-    >
+    <>
+      <AdminPageHeader
+        title="Dashboard Ringkasan"
+        subtitle="Pemantauan kesiapan dataset biometrik, kehadiran harian, dan layanan AI WhatsApp."
+        headerActions={headerActions}
+      />
+
       {error ? (
         <div
           role="alert"
@@ -164,7 +201,10 @@ export default function DashboardPage() {
       ) : null}
 
       {/* 4 KPI Cards */}
-      <section aria-label="Indikator Utama" className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+      <section
+        aria-label="Indikator Utama"
+        className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4"
+      >
         <div className="rounded-2xl border border-[#E2E8F0] bg-white p-5 shadow-2xs">
           <div className="flex items-center justify-between">
             <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
@@ -196,7 +236,8 @@ export default function DashboardPage() {
               {loading ? "—" : `${datasetReadinessPct}%`}
             </p>
             <span className="text-xs font-semibold text-[#10B981]">
-              {readyDatasetStudents.length}/{students.length} siswa (≥3 foto)
+              {readyDatasetStudents.length}/{activeStudents.length} siswa aktif
+              (≥3 foto)
             </span>
           </div>
           <div className="mt-2.5 h-2 w-full overflow-hidden rounded-full bg-slate-100">
@@ -206,24 +247,26 @@ export default function DashboardPage() {
             />
           </div>
           <p className="mt-1.5 text-[11px] text-slate-500">
-            {anyFaceStudents.length} siswa sudah memiliki minimal 1 foto wajah
+            {anyFaceStudents.length} siswa aktif sudah memiliki minimal 1 foto
+            wajah
           </p>
         </div>
 
         <div className="rounded-2xl border border-[#E2E8F0] bg-white p-5 shadow-2xs">
           <div className="flex items-center justify-between">
             <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
-              Kehadiran Hari Ini
+              Total Presensi Hari Ini (Semua Sesi)
             </p>
             <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#EFF6FF] text-[#1D4ED8]">
               <CheckCircle2 className="h-4 w-4" aria-hidden="true" />
             </div>
           </div>
           <p className="mt-3 text-3xl font-extrabold tracking-tight text-[#0F172A] tabular-nums">
-            {loading ? "—" : totalPresent + totalLate}
+            {loading ? "—" : totalAttendanceRecords}
           </p>
           <p className="mt-1 text-xs text-slate-500">
-            {totalPresent} Hadir • {totalLate} Terlambat • {totalPermitSick} Izin/Sakit
+            {totalPresent} Hadir • {totalLate} Terlambat • {totalPermitSick}{" "}
+            Izin/Sakit • {totalAbsent} Alfa
           </p>
         </div>
 
@@ -237,14 +280,20 @@ export default function DashboardPage() {
             </div>
           </div>
           <p className="mt-3 text-3xl font-extrabold tracking-tight text-[#0F172A] tabular-nums">
-            {loading
+            {loading || !hasLabeledFaceLogs
               ? "—"
               : `${(faceMetrics?.accuracy ?? 0).toFixed(1)}%`}
           </p>
           <p className="mt-1 text-xs text-slate-500">
-            FAR {(faceMetrics?.far ?? 0).toFixed(1)}% • FRR{" "}
-            {(faceMetrics?.frr ?? 0).toFixed(1)}% ({faceMetrics?.total_labeled ?? 0}{" "}
-            log berlabel)
+            {hasLabeledFaceLogs ? (
+              <>
+                FAR {(faceMetrics?.far ?? 0).toFixed(1)}% • FRR{" "}
+                {(faceMetrics?.frr ?? 0).toFixed(1)}% (
+                {faceMetrics?.total_labeled ?? 0} log berlabel)
+              </>
+            ) : (
+              "Belum ada log berlabel ground-truth"
+            )}
           </p>
         </div>
       </section>
@@ -253,7 +302,7 @@ export default function DashboardPage() {
       <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-12">
         {/* Service Status & Threshold */}
         <section className="lg:col-span-5 rounded-2xl border border-[#E2E8F0] bg-white p-6 shadow-2xs space-y-5">
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between gap-2">
             <div>
               <h2 className="text-base font-bold text-[#0F172A]">
                 Status Layanan & Parameter
@@ -262,7 +311,9 @@ export default function DashboardPage() {
                 Konfigurasi aktif engine pengenalan wajah & WhatsApp
               </p>
             </div>
-            <StatusBadge tone="success">Operasional</StatusBadge>
+            <StatusBadge tone={error ? "danger" : "success"}>
+              {error ? "Gangguan Koneksi" : "Operasional"}
+            </StatusBadge>
           </div>
 
           <div className="space-y-3">
@@ -295,8 +346,9 @@ export default function DashboardPage() {
                     Notifikasi & AI Chatbot WhatsApp
                   </p>
                   <p className="text-[11px] text-slate-500">
-                    In-Domain {(chatbotMetrics?.in_domain_rate ?? 0).toFixed(1)}% •
-                    Rata-rata {Math.round(chatbotMetrics?.avg_latency_ms ?? 0)} ms
+                    In-Domain {(chatbotMetrics?.in_domain_rate ?? 0).toFixed(1)}%
+                    • Rata-rata {Math.round(chatbotMetrics?.avg_latency_ms ?? 0)}{" "}
+                    ms
                   </p>
                 </div>
               </div>
@@ -319,9 +371,22 @@ export default function DashboardPage() {
                   </p>
                 </div>
               </div>
-              <StatusBadge tone={pendingLeaves.length > 0 ? "warning" : "success"}>
-                {pendingLeaves.length} Pending
-              </StatusBadge>
+              <div className="flex items-center gap-2">
+                <StatusBadge
+                  tone={pendingLeaves.length > 0 ? "warning" : "success"}
+                >
+                  {pendingLeaves.length} Pending
+                </StatusBadge>
+                {pendingLeaves.length > 0 ? (
+                  <button
+                    type="button"
+                    onClick={() => setLeavesModalOpen(true)}
+                    className="text-xs font-semibold text-[#1D4ED8] hover:underline"
+                  >
+                    Lihat
+                  </button>
+                ) : null}
+              </div>
             </div>
           </div>
 
@@ -343,14 +408,17 @@ export default function DashboardPage() {
                 className="flex items-center justify-between rounded-xl border border-[#E2E8F0] bg-white px-4 py-3 text-xs font-semibold text-[#0F172A] transition-colors hover:bg-slate-50"
               >
                 <span>Evaluasi FAR/FRR</span>
-                <BarChart3 className="h-4 w-4 text-[#1D4ED8]" aria-hidden="true" />
+                <BarChart3
+                  className="h-4 w-4 text-[#1D4ED8]"
+                  aria-hidden="true"
+                />
               </Link>
             </div>
             <Link
               href="/students"
               className="flex items-center justify-between rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] px-4 py-2.5 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-100"
             >
-              <span>Kelola Data Master (Siswa, Orang Tua, Kelas, Jadwal)</span>
+              <span>Kelola Data Master (Siswa, Ortu, Kelas, Jadwal, Guru)</span>
               <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
             </Link>
           </div>
@@ -364,8 +432,13 @@ export default function DashboardPage() {
                 Ringkasan Kehadiran Kelas Hari Ini
               </h2>
               <p className="text-xs text-slate-500">
-                Tanggal rekap: {evaluation?.recap_date ?? "Hari ini"} • Total Alfa:{" "}
-                {totalAbsent}
+                Tanggal rekap:{" "}
+                <strong className="text-[#0F172A]">
+                  {evaluation?.recap_date
+                    ? formatWibDate(evaluation.recap_date)
+                    : "Hari ini"}
+                </strong>{" "}
+                • Total Alfa: {totalAbsent}
               </p>
             </div>
             <Link
@@ -382,6 +455,7 @@ export default function DashboardPage() {
                 <tr className="border-b border-[#E2E8F0] text-xs font-semibold text-slate-500">
                   <th className="pb-3 pr-4">Kelas</th>
                   <th className="pb-3 pr-4">Wali Kelas</th>
+                  <th className="pb-3 px-2 text-center">Sesi</th>
                   <th className="pb-3 px-2 text-center">Hadir</th>
                   <th className="pb-3 px-2 text-center">Telat</th>
                   <th className="pb-3 px-2 text-center">Izin/Sakit</th>
@@ -393,7 +467,7 @@ export default function DashboardPage() {
                 {loading ? (
                   Array.from({ length: 4 }).map((_, i) => (
                     <tr key={i}>
-                      <td colSpan={7} className="py-3">
+                      <td colSpan={8} className="py-3">
                         <div className="h-5 w-full animate-pulse rounded bg-slate-100" />
                       </td>
                     </tr>
@@ -401,7 +475,7 @@ export default function DashboardPage() {
                 ) : (evaluation?.class_recaps.length ?? 0) === 0 ? (
                   <tr>
                     <td
-                      colSpan={7}
+                      colSpan={8}
                       className="py-8 text-center text-sm text-slate-500"
                     >
                       Belum ada data kelas terdaftar.
@@ -415,6 +489,9 @@ export default function DashboardPage() {
                       </td>
                       <td className="py-3 pr-4 text-xs text-slate-600">
                         {recap.homeroom_teacher_name || "-"}
+                      </td>
+                      <td className="py-3 px-2 text-center text-xs font-semibold text-slate-600 tabular-nums">
+                        {recap.session_count}
                       </td>
                       <td className="py-3 px-2 text-center">
                         <span className="inline-flex min-w-7 justify-center rounded-md bg-[#ECFDF5] px-2 py-0.5 text-xs font-bold text-[#059669] tabular-nums">
@@ -447,34 +524,149 @@ export default function DashboardPage() {
           </div>
 
           {pendingLeaves.length > 0 ? (
-            <div className="mt-5 rounded-xl border border-amber-200 bg-[#FFFBEB] p-4">
-              <p className="text-xs font-bold text-[#D97706]">
-                Pengajuan Izin/Sakit Terbaru ({pendingLeaves.length} menunggu guru):
-              </p>
-              <ul className="mt-2 space-y-1.5">
-                {pendingLeaves.slice(0, 3).map((leave) => (
-                  <li
-                    key={leave.id}
-                    className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-700"
-                  >
-                    <span>
-                      <strong className="text-[#0F172A]">
-                        {leave.student_name}
-                      </strong>{" "}
-                      ({leave.class_name}) —{" "}
-                      {leave.request_type === "sick" ? "Sakit" : "Izin"}:{" "}
-                      {leave.reason}
-                    </span>
-                    <span className="font-mono text-[11px] text-slate-500">
-                      {leave.start_date}
-                    </span>
-                  </li>
-                ))}
+            <div className="mt-5 rounded-xl border border-amber-200 bg-[#FFFBEB] p-4 space-y-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs font-bold text-[#D97706]">
+                  Pengajuan Izin/Sakit Terbaru ({pendingLeaves.length} menunggu
+                  verifikasi guru):
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setLeavesModalOpen(true)}
+                  className="text-xs font-semibold text-[#1D4ED8] hover:underline"
+                >
+                  {pendingLeaves.length > 3
+                    ? `+${pendingLeaves.length - 3} lainnya • Lihat Semua`
+                    : "Lihat Semua"}
+                </button>
+              </div>
+              <ul className="space-y-2">
+                {pendingLeaves.slice(0, 3).map((leave) => {
+                  const attachmentHref = resolveAssetUrl(leave.attachment_url);
+                  return (
+                    <li
+                      key={leave.id}
+                      className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-700"
+                    >
+                      <span className="min-w-0">
+                        <strong className="text-[#0F172A]">
+                          {leave.student_name}
+                        </strong>{" "}
+                        ({leave.class_name}) —{" "}
+                        {leave.request_type === "sick" ? "Sakit" : "Izin"}:{" "}
+                        {leave.reason}
+                      </span>
+                      <div className="flex items-center gap-2 shrink-0">
+                        {attachmentHref ? (
+                          <a
+                            href={attachmentHref}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 rounded-md bg-white px-2 py-0.5 text-[11px] font-semibold text-[#1D4ED8] ring-1 ring-blue-200 hover:bg-[#EFF6FF]"
+                          >
+                            <Paperclip className="h-3 w-3" aria-hidden="true" />
+                            <span>Lampiran</span>
+                          </a>
+                        ) : null}
+                        <span className="font-mono text-[11px] text-slate-600">
+                          {formatLeaveDateRange(
+                            leave.start_date,
+                            leave.end_date
+                          )}
+                        </span>
+                      </div>
+                    </li>
+                  );
+                })}
               </ul>
             </div>
           ) : null}
         </section>
       </div>
-    </AdminShell>
+
+      {/* All Pending Leaves Modal */}
+      <Modal
+        open={leavesModalOpen}
+        onClose={() => setLeavesModalOpen(false)}
+        maxWidthClass="max-w-3xl"
+        title={`Semua Pengajuan Izin / Sakit Menunggu (${pendingLeaves.length})`}
+        subtitle="Daftar seluruh pengajuan izin orang tua yang belum diverifikasi oleh guru melalui Mobile Guru."
+      >
+        {pendingLeaves.length === 0 ? (
+          <p className="py-6 text-center text-sm text-slate-500">
+            Tidak ada pengajuan izin yang sedang menunggu verifikasi.
+          </p>
+        ) : (
+          <div className="space-y-3">
+            {pendingLeaves.map((leave) => {
+              const attachmentHref = resolveAssetUrl(leave.attachment_url);
+              return (
+                <div
+                  key={leave.id}
+                  className="rounded-2xl border border-[#E2E8F0] bg-[#F8FAFC] p-4 space-y-2.5"
+                >
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="text-sm font-bold text-[#0F172A]">
+                          {leave.student_name}
+                        </p>
+                        <StatusBadge tone="primary">
+                          {leave.class_name}
+                        </StatusBadge>
+                        <StatusBadge
+                          tone={
+                            leave.request_type === "sick" ? "danger" : "warning"
+                          }
+                        >
+                          {leave.request_type === "sick" ? "Sakit" : "Izin"}
+                        </StatusBadge>
+                      </div>
+                      <p className="mt-0.5 text-xs text-slate-500">
+                        NIS: <span className="font-mono">{leave.student_nis}</span>{" "}
+                        • Orang Tua: <strong>{leave.parent_name}</strong> (
+                        <span className="font-mono text-[#059669]">
+                          {formatWaPhoneDisplay(leave.parent_phone_wa)}
+                        </span>
+                        )
+                      </p>
+                    </div>
+                    <span className="rounded-lg bg-white px-2.5 py-1 text-xs font-semibold text-[#0F172A] ring-1 ring-[#E2E8F0]">
+                      {formatLeaveDateRange(leave.start_date, leave.end_date)}
+                    </span>
+                  </div>
+
+                  <p className="rounded-xl border border-[#E2E8F0] bg-white p-3 text-xs leading-relaxed text-slate-700">
+                    {leave.reason}
+                  </p>
+
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">
+                    <span>
+                      Diajukan pada {formatWibDateTime(leave.created_at)}
+                    </span>
+                    {attachmentHref ? (
+                      <a
+                        href={attachmentHref}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-blue-200 bg-[#EFF6FF] px-3 py-1 text-xs font-semibold text-[#1D4ED8] hover:bg-blue-100"
+                      >
+                        <Paperclip className="h-3.5 w-3.5" aria-hidden="true" />
+                        <span>Lihat Lampiran Surat</span>
+                        <ExternalLink className="h-3 w-3" aria-hidden="true" />
+                      </a>
+                    ) : (
+                      <span className="italic text-slate-400">
+                        Tanpa lampiran
+                      </span>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </Modal>
+    </>
   );
 }

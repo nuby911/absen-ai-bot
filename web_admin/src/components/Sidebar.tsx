@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useRef } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import {
@@ -30,7 +31,7 @@ const NAV_ITEMS = [
   {
     href: "/students",
     label: "Data Siswa & Master",
-    description: "Siswa, Ortu, Kelas & Jadwal",
+    description: "Siswa, Ortu, Kelas, Jadwal & Guru",
     icon: Users,
   },
   {
@@ -54,6 +55,30 @@ export function Sidebar({
 }: SidebarProps) {
   const pathname = usePathname();
   const router = useRouter();
+  const onCloseMobileRef = useRef(onCloseMobile);
+
+  useEffect(() => {
+    onCloseMobileRef.current = onCloseMobile;
+  }, [onCloseMobile]);
+
+  useEffect(() => {
+    if (!mobileOpen) return;
+
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        onCloseMobileRef.current?.();
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.body.style.overflow = prevOverflow;
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [mobileOpen]);
 
   function handleLogout() {
     clearAuthSession();
@@ -101,7 +126,10 @@ export function Sidebar({
       </div>
 
       {/* Navigation Links */}
-      <nav aria-label="Navigasi Admin" className="flex-1 space-y-1.5 overflow-y-auto px-3 py-5">
+      <nav
+        aria-label="Navigasi Admin"
+        className="flex-1 space-y-1.5 overflow-y-auto px-3 py-5"
+      >
         <p className="px-3 pb-2 text-[11px] font-semibold tracking-wider text-slate-400 uppercase">
           Menu Utama
         </p>

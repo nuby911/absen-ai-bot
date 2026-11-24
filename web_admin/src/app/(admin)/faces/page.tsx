@@ -17,7 +17,9 @@ import {
   Camera,
   CheckCircle2,
   Cpu,
+  Edit3,
   ImagePlus,
+  Info,
   MessageCircle,
   RefreshCw,
   ScanFace,
@@ -26,9 +28,11 @@ import {
   Trash2,
   Upload,
 } from "lucide-react";
-import { AdminShell } from "@/components/AdminShell";
+import { AdminPageHeader } from "@/components/AdminShell";
+import { Modal } from "@/components/Modal";
 import { StatusBadge } from "@/components/StatusBadge";
 import { WebcamCaptureModal } from "@/components/faces/WebcamCaptureModal";
+import { ParentFormModal } from "@/components/students/MasterDataModals";
 import {
   ApiError,
   deleteStudentFace,
@@ -41,7 +45,14 @@ import {
   type SchoolClass,
   type Student,
 } from "@/lib/api";
-import { formatWaPhoneDisplay, formatWibDateTime, getInitials } from "@/lib/format";
+import {
+  formatWaPhoneDisplay,
+  formatWibDateTime,
+  getInitials,
+} from "@/lib/format";
+
+const MAX_FACES = 5;
+const MAX_FACE_FILE_BYTES = 10 * 1024 * 1024; // 10 MB
 
 const SLOT_GUIDES = [
   "Hadap Depan (Netral)",
@@ -51,12 +62,29 @@ const SLOT_GUIDES = [
   "Variasi Pencahayaan",
 ];
 
+function FaceSlotSkeleton({ slotIndex }: { slotIndex: number }) {
+  return (
+    <div className="flex flex-col overflow-hidden rounded-2xl border border-[#E2E8F0] bg-white shadow-2xs">
+      <div className="relative aspect-square w-full animate-pulse bg-slate-200">
+        <span className="absolute left-2.5 top-2.5 rounded-lg bg-slate-300/90 px-2 py-0.5 text-[11px] font-bold text-slate-600">
+          Slot #{slotIndex + 1}
+        </span>
+      </div>
+      <div className="p-3 space-y-2.5">
+        <div className="h-3.5 w-3/4 animate-pulse rounded bg-slate-200" />
+        <div className="h-1.5 w-full animate-pulse rounded-full bg-slate-100" />
+        <div className="h-2.5 w-1/2 animate-pulse rounded bg-slate-100" />
+      </div>
+    </div>
+  );
+}
+
 function FaceSlotCard({
   slotIndex,
   face,
   deletingFaceId,
   disabledUpload,
-  onDelete,
+  onRequestDelete,
   onTriggerUpload,
   onTriggerWebcam,
 }: {
@@ -64,11 +92,14 @@ function FaceSlotCard({
   face: FaceEmbedding | undefined;
   deletingFaceId: string | null;
   disabledUpload: boolean;
-  onDelete: (faceId: string) => void;
+  onRequestDelete: (faceId: string, slotNumber: number) => void;
   onTriggerUpload: () => void;
   onTriggerWebcam: () => void;
 }) {
-  const [imgError, setImgError] = useState(false);
+  const imageUrl = face ? resolveAssetUrl(face.image_url) : null;
+  // Automatically resets error state whenever imageUrl changes without triggering setState-in-effect
+  const [failedImageUrl, setFailedImageUrl] = useState<string | null>(null);
+  const imgError = Boolean(imageUrl && failedImageUrl === imageUrl);
 
   if (!face) {
     return (
@@ -116,8 +147,10 @@ function FaceSlotCard({
     );
   }
 
-  const imageUrl = resolveAssetUrl(face.image_url);
-  const qualityPct = Math.min(100, Math.max(0, Math.round(face.quality_score * 100)));
+  const qualityPct = Math.min(
+    100,
+    Math.max(0, Math.round(face.quality_score * 100))
+  );
   const qualityHigh = face.quality_score >= 0.75;
 
   return (
@@ -129,7 +162,7 @@ function FaceSlotCard({
             alt={`Sampel wajah #${slotIndex + 1}`}
             fill
             unoptimized
-            onError={() => setImgError(true)}
+            onError={() => setFailedImageUrl(imageUrl)}
             className="object-cover"
           />
         ) : (
@@ -152,7 +185,7 @@ function FaceSlotCard({
 
         <button
           type="button"
-          onClick={() => onDelete(face.id)}
+          onClick={() => onRequestDelete(face.id, slotIndex + 1)}
           disabled={deletingFaceId === face.id}
           aria-label={`Hapus sampel wajah slot ${slotIndex + 1}`}
           className="absolute right-2.5 top-2.5 inline-flex h-7 w-7 items-center justify-center rounded-lg bg-red-600/90 text-white shadow-sm transition-colors hover:bg-red-700 disabled:opacity-60"
@@ -209,6 +242,18 @@ function FaceDatasetContent() {
   const [uploading, setUploading] = useState(false);
   const [deletingFaceId, setDeletingFaceId] = useState<string | null>(null);
   const [webcamOpen, setWebcamOpen] = useState(false);
+  const [webcamError, setWebcamError] = useState<string | null>(null);
+  const [webcamSuccess, setWebcamSuccess] = useState<string | null>(null);
+
+  // Face delete confirmation modal
+  const [pendingDeleteFace, setPendingDeleteFace] = useState<{
+    id: string;
+    slotNumber: number;
+  } | null>(null);
+  const [deleteFaceError, setDeleteFaceError] = useState<string | null>(null);
+
+  // Inline parent WA contact edit modal
+  const [editingParentOpen, setEditingParentOpen] = useState(false);
 
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
@@ -243,9 +288,7 @@ function FaceDatasetContent() {
       });
     } catch (err) {
       setErrorMsg(
-        err instanceof ApiError
-          ? err.message
-          : "Gagal memuat daftar siswa."
+        err instanceof ApiError ? err.message : "Gagal memuat daftar siswa."
       );
     } finally {
       setLoadingMaster(false);
@@ -260,23 +303,28 @@ function FaceDatasetContent() {
         if (cancelled) return;
         setStudents(studentsRes);
         setClasses(classesRes);
-        setSelectedStudentId((prev) => {
-          if (prev && studentsRes.some((s) => s.id === prev)) return prev;
-          if (
-            initialStudentIdParam &&
-            studentsRes.some((s) => s.id === initialStudentIdParam)
-          ) {
-            return initialStudentIdParam;
-          }
-          return studentsRes[0]?.id ?? "";
-        });
+
+        let nextId = "";
+        if (
+          initialStudentIdParam &&
+          studentsRes.some((s) => s.id === initialStudentIdParam)
+        ) {
+          nextId = initialStudentIdParam;
+        } else {
+          nextId = studentsRes[0]?.id ?? "";
+        }
+
+        if (nextId) {
+          setLoadingFaces(true);
+        }
+        setSelectedStudentId((prev) =>
+          prev && studentsRes.some((s) => s.id === prev) ? prev : nextId
+        );
         setErrorMsg(null);
       } catch (err) {
         if (cancelled) return;
         setErrorMsg(
-          err instanceof ApiError
-            ? err.message
-            : "Gagal memuat daftar siswa."
+          err instanceof ApiError ? err.message : "Gagal memuat daftar siswa."
         );
       } finally {
         if (!cancelled) setLoadingMaster(false);
@@ -361,28 +409,50 @@ function FaceDatasetContent() {
     [students, selectedStudentId]
   );
 
-  async function processFaceUpload(blob: Blob, filename: string) {
-    if (!selectedStudent) return;
+  const selectedParentSharedCount = useMemo(() => {
+    if (!selectedStudent) return 0;
+    return students.filter((s) => s.parent_id === selectedStudent.parent_id)
+      .length;
+  }, [students, selectedStudent]);
+
+  async function processFaceUpload(
+    blob: Blob,
+    filename: string,
+    fromWebcam = false
+  ): Promise<boolean> {
+    if (!selectedStudent) return false;
     setUploading(true);
     setErrorMsg(null);
     setSuccessMsg(null);
+    if (fromWebcam) {
+      setWebcamError(null);
+      setWebcamSuccess(null);
+    }
+
     try {
       const created = await uploadStudentFace(
         selectedStudent.id,
         blob,
         filename
       );
-      setSuccessMsg(
-        `Sampel wajah berhasil diekstrak (${created.embedding_dim}-d, skor kualitas ${created.quality_score.toFixed(2)}).`
-      );
-      setWebcamOpen(false);
+      const okMsg = `Sampel wajah berhasil diekstrak (${created.embedding_dim}-d, skor kualitas ${created.quality_score.toFixed(2)}).`;
+      setSuccessMsg(okMsg);
+      if (fromWebcam) {
+        setWebcamSuccess(okMsg);
+      }
       await loadSelectedFaces(selectedStudent.id);
+      return true;
     } catch (err) {
-      setErrorMsg(
+      const message =
         err instanceof ApiError
           ? err.message
-          : "Gagal mengunggah foto wajah."
-      );
+          : "Gagal mengunggah foto wajah.";
+      if (fromWebcam) {
+        setWebcamError(message);
+      } else {
+        setErrorMsg(message);
+      }
+      return false;
     } finally {
       setUploading(false);
     }
@@ -392,20 +462,34 @@ function FaceDatasetContent() {
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) return;
-    await processFaceUpload(file, file.name);
+
+    if (file.size > MAX_FACE_FILE_BYTES) {
+      setSuccessMsg(null);
+      setErrorMsg(
+        `Ukuran file "${file.name}" (${(file.size / (1024 * 1024)).toFixed(1)} MB) melebihi batas maksimal 10 MB.`
+      );
+      return;
+    }
+
+    await processFaceUpload(file, file.name, false);
   }
 
-  async function handleDeleteFace(faceId: string) {
-    if (!selectedStudent) return;
+  async function handleConfirmDeleteFace() {
+    if (!selectedStudent || !pendingDeleteFace) return;
+    const faceId = pendingDeleteFace.id;
     setDeletingFaceId(faceId);
+    setDeleteFaceError(null);
     setErrorMsg(null);
     setSuccessMsg(null);
     try {
       await deleteStudentFace(selectedStudent.id, faceId);
-      setSuccessMsg("Sampel foto wajah berhasil dihapus.");
+      setSuccessMsg(
+        `Sampel foto wajah Slot #${pendingDeleteFace.slotNumber} berhasil dihapus.`
+      );
+      setPendingDeleteFace(null);
       await loadSelectedFaces(selectedStudent.id);
     } catch (err) {
-      setErrorMsg(
+      setDeleteFaceError(
         err instanceof ApiError
           ? err.message
           : "Gagal menghapus sampel foto wajah."
@@ -415,26 +499,45 @@ function FaceDatasetContent() {
     }
   }
 
-  const maxReached = faces.length >= 5;
+  const maxReached = faces.length >= MAX_FACES;
+
+  const headerActions = useMemo(
+    () => (
+      <button
+        type="button"
+        disabled={loadingMaster || loadingFaces}
+        onClick={() => {
+          void loadMasterData();
+          if (selectedStudentId) void loadSelectedFaces(selectedStudentId);
+        }}
+        className="inline-flex items-center gap-1.5 rounded-xl border border-[#E2E8F0] bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-60"
+      >
+        <RefreshCw
+          className={`h-3.5 w-3.5 ${
+            loadingMaster || loadingFaces ? "animate-spin" : ""
+          }`}
+          aria-hidden="true"
+        />
+        <span>Muat Ulang</span>
+      </button>
+    ),
+    [
+      loadMasterData,
+      loadSelectedFaces,
+      selectedStudentId,
+      loadingMaster,
+      loadingFaces,
+    ]
+  );
 
   return (
-    <AdminShell
-      title="Dataset Wajah Siswa"
-      subtitle="Registrasi 3–5 foto wajah per siswa untuk ekstraksi vektor 512-d InsightFace."
-      headerActions={
-        <button
-          type="button"
-          onClick={() => {
-            void loadMasterData();
-            if (selectedStudentId) void loadSelectedFaces(selectedStudentId);
-          }}
-          className="inline-flex items-center gap-1.5 rounded-xl border border-[#E2E8F0] bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
-        >
-          <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
-          <span>Muat Ulang</span>
-        </button>
-      }
-    >
+    <>
+      <AdminPageHeader
+        title="Dataset Wajah Siswa"
+        subtitle="Registrasi 3–5 foto wajah per siswa untuk ekstraksi vektor 512-d InsightFace."
+        headerActions={headerActions}
+      />
+
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
         {/* Left Panel: Student List + Class Filter */}
         <section className="lg:col-span-4 rounded-2xl border border-[#E2E8F0] bg-white shadow-2xs flex flex-col max-h-[calc(100vh-11rem)]">
@@ -512,9 +615,10 @@ function FaceDatasetContent() {
                     type="button"
                     onClick={() => {
                       if (student.id !== selectedStudentId) {
+                        setFaces([]);
                         setLoadingFaces(true);
+                        setSelectedStudentId(student.id);
                       }
-                      setSelectedStudentId(student.id);
                       setErrorMsg(null);
                       setSuccessMsg(null);
                     }}
@@ -586,21 +690,23 @@ function FaceDatasetContent() {
                         <h2 className="text-lg font-bold text-[#0F172A]">
                           Registrasi Dataset Wajah — {selectedStudent.name}
                         </h2>
-                        <StatusBadge
-                          tone={
-                            faces.length >= 3
-                              ? "success"
+                        {!loadingFaces ? (
+                          <StatusBadge
+                            tone={
+                              faces.length >= 3
+                                ? "success"
+                                : faces.length > 0
+                                  ? "warning"
+                                  : "danger"
+                            }
+                          >
+                            {faces.length >= 3
+                              ? `${faces.length}/5 Foto ✓ Siap Kiosk`
                               : faces.length > 0
-                                ? "warning"
-                                : "danger"
-                          }
-                        >
-                          {faces.length >= 3
-                            ? `${faces.length}/5 Foto ✓ Siap Kiosk`
-                            : faces.length > 0
-                              ? `${faces.length}/5 Foto (Disarankan ≥3)`
-                              : "0/5 Belum Terdaftar"}
-                        </StatusBadge>
+                                ? `${faces.length}/5 Foto (Disarankan ≥3)`
+                                : "0/5 Belum Terdaftar"}
+                          </StatusBadge>
+                        ) : null}
                       </div>
                       <p className="mt-0.5 text-xs text-slate-500">
                         NIS:{" "}
@@ -629,8 +735,12 @@ function FaceDatasetContent() {
                     />
                     <button
                       type="button"
-                      disabled={maxReached || uploading}
-                      onClick={() => setWebcamOpen(true)}
+                      disabled={maxReached || uploading || loadingFaces}
+                      onClick={() => {
+                        setWebcamError(null);
+                        setWebcamSuccess(null);
+                        setWebcamOpen(true);
+                      }}
                       className="inline-flex items-center gap-2 rounded-xl bg-[#1D4ED8] px-4 py-2.5 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-[#1E3A8A] disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       <Camera className="h-4 w-4" aria-hidden="true" />
@@ -638,11 +748,14 @@ function FaceDatasetContent() {
                     </button>
                     <button
                       type="button"
-                      disabled={maxReached || uploading}
+                      disabled={maxReached || uploading || loadingFaces}
                       onClick={() => fileInputRef.current?.click()}
                       className="inline-flex items-center gap-2 rounded-xl border border-[#E2E8F0] bg-white px-4 py-2.5 text-xs font-semibold text-[#0F172A] transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                     >
-                      <Upload className="h-4 w-4 text-[#1D4ED8]" aria-hidden="true" />
+                      <Upload
+                        className="h-4 w-4 text-[#1D4ED8]"
+                        aria-hidden="true"
+                      />
                       <span>
                         {uploading ? "Mengunggah..." : "Upload File Foto"}
                       </span>
@@ -650,13 +763,31 @@ function FaceDatasetContent() {
                   </div>
                 </div>
 
+                {/* Inline Full Quota Note */}
+                {!loadingFaces && maxReached ? (
+                  <div
+                    role="status"
+                    className="flex items-center gap-2.5 rounded-xl border border-blue-200 bg-[#EFF6FF] p-3.5 text-xs font-medium text-[#1D4ED8]"
+                  >
+                    <Info className="h-4 w-4 shrink-0" aria-hidden="true" />
+                    <span>
+                      Kuota maksimal <strong>5/5 sampel foto</strong> telah
+                      terpenuhi. Hapus salah satu sampel terlebih dahulu apabila
+                      ingin mengganti dengan foto baru.
+                    </span>
+                  </div>
+                ) : null}
+
                 {/* Inline Feedback Messages */}
                 {successMsg ? (
                   <div
                     role="status"
                     className="flex items-center gap-2.5 rounded-xl border border-emerald-200 bg-[#ECFDF5] p-3.5 text-xs font-medium text-[#059669]"
                   >
-                    <CheckCircle2 className="h-4 w-4 shrink-0" aria-hidden="true" />
+                    <CheckCircle2
+                      className="h-4 w-4 shrink-0"
+                      aria-hidden="true"
+                    />
                     <span>{successMsg}</span>
                   </div>
                 ) : null}
@@ -666,7 +797,10 @@ function FaceDatasetContent() {
                     role="alert"
                     className="flex items-center gap-2.5 rounded-xl border border-red-200 bg-[#FEF2F2] p-3.5 text-xs font-medium text-[#DC2626]"
                   >
-                    <AlertCircle className="h-4 w-4 shrink-0" aria-hidden="true" />
+                    <AlertCircle
+                      className="h-4 w-4 shrink-0"
+                      aria-hidden="true"
+                    />
                     <span>{errorMsg}</span>
                   </div>
                 ) : null}
@@ -679,24 +813,38 @@ function FaceDatasetContent() {
                     </p>
                     {loadingFaces ? (
                       <span className="text-xs text-slate-400">
-                        Menyinkronkan slot...
+                        Memuat slot wajah...
                       </span>
                     ) : null}
                   </div>
 
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-5">
-                    {Array.from({ length: 5 }).map((_, index) => (
-                      <FaceSlotCard
-                        key={faces[index]?.id ?? `empty-${selectedStudent.id}-${index}`}
-                        slotIndex={index}
-                        face={faces[index]}
-                        deletingFaceId={deletingFaceId}
-                        disabledUpload={maxReached || uploading}
-                        onDelete={(faceId) => void handleDeleteFace(faceId)}
-                        onTriggerUpload={() => fileInputRef.current?.click()}
-                        onTriggerWebcam={() => setWebcamOpen(true)}
-                      />
-                    ))}
+                    {loadingFaces
+                      ? Array.from({ length: MAX_FACES }).map((_, index) => (
+                          <FaceSlotSkeleton key={index} slotIndex={index} />
+                        ))
+                      : Array.from({ length: MAX_FACES }).map((_, index) => (
+                          <FaceSlotCard
+                            key={
+                              faces[index]?.id ??
+                              `empty-${selectedStudent.id}-${index}`
+                            }
+                            slotIndex={index}
+                            face={faces[index]}
+                            deletingFaceId={deletingFaceId}
+                            disabledUpload={maxReached || uploading}
+                            onRequestDelete={(faceId, slotNumber) => {
+                              setDeleteFaceError(null);
+                              setPendingDeleteFace({ id: faceId, slotNumber });
+                            }}
+                            onTriggerUpload={() => fileInputRef.current?.click()}
+                            onTriggerWebcam={() => {
+                              setWebcamError(null);
+                              setWebcamSuccess(null);
+                              setWebcamOpen(true);
+                            }}
+                          />
+                        ))}
                   </div>
                 </div>
 
@@ -723,12 +871,14 @@ function FaceDatasetContent() {
                     </div>
                   </div>
                   <StatusBadge tone="primary">
-                    {faces.length}/5 Embedding Aktif (512-d)
+                    {loadingFaces
+                      ? "Memuat..."
+                      : `${faces.length}/5 Embedding Aktif (512-d)`}
                   </StatusBadge>
                 </div>
               </div>
 
-              {/* Parent WhatsApp Connection Card */}
+              {/* Parent WhatsApp Contact Card */}
               <div className="rounded-2xl border border-[#E2E8F0] bg-white p-5 shadow-2xs flex flex-wrap items-center justify-between gap-4">
                 <div className="flex items-center gap-4">
                   <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-[#ECFDF5] text-[#10B981]">
@@ -736,7 +886,7 @@ function FaceDatasetContent() {
                   </div>
                   <div>
                     <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                      Koneksi WhatsApp Orang Tua
+                      Kontak WhatsApp Orang Tua
                     </p>
                     <p className="mt-0.5 text-sm font-bold text-[#0F172A]">
                       {selectedStudent.parent_name}{" "}
@@ -745,20 +895,22 @@ function FaceDatasetContent() {
                       </span>
                     </p>
                     <p className="text-xs text-slate-500">
-                      Terhubung otomatis untuk notifikasi kehadiran real-time &
-                      AI Chatbot Wali Murid.
+                      Digunakan untuk pengiriman notifikasi kehadiran real-time
+                      & akses AI Chatbot Wali Murid.
                     </p>
                   </div>
                 </div>
 
                 <div className="flex items-center gap-2.5">
-                  <StatusBadge tone="success">WA Terhubung</StatusBadge>
-                  <Link
-                    href="/students"
-                    className="rounded-xl border border-[#E2E8F0] px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                  <StatusBadge tone="success">Nomor WA Terdaftar</StatusBadge>
+                  <button
+                    type="button"
+                    onClick={() => setEditingParentOpen(true)}
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-[#E2E8F0] bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 hover:text-[#1D4ED8]"
                   >
-                    Ubah Kontak
-                  </Link>
+                    <Edit3 className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Ubah Kontak WA</span>
+                  </button>
                 </div>
               </div>
             </>
@@ -766,19 +918,110 @@ function FaceDatasetContent() {
         </section>
       </div>
 
-      {/* Webcam Capture Modal */}
+      {/* Webcam Capture Modal (stays open after saving for consecutive 3-5 poses) */}
       {webcamOpen && selectedStudent ? (
         <WebcamCaptureModal
           open={webcamOpen}
           studentName={selectedStudent.name}
+          currentFaceCount={faces.length}
+          maxFaces={MAX_FACES}
           isUploading={uploading}
-          onClose={() => setWebcamOpen(false)}
+          uploadError={webcamError}
+          uploadSuccess={webcamSuccess}
+          onClearFeedback={() => {
+            setWebcamError(null);
+            setWebcamSuccess(null);
+          }}
+          onClose={() => {
+            setWebcamOpen(false);
+            setWebcamError(null);
+            setWebcamSuccess(null);
+          }}
           onCapture={(blob) =>
-            processFaceUpload(blob, `webcam-${selectedStudent.nis}.jpg`)
+            processFaceUpload(blob, `webcam-${selectedStudent.nis}.jpg`, true)
           }
         />
       ) : null}
-    </AdminShell>
+
+      {/* Delete Face Confirmation Modal */}
+      <Modal
+        open={Boolean(pendingDeleteFace)}
+        onClose={() => {
+          setPendingDeleteFace(null);
+          setDeleteFaceError(null);
+        }}
+        preventClose={deletingFaceId !== null}
+        title="Konfirmasi Hapus Sampel Wajah"
+        subtitle="Vektor embedding 512-d dan file foto untuk slot ini akan dihapus permanen."
+        maxWidthClass="max-w-md"
+      >
+        <div className="space-y-4">
+          {deleteFaceError ? (
+            <div
+              role="alert"
+              className="flex items-start gap-2 rounded-xl border border-red-200 bg-[#FEF2F2] p-3 text-xs text-[#DC2626]"
+            >
+              <AlertCircle
+                className="mt-0.5 h-4 w-4 shrink-0"
+                aria-hidden="true"
+              />
+              <span>{deleteFaceError}</span>
+            </div>
+          ) : null}
+
+          <p className="text-sm text-slate-600">
+            Apakah Anda yakin ingin menghapus{" "}
+            <strong className="text-[#0F172A]">
+              Sampel Wajah Slot #{pendingDeleteFace?.slotNumber}
+            </strong>{" "}
+            milik{" "}
+            <strong className="text-[#0F172A]">{selectedStudent?.name}</strong>?
+          </p>
+
+          <div className="flex justify-end gap-2.5 pt-1">
+            <button
+              type="button"
+              disabled={deletingFaceId !== null}
+              onClick={() => {
+                setPendingDeleteFace(null);
+                setDeleteFaceError(null);
+              }}
+              className="rounded-xl border border-[#E2E8F0] px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+            >
+              Batal
+            </button>
+            <button
+              type="button"
+              disabled={deletingFaceId !== null}
+              onClick={() => void handleConfirmDeleteFace()}
+              className="rounded-xl bg-[#EF4444] px-4 py-2 text-sm font-semibold text-white hover:bg-red-600 disabled:opacity-60"
+            >
+              {deletingFaceId !== null ? "Menghapus..." : "Ya, Hapus Foto"}
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Inline Edit Parent WA Contact Modal */}
+      {editingParentOpen && selectedStudent ? (
+        <ParentFormModal
+          key={`${selectedStudent.parent_id}-${selectedStudent.parent_phone_wa}`}
+          open={editingParentOpen}
+          editing={{
+            id: selectedStudent.parent_id,
+            name: selectedStudent.parent_name,
+            phone_wa: selectedStudent.parent_phone_wa,
+            created_at: selectedStudent.created_at,
+          }}
+          sharedStudentsCount={selectedParentSharedCount}
+          onClose={() => setEditingParentOpen(false)}
+          onSaved={(message) => {
+            setSuccessMsg(message);
+            void loadMasterData();
+          }}
+        />
+      ) : null}
+    </>
   );
 }
 
@@ -786,7 +1029,7 @@ export default function FacesPage() {
   return (
     <Suspense
       fallback={
-        <div className="min-h-screen bg-[#F8FAFC] flex items-center justify-center p-6 text-sm text-slate-500">
+        <div className="py-16 text-center text-sm text-slate-500">
           Memuat halaman Dataset Wajah Siswa...
         </div>
       }

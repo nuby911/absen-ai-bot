@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, type FormEvent } from "react";
-import { AlertCircle, ShieldAlert, UserCheck } from "lucide-react";
+import { AlertCircle, RotateCcw, ShieldAlert, UserCheck } from "lucide-react";
 import { Modal } from "@/components/Modal";
 import {
   ApiError,
@@ -14,7 +14,10 @@ interface FaceLogLabelModalProps {
   log: FaceRecognitionLogItem | null;
   students: Student[];
   onClose: () => void;
-  onLabeled: (updatedLog: FaceRecognitionLogItem) => void;
+  onLabeled: (
+    updatedLog: FaceRecognitionLogItem,
+    action: "labeled" | "unlabeled"
+  ) => void;
 }
 
 const CONDITION_PRESETS = [
@@ -27,6 +30,11 @@ const CONDITION_PRESETS = [
   "foto_cetak",
 ];
 
+function stripImpostorPrefix(note: string | null | undefined): string {
+  if (!note) return "";
+  return note.trim().replace(/^impostor:?\s*/i, "").trim();
+}
+
 export function FaceLogLabelModal({
   log,
   students,
@@ -36,16 +44,21 @@ export function FaceLogLabelModal({
   const [identityType, setIdentityType] = useState<"student" | "impostor">(
     log?.is_impostor ? "impostor" : "student"
   );
+  // NEVER fall back to students[0]?.id
   const [actualStudentId, setActualStudentId] = useState<string>(
-    log?.actual_student_id ?? log?.predicted_student_id ?? students[0]?.id ?? ""
+    log?.actual_student_id ?? log?.predicted_student_id ?? ""
   );
   const [conditionNote, setConditionNote] = useState<string>(
-    log?.condition_note ?? ""
+    stripImpostorPrefix(log?.condition_note)
   );
   const [submitting, setSubmitting] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   if (!log) return null;
+
+  const isAlreadyLabeled = log.classification !== "unlabeled";
+  const busy = submitting || resetting;
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -57,14 +70,16 @@ export function FaceLogLabelModal({
       return;
     }
 
+    const cleanedNote = stripImpostorPrefix(conditionNote);
+
     setSubmitting(true);
     try {
       const updated = await labelFaceLog(log.id, {
         actual_student_id: identityType === "student" ? actualStudentId : null,
         is_impostor: identityType === "impostor",
-        condition_note: conditionNote.trim() || null,
+        condition_note: cleanedNote || null,
       });
-      onLabeled(updated);
+      onLabeled(updated, "labeled");
       onClose();
     } catch (err) {
       setError(
@@ -77,16 +92,47 @@ export function FaceLogLabelModal({
     }
   }
 
+  async function handleResetToUnlabeled() {
+    if (!log) return;
+    setError(null);
+    setResetting(true);
+    try {
+      const updated = await labelFaceLog(log.id, {
+        actual_student_id: null,
+        is_impostor: false,
+        condition_note: null,
+      });
+      onLabeled(updated, "unlabeled");
+      onClose();
+    } catch (err) {
+      setError(
+        err instanceof ApiError
+          ? err.message
+          : "Gagal mereset label pengujian."
+      );
+    } finally {
+      setResetting(false);
+    }
+  }
+
   return (
     <Modal
       open={Boolean(log)}
       onClose={onClose}
-      title="Pelabelan Ground-Truth Log Wajah"
+      preventClose={busy}
+      title={
+        isAlreadyLabeled
+          ? "Edit Ground-Truth Log Wajah"
+          : "Pelabelan Ground-Truth Log Wajah"
+      }
       subtitle={`Skor similarity: ${log.top_similarity_score.toFixed(3)} • Threshold: ${log.threshold_used.toFixed(2)} • Prediksi: ${log.predicted_student_name ?? "Tidak Cocok"}`}
     >
       <form onSubmit={handleSubmit} className="space-y-5">
         {error ? (
-          <div className="flex items-start gap-2 rounded-xl border border-red-200 bg-[#FEF2F2] p-3 text-xs text-[#DC2626]">
+          <div
+            role="alert"
+            className="flex items-start gap-2 rounded-xl border border-red-200 bg-[#FEF2F2] p-3 text-xs text-[#DC2626]"
+          >
             <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
             <span>{error}</span>
           </div>
@@ -99,7 +145,12 @@ export function FaceLogLabelModal({
           <div className="grid grid-cols-2 gap-3">
             <button
               type="button"
-              onClick={() => setIdentityType("student")}
+              disabled={busy}
+              onClick={() => {
+                setIdentityType("student");
+                setConditionNote((prev) => stripImpostorPrefix(prev));
+                setError(null);
+              }}
               className={`flex items-center justify-center gap-2 rounded-xl border p-3 text-xs font-semibold transition-colors ${
                 identityType === "student"
                   ? "border-[#1D4ED8] bg-[#EFF6FF] text-[#1D4ED8]"
@@ -111,7 +162,11 @@ export function FaceLogLabelModal({
             </button>
             <button
               type="button"
-              onClick={() => setIdentityType("impostor")}
+              disabled={busy}
+              onClick={() => {
+                setIdentityType("impostor");
+                setError(null);
+              }}
               className={`flex items-center justify-center gap-2 rounded-xl border p-3 text-xs font-semibold transition-colors ${
                 identityType === "impostor"
                   ? "border-[#EF4444] bg-[#FEF2F2] text-[#DC2626]"
@@ -175,6 +230,7 @@ export function FaceLogLabelModal({
               <button
                 key={preset}
                 type="button"
+                disabled={busy}
                 onClick={() => setConditionNote(preset)}
                 className="rounded-full border border-[#E2E8F0] bg-[#F8FAFC] px-2.5 py-1 text-[11px] font-medium text-slate-600 hover:border-[#1D4ED8] hover:text-[#1D4ED8]"
               >
@@ -184,21 +240,40 @@ export function FaceLogLabelModal({
           </div>
         </div>
 
-        <div className="flex items-center justify-end gap-2.5 pt-2">
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-xl border border-[#E2E8F0] bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
-          >
-            Batal
-          </button>
-          <button
-            type="submit"
-            disabled={submitting}
-            className="rounded-xl bg-[#1D4ED8] px-5 py-2 text-sm font-semibold text-white hover:bg-[#1E3A8A] disabled:opacity-60"
-          >
-            {submitting ? "Menyimpan..." : "Simpan Label"}
-          </button>
+        <div className="flex flex-wrap items-center justify-between gap-2.5 pt-2">
+          <div>
+            {isAlreadyLabeled ? (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => void handleResetToUnlabeled()}
+                className="inline-flex items-center gap-1.5 rounded-xl border border-red-200 bg-[#FEF2F2] px-3.5 py-2 text-xs font-semibold text-[#DC2626] hover:bg-red-100 disabled:opacity-60"
+              >
+                <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>
+                  {resetting ? "Mereset..." : "Reset ke Belum Dilabeli"}
+                </span>
+              </button>
+            ) : null}
+          </div>
+
+          <div className="flex items-center gap-2.5">
+            <button
+              type="button"
+              disabled={busy}
+              onClick={onClose}
+              className="rounded-xl border border-[#E2E8F0] bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+            >
+              Batal
+            </button>
+            <button
+              type="submit"
+              disabled={busy}
+              className="rounded-xl bg-[#1D4ED8] px-5 py-2 text-sm font-semibold text-white hover:bg-[#1E3A8A] disabled:opacity-60"
+            >
+              {submitting ? "Menyimpan..." : "Simpan Label"}
+            </button>
+          </div>
         </div>
       </form>
     </Modal>

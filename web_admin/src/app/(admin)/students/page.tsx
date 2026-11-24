@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import {
+  AlertCircle,
   AlertTriangle,
   CalendarClock,
   CheckCircle2,
@@ -15,9 +16,10 @@ import {
   School,
   Search,
   Trash2,
-  Users,
+  UserCog,
+  type LucideIcon,
 } from "lucide-react";
-import { AdminShell } from "@/components/AdminShell";
+import { AdminPageHeader } from "@/components/AdminShell";
 import { Modal } from "@/components/Modal";
 import { StatusBadge } from "@/components/StatusBadge";
 import {
@@ -25,6 +27,7 @@ import {
   ParentFormModal,
   ScheduleFormModal,
   StudentFormModal,
+  TeacherFormModal,
   type TeacherOption,
 } from "@/components/students/MasterDataModals";
 import {
@@ -33,6 +36,7 @@ import {
   deleteParent,
   deleteSchedule,
   deleteStudent,
+  deleteTeacher,
   getClasses,
   getParents,
   getSchedules,
@@ -50,14 +54,16 @@ import {
   formatTimeShort,
   formatWaPhoneDisplay,
   formatWibDateTime,
+  matchesPhoneQuery,
 } from "@/lib/format";
 
-type ActiveTab = "students" | "parents" | "classes" | "schedules";
+type ActiveTab = "students" | "parents" | "classes" | "schedules" | "teachers";
 
 interface DeleteTarget {
   type: ActiveTab;
   id: string;
   label: string;
+  warningMessage?: string;
 }
 
 export default function MasterDataPage() {
@@ -82,11 +88,13 @@ export default function MasterDataPage() {
     | { type: "parent"; item: Parent | null }
     | { type: "class"; item: SchoolClass | null }
     | { type: "schedule"; item: Schedule | null }
+    | { type: "teacher"; item: UserProfile | null }
     | null
   >(null);
 
-  // Delete confirmation modal
+  // Delete confirmation modal (stays open on 409 error with inline error)
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
 
   const fetchAllMasterData = useCallback(async () => {
@@ -153,59 +161,52 @@ export default function MasterDataPage() {
     };
   }, [fetchAllMasterData]);
 
-  // Build teacher dropdown options from GET /api/v1/teachers, preserving any legacy references
-  const knownTeachers = useMemo<TeacherOption[]>(() => {
-    const map = new Map<string, TeacherOption>();
-    for (const teacher of teachers) {
-      map.set(teacher.id, {
-        id: teacher.id,
-        name: teacher.name,
-        nip: teacher.nip,
-      });
-    }
-    for (const cls of classes) {
-      if (
-        cls.homeroom_teacher_id &&
-        cls.homeroom_teacher_name &&
-        !map.has(cls.homeroom_teacher_id)
-      ) {
-        map.set(cls.homeroom_teacher_id, {
-          id: cls.homeroom_teacher_id,
-          name: cls.homeroom_teacher_name,
-        });
-      }
-    }
-    for (const sched of schedules) {
-      if (sched.teacher_id && sched.teacher_name && !map.has(sched.teacher_id)) {
-        map.set(sched.teacher_id, {
-          id: sched.teacher_id,
-          name: sched.teacher_name,
-        });
-      }
-    }
-    return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
-  }, [teachers, classes, schedules]);
+  const switchTab = useCallback((nextTab: ActiveTab) => {
+    setActiveTab(nextTab);
+    setSearchQuery("");
+    setClassFilter("");
+    setDayFilter("");
+  }, []);
+
+  // Automatically ignore stale classFilter if the selected class was deleted
+  const effectiveClassFilter = useMemo(() => {
+    if (!classFilter) return "";
+    return classes.some((cls) => cls.id === classFilter) ? classFilter : "";
+  }, [classes, classFilter]);
+
+  // Teacher dropdown options strictly from real GET /api/v1/teachers list
+  const teacherOptions = useMemo<TeacherOption[]>(() => {
+    return teachers
+      .map((t) => ({
+        id: t.id,
+        name: t.name,
+        nip: t.nip,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [teachers]);
 
   const filteredStudents = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     return students.filter((s) => {
-      if (classFilter && s.class_id !== classFilter) return false;
+      if (effectiveClassFilter && s.class_id !== effectiveClassFilter) {
+        return false;
+      }
       if (!q) return true;
       return (
         s.name.toLowerCase().includes(q) ||
         s.nis.toLowerCase().includes(q) ||
-        s.parent_name.toLowerCase().includes(q)
+        s.parent_name.toLowerCase().includes(q) ||
+        matchesPhoneQuery(s.parent_phone_wa, q)
       );
     });
-  }, [students, classFilter, searchQuery]);
+  }, [students, effectiveClassFilter, searchQuery]);
 
   const filteredParents = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     if (!q) return parents;
     return parents.filter(
       (p) =>
-        p.name.toLowerCase().includes(q) ||
-        p.phone_wa.toLowerCase().includes(q)
+        p.name.toLowerCase().includes(q) || matchesPhoneQuery(p.phone_wa, q)
     );
   }, [parents, searchQuery]);
 
@@ -222,7 +223,9 @@ export default function MasterDataPage() {
   const filteredSchedules = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     return schedules.filter((sch) => {
-      if (classFilter && sch.class_id !== classFilter) return false;
+      if (effectiveClassFilter && sch.class_id !== effectiveClassFilter) {
+        return false;
+      }
       if (dayFilter && sch.day_of_week !== Number(dayFilter)) return false;
       if (!q) return true;
       return (
@@ -231,11 +234,28 @@ export default function MasterDataPage() {
         sch.class_name.toLowerCase().includes(q)
       );
     });
-  }, [schedules, classFilter, dayFilter, searchQuery]);
+  }, [schedules, effectiveClassFilter, dayFilter, searchQuery]);
+
+  const filteredTeachers = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return teachers;
+    return teachers.filter(
+      (t) =>
+        t.name.toLowerCase().includes(q) ||
+        t.email.toLowerCase().includes(q) ||
+        (t.nip ?? "").toLowerCase().includes(q)
+    );
+  }, [teachers, searchQuery]);
+
+  function openDeleteModal(target: DeleteTarget) {
+    setDeleteError(null);
+    setDeleteTarget(target);
+  }
 
   async function handleConfirmDelete() {
     if (!deleteTarget) return;
     setDeleting(true);
+    setDeleteError(null);
     setError(null);
     setSuccessMsg(null);
 
@@ -246,15 +266,21 @@ export default function MasterDataPage() {
         await deleteParent(deleteTarget.id);
       } else if (deleteTarget.type === "classes") {
         await deleteClass(deleteTarget.id);
-      } else {
+        if (classFilter === deleteTarget.id) {
+          setClassFilter("");
+        }
+      } else if (deleteTarget.type === "schedules") {
         await deleteSchedule(deleteTarget.id);
+      } else {
+        await deleteTeacher(deleteTarget.id);
       }
       setSuccessMsg(`"${deleteTarget.label}" berhasil dihapus.`);
       setDeleteTarget(null);
+      setDeleteError(null);
       await loadAllData();
     } catch (err) {
-      setDeleteTarget(null);
-      setError(
+      // Keep Delete Modal open on 409 / server error and show inline alert
+      setDeleteError(
         err instanceof ApiError ? err.message : "Gagal menghapus data."
       );
     } finally {
@@ -271,9 +297,14 @@ export default function MasterDataPage() {
     key: ActiveTab;
     label: string;
     count: number;
-    icon: typeof Users;
+    icon: LucideIcon;
   }> = [
-    { key: "students", label: "Siswa", count: students.length, icon: GraduationCap },
+    {
+      key: "students",
+      label: "Siswa",
+      count: students.length,
+      icon: GraduationCap,
+    },
     {
       key: "parents",
       label: "Orang Tua (WA)",
@@ -287,9 +318,10 @@ export default function MasterDataPage() {
       count: schedules.length,
       icon: CalendarClock,
     },
+    { key: "teachers", label: "Guru", count: teachers.length, icon: UserCog },
   ];
 
-  function openAddModalForCurrentTab() {
+  const openAddModalForCurrentTab = useCallback(() => {
     setSuccessMsg(null);
     if (activeTab === "students") {
       setModalMode({ type: "student", item: null });
@@ -297,10 +329,12 @@ export default function MasterDataPage() {
       setModalMode({ type: "parent", item: null });
     } else if (activeTab === "classes") {
       setModalMode({ type: "class", item: null });
-    } else {
+    } else if (activeTab === "schedules") {
       setModalMode({ type: "schedule", item: null });
+    } else {
+      setModalMode({ type: "teacher", item: null });
     }
-  }
+  }, [activeTab]);
 
   const addButtonLabel =
     activeTab === "students"
@@ -309,37 +343,51 @@ export default function MasterDataPage() {
         ? "Tambah Orang Tua"
         : activeTab === "classes"
           ? "Tambah Kelas"
-          : "Tambah Jadwal";
+          : activeTab === "schedules"
+            ? "Tambah Jadwal"
+            : "Tambah Guru";
+
+  const headerActions = useMemo(
+    () => (
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={() => void loadAllData()}
+          disabled={loading}
+          className="inline-flex items-center gap-1.5 rounded-xl border border-[#E2E8F0] bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-60"
+        >
+          <RefreshCw
+            className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`}
+            aria-hidden="true"
+          />
+          <span>Muat Ulang</span>
+        </button>
+        <button
+          type="button"
+          onClick={openAddModalForCurrentTab}
+          className="inline-flex items-center gap-1.5 rounded-xl bg-[#1D4ED8] px-4 py-2 text-xs font-semibold text-white shadow-sm hover:bg-[#1E3A8A]"
+        >
+          <Plus className="h-4 w-4" aria-hidden="true" />
+          <span>{addButtonLabel}</span>
+        </button>
+      </div>
+    ),
+    [loadAllData, loading, openAddModalForCurrentTab, addButtonLabel]
+  );
+
+  const selectedParentSharedCount =
+    modalMode?.type === "parent" && modalMode.item
+      ? students.filter((s) => s.parent_id === modalMode.item?.id).length
+      : 0;
 
   return (
-    <AdminShell
-      title="Data Siswa & Master"
-      subtitle="Kelola data master Siswa, Orang Tua (WhatsApp), Kelas, dan Jadwal Pelajaran."
-      headerActions={
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => void loadAllData()}
-            disabled={loading}
-            className="inline-flex items-center gap-1.5 rounded-xl border border-[#E2E8F0] bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
-          >
-            <RefreshCw
-              className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`}
-              aria-hidden="true"
-            />
-            <span>Refresh</span>
-          </button>
-          <button
-            type="button"
-            onClick={openAddModalForCurrentTab}
-            className="inline-flex items-center gap-1.5 rounded-xl bg-[#1D4ED8] px-4 py-2 text-xs font-semibold text-white shadow-sm hover:bg-[#1E3A8A]"
-          >
-            <Plus className="h-4 w-4" aria-hidden="true" />
-            <span>{addButtonLabel}</span>
-          </button>
-        </div>
-      }
-    >
+    <>
+      <AdminPageHeader
+        title="Data Siswa & Master"
+        subtitle="Kelola data master Siswa, Orang Tua (WhatsApp), Kelas, Jadwal Pelajaran, dan Akun Guru."
+        headerActions={headerActions}
+      />
+
       {/* Alerts */}
       {successMsg ? (
         <div
@@ -397,10 +445,7 @@ export default function MasterDataPage() {
                   role="tab"
                   type="button"
                   aria-selected={selected}
-                  onClick={() => {
-                    setActiveTab(tab.key);
-                    setSearchQuery("");
-                  }}
+                  onClick={() => switchTab(tab.key)}
                   className={`inline-flex items-center gap-2 rounded-t-xl border border-b-0 px-4 py-2.5 text-sm font-semibold transition-colors ${
                     selected
                       ? "border-[#E2E8F0] bg-white text-[#1D4ED8] shadow-2xs"
@@ -426,7 +471,7 @@ export default function MasterDataPage() {
 
         {/* Filter Toolbar */}
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#E2E8F0] px-4 py-4 sm:px-6">
-          <div className="relative w-full sm:max-w-xs">
+          <div className="relative w-full sm:max-w-sm">
             <Search
               className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400"
               aria-hidden="true"
@@ -438,12 +483,14 @@ export default function MasterDataPage() {
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder={
                 activeTab === "students"
-                  ? "Cari nama, NIS, atau orang tua..."
+                  ? "Cari nama, NIS, orang tua, atau WA (08xx)..."
                   : activeTab === "parents"
-                    ? "Cari nama atau nomor WhatsApp..."
+                    ? "Cari nama atau nomor WhatsApp (08xx / 628xx)..."
                     : activeTab === "classes"
                       ? "Cari nama kelas atau wali kelas..."
-                      : "Cari mapel, guru, atau kelas..."
+                      : activeTab === "schedules"
+                        ? "Cari mapel, guru, atau kelas..."
+                        : "Cari nama guru, email, atau NIP..."
               }
               className="w-full rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] py-2 pl-9 pr-3 text-sm focus:border-[#1D4ED8] focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1D4ED8]/20"
             />
@@ -453,7 +500,7 @@ export default function MasterDataPage() {
             {(activeTab === "students" || activeTab === "schedules") && (
               <select
                 aria-label="Filter kelas"
-                value={classFilter}
+                value={effectiveClassFilter}
                 onChange={(e) => setClassFilter(e.target.value)}
                 className="rounded-xl border border-[#E2E8F0] bg-white px-3 py-2 text-xs font-semibold text-slate-700 focus:border-[#1D4ED8] focus:outline-none"
               >
@@ -502,13 +549,19 @@ export default function MasterDataPage() {
               <tbody className="divide-y divide-[#E2E8F0]">
                 {loading ? (
                   <tr>
-                    <td colSpan={7} className="px-6 py-10 text-center text-sm text-slate-500">
+                    <td
+                      colSpan={7}
+                      className="px-6 py-10 text-center text-sm text-slate-500"
+                    >
                       Memuat data siswa...
                     </td>
                   </tr>
                 ) : filteredStudents.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="px-6 py-10 text-center text-sm text-slate-500">
+                    <td
+                      colSpan={7}
+                      className="px-6 py-10 text-center text-sm text-slate-500"
+                    >
                       Tidak ada data siswa yang cocok dengan filter.
                     </td>
                   </tr>
@@ -522,7 +575,9 @@ export default function MasterDataPage() {
                         {student.name}
                       </td>
                       <td className="px-4 py-3.5">
-                        <StatusBadge tone="primary">{student.class_name}</StatusBadge>
+                        <StatusBadge tone="primary">
+                          {student.class_name}
+                        </StatusBadge>
                       </td>
                       <td className="px-4 py-3.5">
                         <p className="text-xs font-semibold text-[#0F172A]">
@@ -552,7 +607,9 @@ export default function MasterDataPage() {
                         </Link>
                       </td>
                       <td className="px-4 py-3.5">
-                        <StatusBadge tone={student.is_active ? "success" : "neutral"}>
+                        <StatusBadge
+                          tone={student.is_active ? "success" : "neutral"}
+                        >
                           {student.is_active ? "Aktif" : "Nonaktif"}
                         </StatusBadge>
                       </td>
@@ -571,10 +628,14 @@ export default function MasterDataPage() {
                           <button
                             type="button"
                             onClick={() =>
-                              setDeleteTarget({
+                              openDeleteModal({
                                 type: "students",
                                 id: student.id,
                                 label: student.name,
+                                warningMessage:
+                                  student.face_count > 0
+                                    ? `Siswa ini memiliki ${student.face_count} sampel foto wajah yang akan ikut terhapus apabila tidak ada riwayat presensi.`
+                                    : undefined,
                               })
                             }
                             aria-label={`Hapus ${student.name}`}
@@ -603,19 +664,27 @@ export default function MasterDataPage() {
               <tbody className="divide-y divide-[#E2E8F0]">
                 {loading ? (
                   <tr>
-                    <td colSpan={5} className="px-6 py-10 text-center text-sm text-slate-500">
+                    <td
+                      colSpan={5}
+                      className="px-6 py-10 text-center text-sm text-slate-500"
+                    >
                       Memuat data orang tua...
                     </td>
                   </tr>
                 ) : filteredParents.length === 0 ? (
                   <tr>
-                    <td colSpan={5} className="px-6 py-10 text-center text-sm text-slate-500">
+                    <td
+                      colSpan={5}
+                      className="px-6 py-10 text-center text-sm text-slate-500"
+                    >
                       Belum ada data orang tua yang sesuai.
                     </td>
                   </tr>
                 ) : (
                   filteredParents.map((parent) => {
-                    const linked = students.filter((s) => s.parent_id === parent.id);
+                    const linked = students.filter(
+                      (s) => s.parent_id === parent.id
+                    );
                     return (
                       <tr key={parent.id} className="hover:bg-[#F8FAFC]">
                         <td className="px-6 py-3.5 font-semibold text-[#0F172A]">
@@ -630,7 +699,9 @@ export default function MasterDataPage() {
                         </td>
                         <td className="px-4 py-3.5 text-xs text-slate-600">
                           {linked.length > 0
-                            ? linked.map((s) => `${s.name} (${s.class_name})`).join(", ")
+                            ? linked
+                                .map((s) => `${s.name} (${s.class_name})`)
+                                .join(", ")
                             : "Belum terhubung siswa"}
                         </td>
                         <td className="px-4 py-3.5 text-xs text-slate-500">
@@ -651,10 +722,14 @@ export default function MasterDataPage() {
                             <button
                               type="button"
                               onClick={() =>
-                                setDeleteTarget({
+                                openDeleteModal({
                                   type: "parents",
                                   id: parent.id,
                                   label: parent.name,
+                                  warningMessage:
+                                    linked.length > 0
+                                      ? `Orang tua ini masih terhubung ke ${linked.length} siswa (${linked.map((s) => s.name).join(", ")}). Penghapusan akan ditolak sampai siswa dipindahkan ke orang tua lain.`
+                                      : undefined,
                                 })
                               }
                               aria-label={`Hapus ${parent.name}`}
@@ -684,67 +759,94 @@ export default function MasterDataPage() {
               <tbody className="divide-y divide-[#E2E8F0]">
                 {loading ? (
                   <tr>
-                    <td colSpan={5} className="px-6 py-10 text-center text-sm text-slate-500">
+                    <td
+                      colSpan={5}
+                      className="px-6 py-10 text-center text-sm text-slate-500"
+                    >
                       Memuat data kelas...
                     </td>
                   </tr>
                 ) : filteredClasses.length === 0 ? (
                   <tr>
-                    <td colSpan={5} className="px-6 py-10 text-center text-sm text-slate-500">
+                    <td
+                      colSpan={5}
+                      className="px-6 py-10 text-center text-sm text-slate-500"
+                    >
                       Belum ada data kelas yang sesuai.
                     </td>
                   </tr>
                 ) : (
-                  filteredClasses.map((cls) => (
-                    <tr key={cls.id} className="hover:bg-[#F8FAFC]">
-                      <td className="px-6 py-3.5 font-bold text-[#0F172A]">
-                        {cls.name}
-                      </td>
-                      <td className="px-4 py-3.5 text-xs text-slate-600">
-                        {cls.homeroom_teacher_name || "Belum ditentukan"}
-                      </td>
-                      <td className="px-4 py-3.5">
-                        <StatusBadge tone="primary">
-                          {cls.student_count} Siswa
-                        </StatusBadge>
-                      </td>
-                      <td className="px-4 py-3.5 text-xs text-slate-500">
-                        {formatWibDateTime(cls.created_at)}
-                      </td>
-                      <td className="px-6 py-3.5 text-right">
-                        <div className="inline-flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setModalMode({ type: "class", item: cls })
-                            }
-                            aria-label={`Edit ${cls.name}`}
-                            className="rounded-lg border border-[#E2E8F0] p-1.5 text-slate-600 hover:bg-slate-100 hover:text-[#1D4ED8]"
-                          >
-                            <Edit3 className="h-3.5 w-3.5" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setDeleteTarget({
-                                type: "classes",
-                                id: cls.id,
-                                label: cls.name,
-                              })
-                            }
-                            aria-label={`Hapus ${cls.name}`}
-                            className="rounded-lg border border-[#E2E8F0] p-1.5 text-slate-600 hover:border-red-200 hover:bg-[#FEF2F2] hover:text-[#DC2626]"
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))
+                  filteredClasses.map((cls) => {
+                    const totalStudentsInClass = students.filter(
+                      (s) => s.class_id === cls.id
+                    ).length;
+                    const linkedSchedulesCount = schedules.filter(
+                      (sc) => sc.class_id === cls.id
+                    ).length;
+                    const warningParts: string[] = [];
+                    if (cls.student_count > 0 || totalStudentsInClass > 0) {
+                      warningParts.push(
+                        `${Math.max(cls.student_count, totalStudentsInClass)} siswa`
+                      );
+                    }
+                    if (linkedSchedulesCount > 0) {
+                      warningParts.push(`${linkedSchedulesCount} jadwal`);
+                    }
+                    return (
+                      <tr key={cls.id} className="hover:bg-[#F8FAFC]">
+                        <td className="px-6 py-3.5 font-bold text-[#0F172A]">
+                          {cls.name}
+                        </td>
+                        <td className="px-4 py-3.5 text-xs text-slate-600">
+                          {cls.homeroom_teacher_name || "Belum ditentukan"}
+                        </td>
+                        <td className="px-4 py-3.5">
+                          <StatusBadge tone="primary">
+                            {cls.student_count} Siswa
+                          </StatusBadge>
+                        </td>
+                        <td className="px-4 py-3.5 text-xs text-slate-500">
+                          {formatWibDateTime(cls.created_at)}
+                        </td>
+                        <td className="px-6 py-3.5 text-right">
+                          <div className="inline-flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setModalMode({ type: "class", item: cls })
+                              }
+                              aria-label={`Edit ${cls.name}`}
+                              className="rounded-lg border border-[#E2E8F0] p-1.5 text-slate-600 hover:bg-slate-100 hover:text-[#1D4ED8]"
+                            >
+                              <Edit3 className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                openDeleteModal({
+                                  type: "classes",
+                                  id: cls.id,
+                                  label: cls.name,
+                                  warningMessage:
+                                    warningParts.length > 0
+                                      ? `Kelas ini masih memiliki ${warningParts.join(" dan ")}. Penghapusan akan ditolak sampai seluruh relasi dipindahkan atau dihapus.`
+                                      : undefined,
+                                })
+                              }
+                              aria-label={`Hapus ${cls.name}`}
+                              className="rounded-lg border border-[#E2E8F0] p-1.5 text-slate-600 hover:border-red-200 hover:bg-[#FEF2F2] hover:text-[#DC2626]"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
                 )}
               </tbody>
             </table>
-          ) : (
+          ) : activeTab === "schedules" ? (
             <table className="w-full text-left text-sm">
               <thead className="border-b border-[#E2E8F0] bg-[#F8FAFC] text-xs font-semibold text-slate-500">
                 <tr>
@@ -760,13 +862,19 @@ export default function MasterDataPage() {
               <tbody className="divide-y divide-[#E2E8F0]">
                 {loading ? (
                   <tr>
-                    <td colSpan={7} className="px-6 py-10 text-center text-sm text-slate-500">
+                    <td
+                      colSpan={7}
+                      className="px-6 py-10 text-center text-sm text-slate-500"
+                    >
                       Memuat jadwal pelajaran...
                     </td>
                   </tr>
                 ) : filteredSchedules.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="px-6 py-10 text-center text-sm text-slate-500">
+                    <td
+                      colSpan={7}
+                      className="px-6 py-10 text-center text-sm text-slate-500"
+                    >
                       Tidak ada jadwal pelajaran yang sesuai filter.
                     </td>
                   </tr>
@@ -781,7 +889,9 @@ export default function MasterDataPage() {
                         {formatTimeShort(sch.end_time)}
                       </td>
                       <td className="px-4 py-3.5">
-                        <StatusBadge tone="primary">{sch.class_name}</StatusBadge>
+                        <StatusBadge tone="primary">
+                          {sch.class_name}
+                        </StatusBadge>
                       </td>
                       <td className="px-4 py-3.5 font-semibold text-[#0F172A]">
                         {sch.subject_name}
@@ -807,7 +917,7 @@ export default function MasterDataPage() {
                           <button
                             type="button"
                             onClick={() =>
-                              setDeleteTarget({
+                              openDeleteModal({
                                 type: "schedules",
                                 id: sch.id,
                                 label: `${sch.subject_name} (${sch.class_name})`,
@@ -825,6 +935,106 @@ export default function MasterDataPage() {
                 )}
               </tbody>
             </table>
+          ) : (
+            <table className="w-full text-left text-sm">
+              <thead className="border-b border-[#E2E8F0] bg-[#F8FAFC] text-xs font-semibold text-slate-500">
+                <tr>
+                  <th className="px-6 py-3.5">Nama Guru</th>
+                  <th className="px-4 py-3.5">Email</th>
+                  <th className="px-4 py-3.5">NIP</th>
+                  <th className="px-4 py-3.5">Status PIN Kiosk</th>
+                  <th className="px-6 py-3.5 text-right">Aksi</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[#E2E8F0]">
+                {loading ? (
+                  <tr>
+                    <td
+                      colSpan={5}
+                      className="px-6 py-10 text-center text-sm text-slate-500"
+                    >
+                      Memuat daftar guru...
+                    </td>
+                  </tr>
+                ) : filteredTeachers.length === 0 ? (
+                  <tr>
+                    <td
+                      colSpan={5}
+                      className="px-6 py-10 text-center text-sm text-slate-500"
+                    >
+                      Belum ada akun guru yang sesuai filter.
+                    </td>
+                  </tr>
+                ) : (
+                  filteredTeachers.map((teacher) => {
+                    const teacherScheduleCount = schedules.filter(
+                      (sc) => sc.teacher_id === teacher.id
+                    ).length;
+                    const homeroomClasses = classes.filter(
+                      (c) => c.homeroom_teacher_id === teacher.id
+                    );
+                    let warningMessage: string | undefined;
+                    if (teacherScheduleCount > 0) {
+                      warningMessage = `Guru ini masih mengampu ${teacherScheduleCount} jadwal pelajaran. Penghapusan akan ditolak sampai jadwal dialihkan atau dihapus.`;
+                    } else if (homeroomClasses.length > 0) {
+                      warningMessage = `Guru ini tercatat sebagai wali kelas (${homeroomClasses.map((c) => c.name).join(", ")}). Wali kelas akan otomatis dikosongkan jika guru dihapus.`;
+                    }
+
+                    return (
+                      <tr key={teacher.id} className="hover:bg-[#F8FAFC]">
+                        <td className="px-6 py-3.5 font-semibold text-[#0F172A]">
+                          {teacher.name}
+                        </td>
+                        <td className="px-4 py-3.5 text-xs text-slate-600">
+                          {teacher.email}
+                        </td>
+                        <td className="px-4 py-3.5 font-mono text-xs text-slate-700">
+                          {teacher.nip || "-"}
+                        </td>
+                        <td className="px-4 py-3.5">
+                          <StatusBadge
+                            tone={teacher.has_kiosk_pin ? "success" : "warning"}
+                          >
+                            {teacher.has_kiosk_pin
+                              ? "Sudah Diatur"
+                              : "Belum Diatur"}
+                          </StatusBadge>
+                        </td>
+                        <td className="px-6 py-3.5 text-right">
+                          <div className="inline-flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setModalMode({ type: "teacher", item: teacher })
+                              }
+                              aria-label={`Edit ${teacher.name}`}
+                              className="rounded-lg border border-[#E2E8F0] p-1.5 text-slate-600 hover:bg-slate-100 hover:text-[#1D4ED8]"
+                            >
+                              <Edit3 className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                openDeleteModal({
+                                  type: "teachers",
+                                  id: teacher.id,
+                                  label: teacher.name,
+                                  warningMessage,
+                                })
+                              }
+                              aria-label={`Hapus ${teacher.name}`}
+                              className="rounded-lg border border-[#E2E8F0] p-1.5 text-slate-600 hover:border-red-200 hover:bg-[#FEF2F2] hover:text-[#DC2626]"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
           )}
         </div>
       </div>
@@ -837,6 +1047,7 @@ export default function MasterDataPage() {
           editing={modalMode.item}
           classes={classes}
           parents={parents}
+          students={students}
           onClose={() => setModalMode(null)}
           onSaved={handleSaved}
         />
@@ -847,6 +1058,7 @@ export default function MasterDataPage() {
           key={modalMode.item?.id ?? "new-parent"}
           open
           editing={modalMode.item}
+          sharedStudentsCount={selectedParentSharedCount}
           onClose={() => setModalMode(null)}
           onSaved={handleSaved}
         />
@@ -857,9 +1069,10 @@ export default function MasterDataPage() {
           key={modalMode.item?.id ?? "new-class"}
           open
           editing={modalMode.item}
-          teachers={knownTeachers}
+          teachers={teacherOptions}
           onClose={() => setModalMode(null)}
           onSaved={handleSaved}
+          onGoToTeachers={() => switchTab("teachers")}
         />
       ) : null}
 
@@ -869,7 +1082,18 @@ export default function MasterDataPage() {
           open
           editing={modalMode.item}
           classes={classes}
-          teachers={knownTeachers}
+          teachers={teacherOptions}
+          onClose={() => setModalMode(null)}
+          onSaved={handleSaved}
+          onGoToTeachers={() => switchTab("teachers")}
+        />
+      ) : null}
+
+      {modalMode?.type === "teacher" ? (
+        <TeacherFormModal
+          key={modalMode.item?.id ?? "new-teacher"}
+          open
+          editing={modalMode.item}
           onClose={() => setModalMode(null)}
           onSaved={handleSaved}
         />
@@ -878,21 +1102,56 @@ export default function MasterDataPage() {
       {/* Delete Confirmation Modal */}
       <Modal
         open={Boolean(deleteTarget)}
-        onClose={() => setDeleteTarget(null)}
+        onClose={() => {
+          setDeleteTarget(null);
+          setDeleteError(null);
+        }}
+        preventClose={deleting}
         title="Konfirmasi Hapus Data"
         subtitle="Tindakan ini permanen apabila tidak terikat relasi presensi."
         maxWidthClass="max-w-md"
       >
-        <div className="space-y-5">
+        <div className="space-y-4">
+          {deleteTarget?.warningMessage ? (
+            <div
+              role="status"
+              className="flex items-start gap-2 rounded-xl border border-amber-200 bg-[#FFFBEB] p-3 text-xs text-[#92400E]"
+            >
+              <AlertTriangle
+                className="mt-0.5 h-4 w-4 shrink-0 text-[#D97706]"
+                aria-hidden="true"
+              />
+              <span>{deleteTarget.warningMessage}</span>
+            </div>
+          ) : null}
+
+          {deleteError ? (
+            <div
+              role="alert"
+              className="flex items-start gap-2 rounded-xl border border-red-200 bg-[#FEF2F2] p-3 text-xs text-[#DC2626]"
+            >
+              <AlertCircle
+                className="mt-0.5 h-4 w-4 shrink-0"
+                aria-hidden="true"
+              />
+              <span>{deleteError}</span>
+            </div>
+          ) : null}
+
           <p className="text-sm text-slate-600">
             Apakah Anda yakin ingin menghapus{" "}
             <strong className="text-[#0F172A]">{deleteTarget?.label}</strong>?
           </p>
-          <div className="flex justify-end gap-2.5">
+
+          <div className="flex justify-end gap-2.5 pt-1">
             <button
               type="button"
-              onClick={() => setDeleteTarget(null)}
-              className="rounded-xl border border-[#E2E8F0] px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+              disabled={deleting}
+              onClick={() => {
+                setDeleteTarget(null);
+                setDeleteError(null);
+              }}
+              className="rounded-xl border border-[#E2E8F0] px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
             >
               Batal
             </button>
@@ -907,6 +1166,6 @@ export default function MasterDataPage() {
           </div>
         </div>
       </Modal>
-    </AdminShell>
+    </>
   );
 }

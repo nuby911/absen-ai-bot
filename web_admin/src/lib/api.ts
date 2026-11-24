@@ -7,6 +7,10 @@ export const API_ORIGIN = API_BASE_URL.replace(/\/api\/v1$/, "");
 const TOKEN_STORAGE_KEY = "smartschool_admin_token";
 const USER_STORAGE_KEY = "smartschool_admin_user";
 
+const DEFAULT_TIMEOUT_MS = 30_000;
+const FACE_UPLOAD_TIMEOUT_MS = 60_000;
+const CHATBOT_SIMULATE_TIMEOUT_MS = 60_000;
+
 export interface UserProfile {
   id: string;
   name: string;
@@ -25,6 +29,23 @@ export interface LoginResponse {
   access_token: string;
   token_type: string;
   user: UserProfile;
+}
+
+export interface TeacherCreate {
+  name: string;
+  email: string;
+  password: string;
+  nip?: string | null;
+  kiosk_pin?: string | null;
+}
+
+export interface TeacherUpdate {
+  name?: string;
+  email?: string;
+  nip?: string | null;
+  password?: string | null;
+  kiosk_pin?: string | null;
+  reset_kiosk_pin?: boolean;
 }
 
 export interface SchoolClass {
@@ -81,7 +102,9 @@ export interface StudentCreate {
   nis: string;
   name: string;
   class_id: string;
-  parent_id: string;
+  parent_id?: string | null;
+  parent_name?: string | null;
+  parent_phone_wa?: string | null;
   is_active?: boolean;
 }
 
@@ -89,7 +112,10 @@ export interface StudentUpdate {
   nis?: string;
   name?: string;
   class_id?: string;
-  parent_id?: string;
+  parent_id?: string | null;
+  parent_name?: string | null;
+  parent_phone_wa?: string | null;
+  update_linked_parent?: boolean;
   is_active?: boolean;
 }
 
@@ -164,6 +190,15 @@ export interface FaceRecognitionLogItem {
   created_at: string;
 }
 
+export type FaceLogStatusFilter = "all" | "labeled" | "unlabeled" | "errors";
+
+export interface PaginatedFaceLogsResponse {
+  items: FaceRecognitionLogItem[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
 export interface FaceEvaluationMetrics {
   total_scans: number;
   total_labeled: number;
@@ -183,6 +218,7 @@ export interface ChatbotLogItem {
   created_at: string;
   phone_wa: string;
   user_message: string;
+  bot_response: string;
   detected_intent: string | null;
   tool_called: string | null;
   is_in_domain: boolean;
@@ -190,9 +226,36 @@ export interface ChatbotLogItem {
   latency_ms: number;
 }
 
+export type ChatbotDomainFilter = "all" | "true" | "false";
+
+export interface PaginatedChatbotLogsResponse {
+  items: ChatbotLogItem[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface ChatbotSimulateRequest {
+  phone_wa: string;
+  message_text: string;
+  media_url?: string | null;
+}
+
+export interface WhatsAppWebhookResponse {
+  reply_text: string;
+  is_in_domain: boolean;
+  is_fallback: boolean;
+  tool_called: string | null;
+  detected_intent: string | null;
+  latency_ms: number;
+  wa_sent: boolean;
+  ignored: boolean;
+}
+
 export interface ChatbotEvaluationMetrics {
   total_messages: number;
   in_domain_count: number;
+  out_of_domain_count: number;
   in_domain_rate: number;
   fallback_count: number;
   fallback_rate: number;
@@ -204,6 +267,7 @@ export interface ClassDailyRecap {
   class_id: string;
   class_name: string;
   homeroom_teacher_name: string | null;
+  session_count: number;
   present_count: number;
   late_count: number;
   permit_or_sick_count: number;
@@ -239,6 +303,7 @@ export interface LeaveRequestItem {
   verified_by: string | null;
   verified_by_name: string | null;
   verified_at: string | null;
+  verification_note?: string | null;
   created_at: string;
 }
 
@@ -276,6 +341,7 @@ export function getStoredUser(): UserProfile | null {
 
 export function setAuthSession(token: string, user: UserProfile): void {
   if (typeof window === "undefined") return;
+  unauthorizedRedirectInFlight = false;
   window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
   window.localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(user));
 }
@@ -295,19 +361,23 @@ export function resolveAssetUrl(pathOrUrl: string | null | undefined): string | 
   return `${API_ORIGIN}${normalized}`;
 }
 
+function cleanPydanticPrefix(message: string): string {
+  return message.replace(/^Value error,\s*/i, "").trim();
+}
+
 function extractErrorMessage(payload: unknown, fallbackStatus: number): string {
   if (payload && typeof payload === "object" && "detail" in payload) {
     const detail = (payload as { detail: unknown }).detail;
     if (typeof detail === "string" && detail.trim()) {
-      return detail;
+      return cleanPydanticPrefix(detail);
     }
     if (Array.isArray(detail) && detail.length > 0) {
       const messages = detail
         .map((item) => {
           if (item && typeof item === "object" && "msg" in item) {
-            return String((item as { msg: unknown }).msg);
+            return cleanPydanticPrefix(String((item as { msg: unknown }).msg));
           }
-          return typeof item === "string" ? item : "";
+          return typeof item === "string" ? cleanPydanticPrefix(item) : "";
         })
         .filter(Boolean);
       if (messages.length > 0) {
@@ -328,29 +398,89 @@ function extractErrorMessage(payload: unknown, fallbackStatus: number): string {
 }
 
 let unauthorizedHandler: (() => void) | null = null;
+let unauthorizedRedirectInFlight = false;
 
 export function registerUnauthorizedHandler(handler: (() => void) | null): void {
   unauthorizedHandler = handler;
+  if (!handler) {
+    unauthorizedRedirectInFlight = false;
+  }
 }
 
 function redirectToLoginOnUnauthorized(): void {
   clearAuthSession();
   if (
-    typeof window !== "undefined" &&
-    window.location.pathname !== "/login" &&
-    unauthorizedHandler
+    typeof window === "undefined" ||
+    window.location.pathname === "/login" ||
+    !unauthorizedHandler ||
+    unauthorizedRedirectInFlight
   ) {
-    unauthorizedHandler();
+    return;
+  }
+  unauthorizedRedirectInFlight = true;
+  unauthorizedHandler();
+  window.setTimeout(() => {
+    unauthorizedRedirectInFlight = false;
+  }, 1500);
+}
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  networkFallbackMessage: string
+): Promise<Response> {
+  const controller = new AbortController();
+  let timedOut = false;
+
+  const externalSignal = init.signal;
+  const onExternalAbort = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort();
+    } else {
+      externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+    }
+  }
+
+  const timeoutId = globalThis.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    if (timedOut) {
+      throw new ApiError(
+        0,
+        "Permintaan ke server melebihi batas waktu (timeout). Silakan coba lagi."
+      );
+    }
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new ApiError(0, "Permintaan dibatalkan.");
+    }
+    throw new ApiError(0, networkFallbackMessage);
+  } finally {
+    globalThis.clearTimeout(timeoutId);
+    externalSignal?.removeEventListener("abort", onExternalAbort);
   }
 }
 
 interface RequestOptions extends Omit<RequestInit, "body"> {
   body?: unknown;
   skipAuthRedirect?: boolean;
+  timeoutMs?: number;
 }
 
 async function apiRequest<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { body, headers: customHeaders, skipAuthRedirect = false, ...init } = options;
+  const {
+    body,
+    headers: customHeaders,
+    skipAuthRedirect = false,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    ...init
+  } = options;
 
   const headers = new Headers(customHeaders);
   const token = getAccessToken();
@@ -368,19 +498,16 @@ async function apiRequest<T>(path: string, options: RequestOptions = {}): Promis
     preparedBody = JSON.stringify(body);
   }
 
-  let response: Response;
-  try {
-    response = await fetch(`${API_BASE_URL}${path}`, {
+  const response = await fetchWithTimeout(
+    `${API_BASE_URL}${path}`,
+    {
       ...init,
       headers,
       body: preparedBody,
-    });
-  } catch {
-    throw new ApiError(
-      0,
-      "Tidak dapat terhubung ke server backend. Pastikan API FastAPI sedang berjalan."
-    );
-  }
+    },
+    timeoutMs,
+    "Tidak dapat terhubung ke server backend. Pastikan API FastAPI sedang berjalan."
+  );
 
   if (response.status === 401 && !skipAuthRedirect) {
     redirectToLoginOnUnauthorized();
@@ -427,8 +554,13 @@ export async function loginAdmin(payload: LoginRequest): Promise<LoginResponse> 
   });
 }
 
-export async function getMe(): Promise<UserProfile> {
-  return apiRequest<UserProfile>("/auth/me", { method: "GET" });
+export async function getMe(options?: {
+  skipAuthRedirect?: boolean;
+}): Promise<UserProfile> {
+  return apiRequest<UserProfile>("/auth/me", {
+    method: "GET",
+    skipAuthRedirect: options?.skipAuthRedirect,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +569,29 @@ export async function getMe(): Promise<UserProfile> {
 
 export async function getTeachers(): Promise<UserProfile[]> {
   return apiRequest<UserProfile[]>("/teachers", { method: "GET" });
+}
+
+export async function createTeacher(payload: TeacherCreate): Promise<UserProfile> {
+  return apiRequest<UserProfile>("/teachers", {
+    method: "POST",
+    body: payload,
+  });
+}
+
+export async function updateTeacher(
+  teacherId: string,
+  payload: TeacherUpdate
+): Promise<UserProfile> {
+  return apiRequest<UserProfile>(`/teachers/${encodeURIComponent(teacherId)}`, {
+    method: "PUT",
+    body: payload,
+  });
+}
+
+export async function deleteTeacher(teacherId: string): Promise<void> {
+  return apiRequest<void>(`/teachers/${encodeURIComponent(teacherId)}`, {
+    method: "DELETE",
+  });
 }
 
 export async function getClasses(): Promise<SchoolClass[]> {
@@ -582,6 +737,7 @@ export async function uploadStudentFace(
     {
       method: "POST",
       body: formData,
+      timeoutMs: FACE_UPLOAD_TIMEOUT_MS,
     }
   );
 }
@@ -597,7 +753,7 @@ export async function deleteStudentFace(
 }
 
 // ---------------------------------------------------------------------------
-// Evaluation, Threshold & Reports API (Screen 11)
+// Evaluation, Threshold, Simulator & Reports API (Screen 11)
 // ---------------------------------------------------------------------------
 
 export async function getFaceThreshold(): Promise<FaceThresholdResponse> {
@@ -621,6 +777,47 @@ export async function getEvaluationMetrics(
   const qs = recapDate ? `?recap_date=${encodeURIComponent(recapDate)}` : "";
   return apiRequest<EvaluationDashboardResponse>(`/evaluation/metrics${qs}`, {
     method: "GET",
+  });
+}
+
+export async function getEvaluationFaceLogs(params?: {
+  status?: FaceLogStatusFilter;
+  limit?: number;
+  offset?: number;
+}): Promise<PaginatedFaceLogsResponse> {
+  const qs = new URLSearchParams();
+  if (params?.status) qs.set("status", params.status);
+  if (params?.limit !== undefined) qs.set("limit", String(params.limit));
+  if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+  const queryStr = qs.toString() ? `?${qs.toString()}` : "";
+  return apiRequest<PaginatedFaceLogsResponse>(`/evaluation/face-logs${queryStr}`, {
+    method: "GET",
+  });
+}
+
+export async function getEvaluationChatbotLogs(params?: {
+  in_domain?: ChatbotDomainFilter;
+  limit?: number;
+  offset?: number;
+}): Promise<PaginatedChatbotLogsResponse> {
+  const qs = new URLSearchParams();
+  if (params?.in_domain) qs.set("in_domain", params.in_domain);
+  if (params?.limit !== undefined) qs.set("limit", String(params.limit));
+  if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+  const queryStr = qs.toString() ? `?${qs.toString()}` : "";
+  return apiRequest<PaginatedChatbotLogsResponse>(
+    `/evaluation/chatbot-logs${queryStr}`,
+    { method: "GET" }
+  );
+}
+
+export async function simulateChatbot(
+  payload: ChatbotSimulateRequest
+): Promise<WhatsAppWebhookResponse> {
+  return apiRequest<WhatsAppWebhookResponse>("/evaluation/chatbot-simulate", {
+    method: "POST",
+    body: payload,
+    timeoutMs: CHATBOT_SIMULATE_TIMEOUT_MS,
   });
 }
 
@@ -654,18 +851,15 @@ export async function downloadAttendanceCsv(filters?: {
     headers.set("Authorization", `Bearer ${token}`);
   }
 
-  let response: Response;
-  try {
-    response = await fetch(`${API_BASE_URL}/reports/attendance.csv${qs}`, {
+  const response = await fetchWithTimeout(
+    `${API_BASE_URL}/reports/attendance.csv${qs}`,
+    {
       method: "GET",
       headers,
-    });
-  } catch {
-    throw new ApiError(
-      0,
-      "Tidak dapat mengunduh laporan CSV. Pastikan backend aktif."
-    );
-  }
+    },
+    DEFAULT_TIMEOUT_MS,
+    "Tidak dapat mengunduh laporan CSV. Pastikan backend aktif."
+  );
 
   if (response.status === 401) {
     redirectToLoginOnUnauthorized();
@@ -690,9 +884,19 @@ export async function downloadAttendanceCsv(filters?: {
   const objectUrl = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = objectUrl;
-  link.download = filters?.start_date
-    ? `rekap-absensi-${filters.start_date}.csv`
-    : "rekap-absensi.csv";
+  if (
+    filters?.start_date &&
+    filters?.end_date &&
+    filters.start_date !== filters.end_date
+  ) {
+    link.download = `rekap-absensi-${filters.start_date}_sd_${filters.end_date}.csv`;
+  } else if (filters?.start_date) {
+    link.download = `rekap-absensi-${filters.start_date}.csv`;
+  } else if (filters?.end_date) {
+    link.download = `rekap-absensi-sd-${filters.end_date}.csv`;
+  } else {
+    link.download = "rekap-absensi.csv";
+  }
   document.body.appendChild(link);
   link.click();
   link.remove();

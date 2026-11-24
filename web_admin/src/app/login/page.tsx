@@ -21,8 +21,13 @@ import {
   setAuthSession,
 } from "@/lib/api";
 
+const SHOW_DEMO_HINT =
+  process.env.NODE_ENV !== "production" ||
+  process.env.NEXT_PUBLIC_SHOW_DEMO_HINT === "true";
+
 export default function LoginPage() {
   const router = useRouter();
+  const [checkingSession, setCheckingSession] = useState(true);
   const [identifier, setIdentifier] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -33,21 +38,30 @@ export default function LoginPage() {
     let cancelled = false;
     async function checkExistingSession() {
       const token = getAccessToken();
-      if (!token) return;
+      if (!token) {
+        if (!cancelled) setCheckingSession(false);
+        return;
+      }
       try {
-        const user = await getMe();
+        const user = await getMe({ skipAuthRedirect: true });
         if (cancelled) return;
         if (user.role === "admin") {
           setAuthSession(token, user);
           router.replace("/");
-        } else {
-          clearAuthSession();
+          return;
         }
-      } catch {
+        clearAuthSession();
+      } catch (err) {
         if (!cancelled) {
-          clearAuthSession();
+          if (
+            err instanceof ApiError &&
+            (err.status === 401 || err.status === 403)
+          ) {
+            clearAuthSession();
+          }
         }
       }
+      if (!cancelled) setCheckingSession(false);
     }
     void checkExistingSession();
     return () => {
@@ -91,11 +105,36 @@ export default function LoginPage() {
       if (err instanceof ApiError) {
         setErrorMessage(err.message);
       } else {
-        setErrorMessage("Terjadi kesalahan saat memproses login. Silakan coba lagi.");
+        setErrorMessage(
+          "Terjadi kesalahan saat memproses login. Silakan coba lagi."
+        );
       }
     } finally {
       setIsSubmitting(false);
     }
+  }
+
+  if (checkingSession) {
+    return (
+      <div className="min-h-screen bg-[#F8FAFC] flex items-center justify-center p-6">
+        <div className="w-full max-w-md rounded-2xl border border-[#E2E8F0] bg-white p-8 shadow-xs text-center space-y-4">
+          <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl bg-[#EFF6FF] text-[#1D4ED8]">
+            <ShieldCheck className="h-6 w-6 animate-pulse" aria-hidden="true" />
+          </div>
+          <div className="space-y-1">
+            <h1 className="text-base font-bold text-[#0F172A]">
+              Memeriksa Sesi Admin
+            </h1>
+            <p className="text-sm text-slate-500">
+              Mohon tunggu sebentar...
+            </p>
+          </div>
+          <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
+            <div className="h-full w-1/2 animate-pulse rounded-full bg-[#1D4ED8]" />
+          </div>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -137,17 +176,22 @@ export default function LoginPage() {
               <p className="text-[11px] text-emerald-400">512-d Cosine Match</p>
             </div>
             <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-3.5">
-              <p className="text-xs font-medium text-slate-400">Notifikasi & AI</p>
+              <p className="text-xs font-medium text-slate-400">
+                Notifikasi & AI
+              </p>
               <p className="mt-1 text-sm font-bold text-white">
                 WhatsApp Gateway
               </p>
-              <p className="text-[11px] text-blue-300">Gemini Function Calling</p>
+              <p className="text-[11px] text-blue-300">
+                Gemini Function Calling
+              </p>
             </div>
           </div>
         </div>
 
         <p className="text-xs text-slate-500">
-          © 2026 SmartSchool Attendance System • Akses terbatas khusus Admin Sekolah
+          © 2026 SmartSchool Attendance System • Akses terbatas khusus Admin
+          Sekolah
         </p>
       </div>
 
@@ -168,7 +212,10 @@ export default function LoginPage() {
               role="alert"
               className="mt-5 flex items-start gap-2.5 rounded-xl border border-red-200 bg-[#FEF2F2] p-3.5 text-sm text-[#DC2626]"
             >
-              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+              <AlertCircle
+                className="mt-0.5 h-4 w-4 shrink-0"
+                aria-hidden="true"
+              />
               <span>{errorMessage}</span>
             </div>
           ) : null}
@@ -251,27 +298,32 @@ export default function LoginPage() {
             </button>
           </form>
 
-          {/* Demo Account Hint */}
-          <div className="mt-6 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-4">
-            <div className="flex items-start justify-between gap-3">
-              <div className="space-y-1">
-                <p className="flex items-center gap-1.5 text-xs font-bold text-[#0F172A]">
-                  <KeyRound className="h-3.5 w-3.5 text-[#1D4ED8]" aria-hidden="true" />
-                  <span>Akun Demo Seeder</span>
-                </p>
-                <p className="font-mono text-xs text-slate-600">
-                  admin@sekolah.sch.id / admin123
-                </p>
+          {/* Demo Account Hint (gated for non-production or explicit env flag) */}
+          {SHOW_DEMO_HINT ? (
+            <div className="mt-6 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div className="space-y-1">
+                  <p className="flex items-center gap-1.5 text-xs font-bold text-[#0F172A]">
+                    <KeyRound
+                      className="h-3.5 w-3.5 text-[#1D4ED8]"
+                      aria-hidden="true"
+                    />
+                    <span>Akun Demo Seeder</span>
+                  </p>
+                  <p className="font-mono text-xs text-slate-600">
+                    admin@sekolah.sch.id / admin123
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleFillDemo}
+                  className="shrink-0 rounded-lg border border-blue-200 bg-[#EFF6FF] px-2.5 py-1.5 text-xs font-semibold text-[#1D4ED8] transition-colors hover:bg-blue-100"
+                >
+                  Isi Otomatis
+                </button>
               </div>
-              <button
-                type="button"
-                onClick={handleFillDemo}
-                className="shrink-0 rounded-lg border border-blue-200 bg-[#EFF6FF] px-2.5 py-1.5 text-xs font-semibold text-[#1D4ED8] transition-colors hover:bg-blue-100"
-              >
-                Isi Otomatis
-              </button>
             </div>
-          </div>
+          ) : null}
         </div>
       </div>
     </div>
