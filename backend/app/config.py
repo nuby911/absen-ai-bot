@@ -40,6 +40,15 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.0-flash"
 
     upload_dir: str = "uploads"
+    cors_allow_origins: str = "*"
+
+    def get_cors_origins(self) -> list[str]:
+        """Parse comma-separated CORS_ALLOW_ORIGINS into a normalized allowlist."""
+        raw = self.cors_allow_origins.strip()
+        if not raw or raw == "*":
+            return ["*"]
+        origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
+        return origins or ["*"]
 
 
 @lru_cache

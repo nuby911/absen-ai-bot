@@ -283,6 +283,8 @@ async def test_approve_leave_updates_or_creates_attendance_and_notifies_parent_w
     assert body["leave"]["verified_by"] == seeded_teacher.id
     assert body["leave"]["verified_by_name"] == seeded_teacher.name
     assert body["leave"]["verified_at"] is not None
+    assert body["leave"]["verified_at"].endswith("Z")
+    assert body["leave"]["verification_note"] == "Semoga lekas sembuh."
 
     # Capture scalar identifiers before expiring session cache
     student_a_id = student_a.id
@@ -545,3 +547,89 @@ async def test_verify_leave_atomic_update_blocks_concurrent_race(
     assert res.status_code == 400
     assert res.json()["detail"] == "Pengajuan izin ini sudah diverifikasi sebelumnya."
     assert len(mock_wa.sent) == 0
+
+
+@pytest.mark.asyncio
+async def test_verify_leave_rejects_inactive_student_and_preserves_kiosk_attendance(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    seeded_teacher: User,
+    teacher_headers: dict[str, str],
+    mock_wa: MockWhatsAppProvider,
+) -> None:
+    """Reject verifying leave for inactive student (400) and never overwrite face_kiosk present/late."""
+    data = await _seed_leave_fixtures(db_session)
+    class_a: SchoolClass = data["class_a"]  # type: ignore[assignment]
+    parent_a: Parent = data["parent_a"]  # type: ignore[assignment]
+    student_a: Student = data["student_a"]  # type: ignore[assignment]
+    student_b: Student = data["student_b"]  # type: ignore[assignment]
+    parent_b: Parent = data["parent_b"]  # type: ignore[assignment]
+
+    # 1. Inactive student -> 400
+    student_b.is_active = False
+    inactive_leave = LeaveRequest(
+        student_id=student_b.id,
+        parent_id=parent_b.id,
+        request_type="sick",
+        start_date=date(2026, 11, 24),
+        end_date=date(2026, 11, 24),
+        reason="Sakit.",
+        status="pending",
+    )
+
+    # 2. Active student already scanned present via face_kiosk on 2026-11-24
+    kiosk_session = AttendanceSession(
+        class_id=class_a.id,
+        teacher_id=seeded_teacher.id,
+        session_type="subject",
+        session_date=date(2026, 11, 24),
+        status="open",
+    )
+    leave_a = LeaveRequest(
+        student_id=student_a.id,
+        parent_id=parent_a.id,
+        request_type="sick",
+        start_date=date(2026, 11, 24),
+        end_date=date(2026, 11, 24),
+        reason="Sakit tapi ternyata tetap masuk.",
+        status="pending",
+    )
+    db_session.add_all([inactive_leave, kiosk_session, leave_a])
+    await db_session.flush()
+
+    kiosk_att = Attendance(
+        session_id=kiosk_session.id,
+        student_id=student_a.id,
+        status="present",
+        verification_method="face_kiosk",
+        scanned_at=datetime.now(timezone.utc),
+        similarity_score=0.92,
+        wa_status="sent",
+    )
+    db_session.add(kiosk_att)
+    await db_session.commit()
+
+    kiosk_att_id = kiosk_att.id
+
+    inactive_res = await client.patch(
+        f"/api/v1/leave-requests/{inactive_leave.id}/verify",
+        json={"decision": "approved"},
+        headers=teacher_headers,
+    )
+    assert inactive_res.status_code == 400
+    assert "tidak aktif" in inactive_res.json()["detail"].lower()
+
+    approve_res = await client.patch(
+        f"/api/v1/leave-requests/{leave_a.id}/verify",
+        json={"decision": "approved", "note": "Sudah masuk kelas"},
+        headers=teacher_headers,
+    )
+    assert approve_res.status_code == 200
+    assert approve_res.json()["synced_sessions_count"] == 0
+    assert approve_res.json()["leave"]["verification_note"] == "Sudah masuk kelas"
+
+    db_session.expire_all()
+    att_after = await db_session.get(Attendance, kiosk_att_id)
+    assert att_after is not None
+    assert att_after.status == "present"
+    assert att_after.verification_method == "face_kiosk"

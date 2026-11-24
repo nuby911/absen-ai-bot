@@ -1,9 +1,11 @@
 import asyncio
 from datetime import datetime, time, timedelta, timezone
 import hashlib
+from pathlib import Path
 import uuid
 
 import numpy as np
+from PIL import Image, ImageDraw
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -40,6 +42,35 @@ def _deterministic_embedding(seed_key: str) -> list[float]:
     vec = rng.standard_normal(EMBEDDING_DIM).astype(np.float64)
     norm = float(np.linalg.norm(vec))
     return (vec / norm).tolist() if norm > 0 else [0.0] * EMBEDDING_DIM
+
+
+def _ensure_seed_face_jpeg(target_path: Path, seed_key: str) -> None:
+    """Create a lightweight deterministic JPEG avatar thumbnail on disk if missing."""
+    if target_path.exists() and target_path.is_file():
+        return
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(seed_key.encode("utf-8")).digest()
+    base_r = 45 + (digest[0] % 110)
+    base_g = 65 + (digest[1] % 110)
+    base_b = 110 + (digest[2] % 110)
+
+    size = 160
+    y_grad, x_grad = np.meshgrid(
+        np.linspace(0.0, 1.0, size, dtype=np.float32),
+        np.linspace(0.0, 1.0, size, dtype=np.float32),
+        indexing="ij",
+    )
+    r_chan = np.clip(base_r + 40.0 * x_grad, 0, 255).astype(np.uint8)
+    g_chan = np.clip(base_g + 35.0 * y_grad, 0, 255).astype(np.uint8)
+    b_chan = np.clip(base_b + 30.0 * (1.0 - x_grad), 0, 255).astype(np.uint8)
+    bg = np.stack([r_chan, g_chan, b_chan], axis=-1)
+
+    img = Image.fromarray(bg, mode="RGB")
+    draw = ImageDraw.Draw(img)
+    # Clean stylized portrait silhouette so thumbnails look polished in /faces
+    draw.ellipse((52, 28, 108, 84), fill=(240, 244, 248))
+    draw.pieslice((26, 86, 134, 186), start=180, end=360, fill=(240, 244, 248))
+    img.save(target_path, format="JPEG", quality=82, optimize=True)
 
 
 async def _get_or_create_user(
@@ -161,8 +192,13 @@ async def _get_or_create_schedule(
     return schedule
 
 
-async def seed_demo_data(db: AsyncSession) -> dict[str, int]:
+async def seed_demo_data(
+    db: AsyncSession,
+    *,
+    upload_dir: str | None = None,
+) -> dict[str, int]:
     """Seed idempotent realistic demo data aligned with Figma mockups."""
+    resolved_upload_dir = Path(upload_dir if upload_dir is not None else get_settings().upload_dir)
     now_wib = datetime.now(WIB)
     today_wib = now_wib.date()
     today_dow = today_wib.isoweekday()
@@ -310,11 +346,15 @@ async def seed_demo_data(db: AsyncSession) -> dict[str, int]:
 
     all_students = [rubby, deni, septi, yoga, ahmad, nadia, rizky, putri]
 
-    # 5. Face Embeddings (sample deterministic vectors so face_count > 0)
+    # 5. Face Embeddings (3 samples per student + real JPEG placeholders on disk)
     face_count_seeded = 0
-    for student in [rubby, deni, septi, yoga, ahmad]:
-        for idx in (1, 2):
+    for student in all_students:
+        for idx in (1, 2, 3):
             image_path = f"faces/{student.id}/seed_{idx}.jpg"
+            _ensure_seed_face_jpeg(
+                resolved_upload_dir / image_path,
+                seed_key=f"{student.nis}:{idx}",
+            )
             existing_face = await db.scalar(
                 select(FaceEmbedding).where(
                     FaceEmbedding.student_id == student.id,
@@ -327,7 +367,7 @@ async def seed_demo_data(db: AsyncSession) -> dict[str, int]:
                         student_id=student.id,
                         image_path=image_path,
                         embedding=_deterministic_embedding(f"{student.nis}:{idx}"),
-                        quality_score=0.92,
+                        quality_score=round(0.90 + 0.02 * idx, 2),
                     )
                 )
                 face_count_seeded += 1
@@ -471,14 +511,14 @@ async def seed_demo_data(db: AsyncSession) -> dict[str, int]:
 
     # 9. Labeled Face Recognition Evaluation Logs (TP, FP impostor, FN, TN impostor)
     face_log_specs = [
-        ("face-log-tp-1", rubby.id, rubby.id, 0.89, True, True, 112, "pencahayaan_normal"),
-        ("face-log-tp-2", deni.id, deni.id, 0.83, True, True, 124, "pencahayaan_normal"),
-        ("face-log-tp-3", yoga.id, yoga.id, 0.91, True, True, 108, "pencahayaan_normal"),
-        ("face-log-tp-4", septi.id, septi.id, 0.86, True, True, 118, "kacamata"),
-        ("face-log-fn-1", None, ahmad.id, 0.51, True, False, 136, "cahaya_redup"),
-        ("face-log-fp-1", rubby.id, None, 0.57, True, True, 129, "impostor:kemiripan_tinggi"),
-        ("face-log-tn-1", None, None, 0.28, True, False, 98, "impostor:non_siswa"),
-        ("face-log-tn-2", None, None, 0.34, True, False, 104, "impostor:foto_cetak"),
+        ("face-log-tp-1", rubby.id, rubby.id, 0.89, True, True, False, 112, "pencahayaan_normal"),
+        ("face-log-tp-2", deni.id, deni.id, 0.83, True, True, False, 124, "pencahayaan_normal"),
+        ("face-log-tp-3", yoga.id, yoga.id, 0.91, True, True, False, 108, "pencahayaan_normal"),
+        ("face-log-tp-4", septi.id, septi.id, 0.86, True, True, False, 118, "kacamata"),
+        ("face-log-fn-1", None, ahmad.id, 0.51, True, False, False, 136, "cahaya_redup"),
+        ("face-log-fp-1", rubby.id, None, 0.57, True, True, True, 129, "kemiripan_tinggi"),
+        ("face-log-tn-1", None, None, 0.28, True, False, True, 98, "non_siswa"),
+        ("face-log-tn-2", None, None, 0.34, True, False, True, 104, "foto_cetak"),
     ]
     for idx, (
         key,
@@ -487,6 +527,7 @@ async def seed_demo_data(db: AsyncSession) -> dict[str, int]:
         score,
         liveness,
         matched,
+        impostor,
         latency,
         note,
     ) in enumerate(face_log_specs):
@@ -502,6 +543,7 @@ async def seed_demo_data(db: AsyncSession) -> dict[str, int]:
                     threshold_used=0.55,
                     liveness_passed=liveness,
                     is_match=matched,
+                    is_impostor=impostor,
                     latency_ms=latency,
                     condition_note=note,
                     created_at=now_utc - timedelta(minutes=30 - idx),

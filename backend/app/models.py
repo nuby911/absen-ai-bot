@@ -38,7 +38,8 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
     role: Mapped[str] = mapped_column(String(20), nullable=False)
-    nip: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    nip: Mapped[str | None] = mapped_column(String(50), unique=True, nullable=True, index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     kiosk_pin_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utc_now, nullable=False
@@ -261,9 +262,10 @@ class LeaveRequest(Base):
     attachment_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
     verified_by: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("users.id"), nullable=True
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    verification_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utc_now, nullable=False
     )
@@ -280,18 +282,19 @@ class FaceRecognitionLog(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     session_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("attendance_sessions.id"), nullable=True, index=True
+        String(36), ForeignKey("attendance_sessions.id", ondelete="SET NULL"), nullable=True, index=True
     )
     predicted_student_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("students.id"), nullable=True
+        String(36), ForeignKey("students.id", ondelete="SET NULL"), nullable=True
     )
     actual_student_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("students.id"), nullable=True
+        String(36), ForeignKey("students.id", ondelete="SET NULL"), nullable=True
     )
     top_similarity_score: Mapped[float] = mapped_column(Float, nullable=False)
     threshold_used: Mapped[float] = mapped_column(Float, nullable=False)
     liveness_passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
     is_match: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    is_impostor: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     condition_note: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -306,7 +309,7 @@ class ChatbotLog(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     parent_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("parents.id"), nullable=True, index=True
+        String(36), ForeignKey("parents.id", ondelete="SET NULL"), nullable=True, index=True
     )
     phone_wa: Mapped[str] = mapped_column(String(30), nullable=False)
     user_message: Mapped[str] = mapped_column(Text, nullable=False)

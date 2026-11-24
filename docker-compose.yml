@@ -50,10 +50,17 @@ services:
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.0-flash}
       UPLOAD_DIR: /app/uploads
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-*}
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
       - backend_uploads:/app/uploads
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
 volumes:
   postgres_data:

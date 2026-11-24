@@ -55,18 +55,36 @@ _TOOL_TO_INTENT: dict[str, str] = {
 
 _MONTH_NAMES_ID: dict[str, int] = {
     "januari": 1,
+    "jan": 1,
     "februari": 2,
+    "feb": 2,
     "maret": 3,
+    "mar": 3,
     "april": 4,
+    "apr": 4,
     "mei": 5,
     "juni": 6,
+    "jun": 6,
     "juli": 7,
+    "jul": 7,
     "agustus": 8,
+    "agust": 8,
+    "agu": 8,
+    "agt": 8,
     "september": 9,
+    "sept": 9,
+    "sep": 9,
     "oktober": 10,
+    "okt": 10,
     "november": 11,
+    "nov": 11,
     "desember": 12,
+    "des": 12,
 }
+
+_MONTH_REGEX_PATTERN = "|".join(
+    sorted((re.escape(name) for name in _MONTH_NAMES_ID), key=len, reverse=True)
+)
 
 _DAY_NAMES_ID: dict[str, int] = {
     "senin": 1,
@@ -79,6 +97,68 @@ _DAY_NAMES_ID: dict[str, int] = {
     "minggu": 7,
     "ahad": 7,
 }
+
+_STUDENT_MATCH_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "anak",
+        "saya",
+        "siswa",
+        "murid",
+        "kelas",
+        "hari",
+        "ini",
+        "besok",
+        "lusa",
+        "izin",
+        "ijin",
+        "sakit",
+        "hadir",
+        "absen",
+        "absensi",
+        "presensi",
+        "rekap",
+        "bulan",
+        "jadwal",
+        "pelajaran",
+        "mapel",
+        "cek",
+        "status",
+        "mohon",
+        "tolong",
+        "yang",
+        "dan",
+        "atau",
+        "dari",
+        "untuk",
+        "pada",
+        "tidak",
+        "bisa",
+        "masuk",
+        "sekolah",
+        "guru",
+        "wali",
+        "bapak",
+        "ibu",
+        "ananda",
+        "putra",
+        "putri",
+        "sudah",
+        "belum",
+        "apakah",
+        "karena",
+        "selama",
+        "sampai",
+        "hingga",
+        "dengan",
+        "surat",
+        "dokter",
+        "demam",
+        "acara",
+        "keluarga",
+        *_DAY_NAMES_ID.keys(),
+        *_MONTH_NAMES_ID.keys(),
+    }
+)
 
 CHATBOT_TOOL_DECLARATIONS: list[dict[str, Any]] = [
     {
@@ -166,10 +246,6 @@ CHATBOT_TOOL_DECLARATIONS: list[dict[str, Any]] = [
                     "type": "STRING",
                     "description": "Alasan izin atau keterangan sakit dari orang tua.",
                 },
-                "attachment_url": {
-                    "type": "STRING",
-                    "description": "URL lampiran surat izin/dokter jika tersedia.",
-                },
             },
             "required": ["request_type", "reason"],
         },
@@ -224,8 +300,8 @@ def format_today_attendance_reply(data: dict[str, Any]) -> str:
     for stu in students:
         header = f"- *{stu['student_name']}* (Kelas {stu['class_name']})"
         records = stu.get("records") or []
+        leave_today = stu.get("leave_status_today")
         if not records:
-            leave_today = stu.get("leave_status_today")
             if leave_today:
                 blocks.append(f"{header}\n  Status pengajuan izin hari ini: {leave_today}")
             else:
@@ -238,6 +314,8 @@ def format_today_attendance_reply(data: dict[str, Any]) -> str:
             lines.append(
                 f"  • {rec['session_label']}: *{rec['status_label']}*{time_part}"
             )
+        if leave_today:
+            lines.append(f"  • Status pengajuan izin hari ini: {leave_today}")
         blocks.append("\n".join(lines))
 
     return "\n\n".join(blocks)
@@ -493,59 +571,191 @@ class GeminiLLMProvider:
 
 
 def _match_student_id(lower_msg: str, students: list[dict[str, Any]]) -> str | None:
-    """Match a registered child of the parent by NIS, full name, or distinctive name token."""
+    """Rank-match a parent's child by NIS -> full name -> distinctive tokens; ties return None."""
+    if not students:
+        return None
+
+    # 1. Exact NIS match
+    nis_matches: list[str] = []
     for stu in students:
         nis = str(stu.get("nis", "")).strip().lower()
+        if nis and re.search(rf"(?<!\d){re.escape(nis)}(?!\d)", lower_msg):
+            nis_matches.append(str(stu["id"]))
+    if len(nis_matches) == 1:
+        return nis_matches[0]
+    if len(nis_matches) > 1:
+        return None
+
+    # 2. Full student name match
+    full_matches: list[str] = []
+    for stu in students:
+        name = re.sub(r"\s+", " ", str(stu.get("name", "")).strip().lower())
+        if name and re.search(rf"\b{re.escape(name)}\b", lower_msg):
+            full_matches.append(str(stu["id"]))
+    if len(full_matches) == 1:
+        return full_matches[0]
+    if len(full_matches) > 1:
+        return None
+
+    # 3. Distinctive token match (excluding stopwords & resolving shared-surname ties to None)
+    token_scores: list[tuple[int, str]] = []
+    for stu in students:
         name = str(stu.get("name", "")).strip().lower()
-        if nis and nis in lower_msg:
-            return str(stu["id"])
-        if name and name in lower_msg:
-            return str(stu["id"])
-        for token in name.split():
-            if len(token) >= 3 and re.search(rf"\b{re.escape(token)}\b", lower_msg):
-                return str(stu["id"])
+        distinctive_tokens = {
+            tok
+            for tok in re.findall(r"[a-z0-9]+", name)
+            if len(tok) >= 3 and tok not in _STUDENT_MATCH_STOPWORDS
+        }
+        matched_count = sum(
+            1
+            for tok in distinctive_tokens
+            if re.search(rf"\b{re.escape(tok)}\b", lower_msg)
+        )
+        if matched_count > 0:
+            token_scores.append((matched_count, str(stu["id"])))
+
+    if not token_scores:
+        return None
+
+    token_scores.sort(key=lambda item: item[0], reverse=True)
+    top_score = token_scores[0][0]
+    top_candidates = [sid for score, sid in token_scores if score == top_score]
+    if len(top_candidates) == 1:
+        return top_candidates[0]
+    return None
+
+
+def _extract_leave_duration_days(lower_msg: str) -> int | None:
+    """Extract intended leave duration in days while ignoring past-tense symptom durations."""
+    candidates: list[tuple[int, int, int]] = []  # (start_pos, end_pos, days)
+
+    for match in re.finditer(r"\b(?:selama\s+|untuk\s+)?(\d{1,3})\s+hari\b", lower_msg):
+        days = int(match.group(1))
+        if days > 0:
+            candidates.append((match.start(), match.end(), min(days, 365)))
+
+    for match in re.finditer(r"\b(?:selama\s+|untuk\s+)?(\d{1,2})\s+minggu\b", lower_msg):
+        weeks = int(match.group(1))
+        if weeks > 0:
+            candidates.append((match.start(), match.end(), min(weeks * 7, 365)))
+
+    for match in re.finditer(r"\b(?:selama\s+|untuk\s+)?seminggu\b", lower_msg):
+        candidates.append((match.start(), match.end(), 7))
+
+    candidates.sort(key=lambda item: item[0])
+
+    for start_pos, end_pos, days in candidates:
+        after = lower_msg[end_pos : end_pos + 20]
+        if re.match(r"^\s*(?:yang\s+)?lalu\b", after):
+            continue
+
+        before = lower_msg[max(0, start_pos - 35) : start_pos]
+        past_matches = list(re.finditer(r"\b(?:sudah|sejak|dari|selama\s+ini)\b", before))
+        if past_matches:
+            tail_after_past = before[past_matches[-1].end() :]
+            span_text = lower_msg[start_pos:end_pos]
+            has_explicit_leave_cue = bool(
+                re.search(
+                    r"\b(?:izin|ijin|tidak\s+(?:bisa\s+)?masuk|cuti|selama|untuk)\b",
+                    tail_after_past,
+                )
+                or re.match(r"^(?:selama|untuk)\b", span_text)
+            )
+            if not has_explicit_leave_cue:
+                continue
+
+        return days
     return None
 
 
 def _parse_dates_from_text(lower_msg: str, today: date) -> tuple[str, str]:
     """Extract start_date and end_date ISO strings from natural Indonesian text."""
-    explicit_dates: list[date] = []
+    # 1. Explicit named-month date range (e.g., "25-27 November 2026", "25 s.d. 27 Nov")
+    named_range_re = re.compile(
+        rf"\b(\d{{1,2}})\s*(?:-|s\.?d\.?|sampai(?:\s+dengan)?|hingga)\s*(\d{{1,2}})\s+({_MONTH_REGEX_PATTERN})(?:\s+(20\d{{2}}))?\b"
+    )
+    range_match = named_range_re.search(lower_msg)
+    if range_match:
+        d1 = int(range_match.group(1))
+        d2 = int(range_match.group(2))
+        month_num = _MONTH_NAMES_ID[range_match.group(3)]
+        year_num = int(range_match.group(4)) if range_match.group(4) else today.year
+        try:
+            start_d = date(year_num, month_num, d1)
+            end_d = date(year_num, month_num, d2)
+            return start_d.isoformat(), end_d.isoformat()
+        except ValueError:
+            pass
+
+    # 2. Explicit dates (ISO, DD/MM/YYYY, DD-MM-YYYY, DD Month [YYYY]) in text order
+    found_dates: list[tuple[int, int, date]] = []  # (start, end, date_val)
+
+    def _overlaps_existing(s: int, e: int) -> bool:
+        return any(not (e <= es or s >= ee) for es, ee, _ in found_dates)
 
     for match in re.finditer(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", lower_msg):
         try:
-            explicit_dates.append(
-                date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
-            )
+            parsed = date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+            found_dates.append((match.start(), match.end(), parsed))
         except ValueError:
             pass
 
     for match in re.finditer(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b", lower_msg):
+        if _overlaps_existing(match.start(), match.end()):
+            continue
         try:
-            explicit_dates.append(
-                date(int(match.group(3)), int(match.group(2)), int(match.group(1)))
-            )
+            parsed = date(int(match.group(3)), int(match.group(2)), int(match.group(1)))
+            found_dates.append((match.start(), match.end(), parsed))
         except ValueError:
             pass
 
-    if explicit_dates:
-        start_d = explicit_dates[0]
-        end_d = explicit_dates[1] if len(explicit_dates) > 1 and explicit_dates[1] >= start_d else start_d
+    named_single_re = re.compile(
+        rf"\b(\d{{1,2}})\s+({_MONTH_REGEX_PATTERN})(?:\s+(20\d{{2}}))?\b"
+    )
+    for match in named_single_re.finditer(lower_msg):
+        if _overlaps_existing(match.start(), match.end()):
+            continue
+        day_num = int(match.group(1))
+        month_num = _MONTH_NAMES_ID[match.group(2)]
+        year_num = int(match.group(3)) if match.group(3) else today.year
+        try:
+            parsed = date(year_num, month_num, day_num)
+            found_dates.append((match.start(), match.end(), parsed))
+        except ValueError:
+            pass
+
+    if found_dates:
+        found_dates.sort(key=lambda item: item[0])
+        if len(found_dates) >= 2:
+            # Preserve order (including inverted ranges) so submit_leave_request validates cleanly
+            return found_dates[0][2].isoformat(), found_dates[1][2].isoformat()
+        start_d = found_dates[0][2]
+        duration_days = _extract_leave_duration_days(lower_msg)
+        end_d = start_d + timedelta(days=duration_days - 1) if duration_days else start_d
         return start_d.isoformat(), end_d.isoformat()
 
-    if "lusa" in lower_msg:
+    # 3. Multi-day relative Indonesian phrases
+    has_today = bool(re.search(r"\bhari\s+ini\b", lower_msg))
+    has_besok = bool(re.search(r"\bbesok\b", lower_msg))
+    has_lusa = bool(re.search(r"\blusa\b", lower_msg))
+
+    if has_today and has_lusa:
+        return today.isoformat(), (today + timedelta(days=2)).isoformat()
+    if has_today and has_besok:
+        return today.isoformat(), (today + timedelta(days=1)).isoformat()
+    if has_besok and has_lusa:
+        return (today + timedelta(days=1)).isoformat(), (today + timedelta(days=2)).isoformat()
+
+    # 4. Single relative anchor + optional duration
+    if has_lusa:
         start_d = today + timedelta(days=2)
-    elif "besok" in lower_msg:
+    elif has_besok:
         start_d = today + timedelta(days=1)
     else:
         start_d = today
 
-    duration_match = re.search(r"\b(?:selama\s+)?(\d{1,2})\s+hari\b", lower_msg)
-    if duration_match:
-        days = max(1, min(30, int(duration_match.group(1))))
-        end_d = start_d + timedelta(days=days - 1)
-    else:
-        end_d = start_d
-
+    duration_days = _extract_leave_duration_days(lower_msg)
+    end_d = start_d + timedelta(days=duration_days - 1) if duration_days else start_d
     return start_d.isoformat(), end_d.isoformat()
 
 
@@ -559,8 +769,10 @@ def _parse_month_year(lower_msg: str, today: date) -> tuple[int, int]:
             return 12, year - 1
         return today.month - 1, year
 
-    for month_name, month_num in _MONTH_NAMES_ID.items():
-        if re.search(rf"\b{month_name}\b", lower_msg):
+    for month_name, month_num in sorted(
+        _MONTH_NAMES_ID.items(), key=lambda item: len(item[0]), reverse=True
+    ):
+        if re.search(rf"\b{re.escape(month_name)}\b", lower_msg):
             return month_num, year
 
     return today.month, year
@@ -568,15 +780,22 @@ def _parse_month_year(lower_msg: str, today: date) -> tuple[int, int]:
 
 def _parse_day_of_week(lower_msg: str, today: date) -> int | None:
     """Extract ISO day_of_week (1=Monday..7=Sunday) from Indonesian schedule queries."""
-    has_week_phrase = bool(re.search(r"\bminggu\s+(?:ini|depan|lalu)\b", lower_msg))
+    has_week_phrase = bool(
+        re.search(
+            r"\b(?:minggu\s+(?:ini|depan|lalu)|(?:\d+|satu|dua|tiga|se)\s*minggu|selama\s+\d*\s*minggu)\b",
+            lower_msg,
+        )
+    )
     for day_name, dow in _DAY_NAMES_ID.items():
         if day_name == "minggu" and has_week_phrase and "hari minggu" not in lower_msg:
             continue
         if re.search(rf"\b{re.escape(day_name)}\b", lower_msg):
             return dow
-    if "hari ini" in lower_msg:
+    if re.search(r"\bhari\s+ini\b", lower_msg):
         return today.isoweekday()
-    if "besok" in lower_msg:
+    if re.search(r"\blusa\b", lower_msg):
+        return (today + timedelta(days=2)).isoweekday()
+    if re.search(r"\bbesok\b", lower_msg):
         return (today + timedelta(days=1)).isoweekday()
     return None
 
@@ -606,8 +825,9 @@ class RuleBasedLLMProvider:
         student_id = _match_student_id(lower_msg, students)
         media_url = context.get("media_url")
 
-        # 1. Quick menu shortcuts ("1"-"4")
-        if lower_msg == "1":
+        # 1. Quick menu shortcuts ("1"-"4", "1."-"4.", "menu 1"-"menu 4")
+        menu_cmd = re.sub(r"\s+", " ", lower_msg).rstrip(". ")
+        if menu_cmd in {"1", "menu 1"}:
             result = await tool_executor("get_today_attendance", {"student_id": student_id})
             return LLMResult(
                 reply_text=format_today_attendance_reply(result),
@@ -615,7 +835,7 @@ class RuleBasedLLMProvider:
                 tool_called="get_today_attendance",
                 is_in_domain=True,
             )
-        if lower_msg == "2":
+        if menu_cmd in {"2", "menu 2"}:
             result = await tool_executor("get_monthly_recap", {"student_id": student_id})
             return LLMResult(
                 reply_text=format_monthly_recap_reply(result),
@@ -623,7 +843,7 @@ class RuleBasedLLMProvider:
                 tool_called="get_monthly_recap",
                 is_in_domain=True,
             )
-        if lower_msg == "3":
+        if menu_cmd in {"3", "menu 3"}:
             result = await tool_executor("get_class_schedule", {"student_id": student_id})
             return LLMResult(
                 reply_text=format_class_schedule_reply(result),
@@ -631,19 +851,26 @@ class RuleBasedLLMProvider:
                 tool_called="get_class_schedule",
                 is_in_domain=True,
             )
-        if lower_msg == "4":
+        if menu_cmd in {"4", "menu 4"}:
             return LLMResult(
                 reply_text=LEAVE_GUIDE_REPLY,
                 detected_intent="leave_instructions",
                 tool_called=None,
                 is_in_domain=True,
             )
+
+        # Strip polite conversational openers like "izin tanya ..." so they don't file leaves
+        leave_scan_msg = re.sub(
+            r"\b(?:izin|ijin)\s+(?:bertanya|tanya|nanya)\b",
+            "tanya",
+            lower_msg,
+        )
 
         # 2. Explicit "how to apply for leave" inquiry
         if _has_any_phrase(
-            lower_msg,
+            leave_scan_msg,
             ("cara", "bagaimana cara", "format izin", "syarat izin", "panduan izin"),
-        ) and _has_any_phrase(lower_msg, ("izin", "ijin", "sakit", "cuti")):
+        ) and _has_any_phrase(leave_scan_msg, ("izin", "ijin", "sakit", "cuti")):
             return LLMResult(
                 reply_text=LEAVE_GUIDE_REPLY,
                 detected_intent="leave_instructions",
@@ -651,7 +878,6 @@ class RuleBasedLLMProvider:
                 is_in_domain=True,
             )
 
-        # 3. Leave / sick submission
         sick_keywords = (
             "sakit",
             "demam",
@@ -673,35 +899,78 @@ class RuleBasedLLMProvider:
             "acara keluarga",
             "cuti",
         )
-        request_verbs = (
-            "mohon",
-            "ajukan",
-            "mengajukan",
-            "tolong",
-            "minta",
-            "buatkan",
-            "daftarkan",
-            "kirimkan",
-            "laporkan",
-        )
-        status_question_prefixes = (
+        inquiry_keywords = (
+            "cek",
+            "periksa",
+            "lihat",
+            "status",
+            "tanya",
+            "bertanya",
+            "nanya",
+            "sudah disetujui",
+            "sudah diverifikasi",
+            "apakah sudah",
             "apakah",
             "apa",
-            "cek",
-            "sudah",
             "bagaimana",
             "gimana",
-            "status",
+            "kapan",
+            "berapa",
+            "siapa",
         )
-        has_request_verb = _has_any_phrase(lower_msg, request_verbs)
-        looks_like_question = lower_msg.endswith("?") or any(
-            re.match(rf"^{prefix}\b", lower_msg) for prefix in status_question_prefixes
+        ood_keywords = (
+            "spp",
+            "biaya",
+            "uang",
+            "pembayaran",
+            "seragam",
+            "rapor",
+            "raport",
+            "libur",
+            "kantin",
+            "beasiswa",
+            "ppdb",
+            "ekstrakurikuler",
+            "eskul",
+            "ekskul",
+            "presiden",
+            "cuaca",
         )
-        is_status_question = looks_like_question and not has_request_verb
-        has_sick = _has_any_phrase(lower_msg, sick_keywords)
-        has_leave = _has_any_phrase(lower_msg, leave_keywords)
-        if not is_status_question and (has_sick or has_leave):
-            if lower_msg in {"izin", "ijin", "sakit"} and not media_url:
+
+        has_sick = _has_any_phrase(leave_scan_msg, sick_keywords)
+        has_leave = _has_any_phrase(leave_scan_msg, leave_keywords)
+        has_absence_reason = has_sick or _has_any_phrase(
+            leave_scan_msg, ("tidak masuk", "tidak bisa masuk", "berhalangan", "acara keluarga", "cuti")
+        )
+        has_attendance_word = _has_any_phrase(
+            lower_msg, ("absen", "absensi", "presensi", "hadir", "kehadiran")
+        )
+        has_schedule_word = _has_any_phrase(
+            lower_msg, ("jadwal", "pelajaran", "mapel", "mata pelajaran", "schedule")
+        )
+
+        # 2.5 Out-of-domain early guard (e.g., "izin tanya SPP", "biaya seragam", "pembagian rapor")
+        if (
+            _has_any_phrase(lower_msg, ood_keywords)
+            and not has_absence_reason
+            and not has_attendance_word
+            and not has_schedule_word
+        ):
+            return LLMResult(
+                reply_text=OUT_OF_DOMAIN_REPLY,
+                detected_intent="out_of_domain",
+                tool_called=None,
+                is_in_domain=False,
+            )
+
+        # 3. Leave / sick submission (inquiry verbs ALWAYS beat mohon/tolong)
+        has_inquiry_signal = (
+            lower_msg.endswith("?")
+            or _has_any_phrase(leave_scan_msg, inquiry_keywords)
+            or bool(re.match(r"^sudah\b", leave_scan_msg))
+        )
+        if not has_inquiry_signal and (has_sick or has_leave):
+            if leave_scan_msg in {"izin", "ijin", "sakit"} and not media_url:
                 return LLMResult(
                     reply_text=LEAVE_GUIDE_REPLY,
                     detected_intent="leave_instructions",
@@ -720,7 +989,6 @@ class RuleBasedLLMProvider:
                     "start_date": start_date,
                     "end_date": end_date,
                     "reason": reason,
-                    "attachment_url": media_url,
                 },
             )
             return LLMResult(
@@ -730,17 +998,14 @@ class RuleBasedLLMProvider:
                 is_in_domain=True,
             )
 
-        # 4. Monthly recap (must precede daily attendance check)
-        has_attendance_word = _has_any_phrase(
-            lower_msg, ("absen", "absensi", "presensi", "hadir", "kehadiran")
-        )
+        # 4. Monthly recap (require attendance word alongside "bulan ini"/"bulan lalu"/month name)
         has_month_name = _has_any_phrase(lower_msg, tuple(_MONTH_NAMES_ID.keys()))
+        has_relative_month = _has_any_phrase(
+            lower_msg, ("bulan ini", "bulan lalu", "bulan kemarin")
+        )
         if (
-            _has_any_phrase(
-                lower_msg,
-                ("rekap", "bulanan", "bulan ini", "bulan lalu", "bulan kemarin", "persentase", "statistik"),
-            )
-            or (has_month_name and has_attendance_word)
+            _has_any_phrase(lower_msg, ("rekap", "bulanan", "persentase", "statistik"))
+            or ((has_month_name or has_relative_month) and has_attendance_word)
         ):
             month, year = _parse_month_year(lower_msg, today)
             result = await tool_executor(
@@ -755,9 +1020,7 @@ class RuleBasedLLMProvider:
             )
 
         # 5. Class schedule
-        if _has_any_phrase(
-            lower_msg, ("jadwal", "pelajaran", "mapel", "mata pelajaran", "schedule")
-        ):
+        if has_schedule_word:
             dow = _parse_day_of_week(lower_msg, today)
             result = await tool_executor(
                 "get_class_schedule",
@@ -770,7 +1033,7 @@ class RuleBasedLLMProvider:
                 is_in_domain=True,
             )
 
-        # 6. Today's attendance
+        # 6. Today's attendance (including status inquiries about sakit/izin)
         today_attendance_keywords = (
             "absen",
             "absensi",
@@ -789,7 +1052,7 @@ class RuleBasedLLMProvider:
         )
         if (
             _has_any_phrase(lower_msg, today_attendance_keywords)
-            or (is_status_question and (has_sick or has_leave))
+            or (has_inquiry_signal and (has_sick or has_leave))
             or (student_id is not None and _has_any_phrase(lower_msg, ("hari ini", "status", "sudah")))
         ):
             result = await tool_executor(

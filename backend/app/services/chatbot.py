@@ -42,6 +42,16 @@ UNKNOWN_PARENT_REPLY = (
     "Silakan hubungi admin atau tata usaha sekolah untuk mendaftarkan nomor Anda."
 )
 
+MEDIA_MISSING_CAPTION_REPLY = (
+    "Terima kasih, lampiran media Bapak/Ibu telah kami terima. "
+    "Untuk mengajukan izin atau sakit, mohon kirimkan kembali foto/lampiran tersebut "
+    "disertai keterangan atau alasan izin pada caption pesan "
+    "(contoh: \"Mohon izin [Nama Anak] sakit demam hari ini\")."
+)
+
+MAX_LEAVE_DURATION_DAYS = 30
+MAX_BACKDATE_LEAVE_DAYS = 7
+
 _MONTH_NAMES_ID: dict[int, str] = {
     1: "Januari",
     2: "Februari",
@@ -174,13 +184,14 @@ async def _resolve_owned_students(
                 .where(
                     Student.id == cleaned_id,
                     Student.parent_id == parent_id,
+                    Student.is_active.is_(True),
                 )
             )
         ).first()
         if row is None:
             return None, {
                 "ok": False,
-                "error": "Akses ditolak: data siswa tidak ditemukan atau tidak terdaftar pada akun orang tua ini.",
+                "error": "Akses ditolak: data siswa aktif tidak ditemukan atau tidak terdaftar pada akun orang tua ini.",
             }
         return [(row[0], row[1])], None
 
@@ -236,7 +247,7 @@ class KeywordFallbackEngine:
         tool_executor: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]],
     ) -> LLMResult:
         """Handle quick menu choices `1`..`4` or present the fallback menu."""
-        cmd = (message_text or "").strip().lower()
+        cmd = " ".join((message_text or "").strip().lower().split()).rstrip(". ")
 
         if cmd in {"1", "menu 1", "status hari ini"}:
             data = await tool_executor("get_today_attendance", {})
@@ -526,7 +537,6 @@ class ChatbotOrchestrator:
             start_date: str | None = None,
             end_date: str | None = None,
             reason: str = "",
-            attachment_url: str | None = None,
         ) -> dict[str, Any]:
             owned, err = await _resolve_owned_students(
                 db, parent_id=parent_id, student_id=student_id, allow_multiple=False
@@ -563,6 +573,25 @@ class ChatbotOrchestrator:
                     "error": "Tanggal selesai izin tidak boleh lebih awal dari tanggal mulai.",
                 }
 
+            earliest_allowed = today - timedelta(days=MAX_BACKDATE_LEAVE_DAYS)
+            if parsed_start < earliest_allowed:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Tanggal mulai izin tidak boleh lebih dari {MAX_BACKDATE_LEAVE_DAYS} "
+                        "hari yang lalu."
+                    ),
+                }
+
+            duration_days = (parsed_end - parsed_start).days + 1
+            if duration_days > MAX_LEAVE_DURATION_DAYS:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Durasi pengajuan izin maksimal {MAX_LEAVE_DURATION_DAYS} hari kalender."
+                    ),
+                }
+
             cleaned_reason = str(reason or "").strip()
             if not cleaned_reason:
                 return {
@@ -570,21 +599,25 @@ class ChatbotOrchestrator:
                     "error": "Alasan pengajuan izin atau sakit wajib diisi.",
                 }
 
-            explicit_attachment = (
-                str(attachment_url).strip()
-                if attachment_url is not None and str(attachment_url).strip()
-                else None
+            overlapping_leave = await db.scalar(
+                select(LeaveRequest.id).where(
+                    LeaveRequest.student_id == student.id,
+                    LeaveRequest.status.in_(("pending", "approved")),
+                    LeaveRequest.start_date <= parsed_end,
+                    LeaveRequest.end_date >= parsed_start,
+                )
             )
-            if explicit_attachment is not None:
-                resolved_attachment = _sanitize_attachment_url(explicit_attachment)
-                if resolved_attachment is None:
-                    logger.warning(
-                        "URL lampiran izin tidak valid diabaikan untuk siswa %s: %s",
-                        student.id,
-                        explicit_attachment,
-                    )
-            else:
-                resolved_attachment = _sanitize_attachment_url(default_media_url)
+            if overlapping_leave is not None:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Sudah terdapat pengajuan izin/sakit yang masih menunggu verifikasi "
+                        f"atau telah disetujui untuk ananda {student.name} pada rentang tanggal tersebut."
+                    ),
+                }
+
+            # Always use the server-verified webhook media URL, never LLM-generated URLs.
+            resolved_attachment = _sanitize_attachment_url(default_media_url)
 
             student_name = student.name
             student_id_val = student.id
@@ -640,7 +673,6 @@ class ChatbotOrchestrator:
                     start_date=safe_args.get("start_date"),
                     end_date=safe_args.get("end_date"),
                     reason=safe_args.get("reason", ""),
-                    attachment_url=safe_args.get("attachment_url"),
                 )
             return {"ok": False, "error": f"Tool '{tool_name}' tidak dikenali."}
 
@@ -652,6 +684,8 @@ class ChatbotOrchestrator:
         phone_wa_raw: str,
         message_text: str | None = None,
         media_url: str | None = None,
+        *,
+        send_wa: bool = True,
     ) -> WhatsAppWebhookResponse:
         """Normalize sender phone, execute parent-isolated chatbot flow, log, and reply WA."""
         started_at = time_perf.perf_counter()
@@ -665,17 +699,16 @@ class ChatbotOrchestrator:
             )
 
         cleaned_message = (message_text or "").strip()
-        if not cleaned_message and sanitized_media_url:
-            cleaned_message = "Lampiran surat izin"
 
         parent = await db.scalar(select(Parent).where(Parent.phone_wa == normalized_phone))
         if parent is None:
             latency_ms = max(0, int(round((time_perf.perf_counter() - started_at) * 1000)))
+            logged_msg = cleaned_message or "[Lampiran media tanpa keterangan]"
             db.add(
                 ChatbotLog(
                     parent_id=None,
                     phone_wa=normalized_phone,
-                    user_message=cleaned_message,
+                    user_message=logged_msg,
                     detected_intent="unregistered_parent",
                     tool_called=None,
                     bot_response=UNKNOWN_PARENT_REPLY,
@@ -685,8 +718,12 @@ class ChatbotOrchestrator:
                 )
             )
             await db.commit()
-            wa_sent = await _safe_send_wa(
-                self.whatsapp_provider, normalized_phone, UNKNOWN_PARENT_REPLY
+            wa_sent = (
+                await _safe_send_wa(
+                    self.whatsapp_provider, normalized_phone, UNKNOWN_PARENT_REPLY
+                )
+                if send_wa
+                else False
             )
             return WhatsAppWebhookResponse(
                 reply_text=UNKNOWN_PARENT_REPLY,
@@ -703,6 +740,41 @@ class ChatbotOrchestrator:
         parent_id = parent.id
         parent_name = parent.name
         parent_phone = parent.phone_wa
+
+        # Captionless media must NOT auto-file a leave request; ask parent for caption/reason.
+        if not cleaned_message and sanitized_media_url:
+            latency_ms = max(0, int(round((time_perf.perf_counter() - started_at) * 1000)))
+            db.add(
+                ChatbotLog(
+                    parent_id=parent_id,
+                    phone_wa=parent_phone,
+                    user_message="[Lampiran media tanpa keterangan]",
+                    detected_intent="media_missing_caption",
+                    tool_called=None,
+                    bot_response=MEDIA_MISSING_CAPTION_REPLY,
+                    is_in_domain=True,
+                    is_fallback=False,
+                    latency_ms=latency_ms,
+                )
+            )
+            await db.commit()
+            wa_sent = (
+                await _safe_send_wa(
+                    self.whatsapp_provider, parent_phone, MEDIA_MISSING_CAPTION_REPLY
+                )
+                if send_wa
+                else False
+            )
+            return WhatsAppWebhookResponse(
+                reply_text=MEDIA_MISSING_CAPTION_REPLY,
+                is_in_domain=True,
+                is_fallback=False,
+                tool_called=None,
+                detected_intent="media_missing_caption",
+                latency_ms=latency_ms,
+                wa_sent=wa_sent,
+                ignored=False,
+            )
 
         student_rows = (
             await db.execute(
@@ -776,7 +848,11 @@ class ChatbotOrchestrator:
         )
         await db.commit()
 
-        wa_sent = await _safe_send_wa(self.whatsapp_provider, parent_phone, reply_text)
+        wa_sent = (
+            await _safe_send_wa(self.whatsapp_provider, parent_phone, reply_text)
+            if send_wa
+            else False
+        )
 
         return WhatsAppWebhookResponse(
             reply_text=reply_text,

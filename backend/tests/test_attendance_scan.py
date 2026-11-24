@@ -223,6 +223,11 @@ async def test_kiosk_scan_match_triggers_wa_and_prevents_duplicate_wa(
     assert cross_class_scan.json()["matched"] is False
 
     # 4. Late detection when expected_start_time + tolerance has passed
+    # Close the first open session first so duplicate open session guard allows a new one
+    assert (
+        await client.post(f"/api/v1/sessions/{session_id}/close", headers=teacher_headers)
+    ).status_code == 200
+
     now_wib = datetime.now(WIB)
     if now_wib.hour > 0 or now_wib.minute >= 20:
         past_start = (now_wib - timedelta(minutes=20)).time().replace(microsecond=0)
@@ -251,7 +256,7 @@ async def test_kiosk_scan_match_triggers_wa_and_prevents_duplicate_wa(
     assert len(mock_wa.sent) == 2
     assert "Terlambat" in mock_wa.sent[1].text
 
-    # 5. Gate session (class_id=None) matches active students across all classes
+    # 5. Gate session (class_id=None) matches active students across all classes and exposes full roster
     gate_res = await client.post(
         "/api/v1/sessions",
         headers=teacher_headers,
@@ -259,6 +264,8 @@ async def test_kiosk_scan_match_triggers_wa_and_prevents_duplicate_wa(
     )
     assert gate_res.status_code == 201
     gate_id = gate_res.json()["id"]
+    assert gate_res.json()["total_students"] == 3
+    assert gate_res.json()["unrecorded_count"] == 3
 
     gate_scan = await client.post(
         "/api/v1/attendance/scan",
@@ -273,12 +280,17 @@ async def test_kiosk_scan_match_triggers_wa_and_prevents_duplicate_wa(
 
     gate_detail = await client.get(f"/api/v1/sessions/{gate_id}", headers=teacher_headers)
     assert gate_detail.status_code == 200
+    assert gate_detail.json()["summary"]["total_students"] == 3
     assert gate_detail.json()["summary"]["recorded_count"] == 1
-    assert len(gate_detail.json()["students"]) == 1
+    assert gate_detail.json()["summary"]["unrecorded_count"] == 2
+    assert len(gate_detail.json()["students"]) == 3
 
     gate_close = await client.post(f"/api/v1/sessions/{gate_id}/close", headers=teacher_headers)
     assert gate_close.status_code == 200
     assert gate_close.json()["status"] == "closed"
+    assert gate_close.json()["summary"]["present_count"] == 1
+    assert gate_close.json()["summary"]["absent_count"] == 2
+    assert gate_close.json()["summary"]["unrecorded_count"] == 0
 
 
 async def test_kiosk_scan_wa_failure_keeps_attendance_and_allows_resend(
@@ -441,15 +453,21 @@ async def test_kiosk_scan_rejects_failed_liveness_and_unrecognized_face(
 
     logs = (
         await db_session.scalars(
-            select(FaceRecognitionLog).where(FaceRecognitionLog.session_id == session_id)
+            select(FaceRecognitionLog)
+            .where(FaceRecognitionLog.session_id == session_id)
+            .order_by(FaceRecognitionLog.created_at.asc(), FaceRecognitionLog.id.asc())
         )
     ).all()
-    assert len(logs) == 1
-    assert logs[0].is_match is False
-    assert logs[0].predicted_student_id is None
-    assert logs[0].liveness_passed is True
-    assert logs[0].condition_note == "cahaya_redup"
-    assert logs[0].latency_ms >= 0
+    assert len(logs) == 2
+    liveness_log = next(log for log in logs if log.liveness_passed is False)
+    assert liveness_log.is_match is False
+    assert liveness_log.top_similarity_score == 0.0
+
+    unrec_log = next(log for log in logs if log.liveness_passed is True)
+    assert unrec_log.is_match is False
+    assert unrec_log.predicted_student_id is None
+    assert unrec_log.condition_note == "cahaya_redup"
+    assert unrec_log.latency_ms >= 0
 
     attendances = (
         await db_session.scalars(select(Attendance).where(Attendance.session_id == session_id))
@@ -737,8 +755,8 @@ async def test_teacher_dashboard_returns_today_sessions_and_stats(
         status="pending",
     )
     leave_approved = LeaveRequest(
-        student_id=student_b.id,
-        parent_id=parent_b.id,
+        student_id=seeded["student_c"].id,  # type: ignore[union-attr]
+        parent_id=seeded["parent_c"].id,  # type: ignore[union-attr]
         request_type="permit",
         start_date=today,
         end_date=today,
@@ -854,3 +872,245 @@ async def test_waha_provider_and_message_builder() -> None:
     assert "XI IPA 1" in msg
     assert "Hadir" in msg
     assert "07:15 WIB" in msg
+
+
+async def test_preapproved_leave_synced_on_session_open_close_and_kiosk_upgrade(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    teacher_headers: dict[str, str],
+    admin_headers: dict[str, str],
+    mock_wa: MockWhatsAppProvider,
+) -> None:
+    """Approved leaves auto-populate on POST /sessions, survive close, and kiosk scan upgrades to present."""
+    seeded = await _seed_classroom_with_faces(db_session)
+    class_a: SchoolClass = seeded["class_a"]  # type: ignore[assignment]
+    parent_a: Parent = seeded["parent_a"]  # type: ignore[assignment]
+    student_a: Student = seeded["student_a"]  # type: ignore[assignment]
+    student_b: Student = seeded["student_b"]  # type: ignore[assignment]
+    png_a: bytes = seeded["png_a"]  # type: ignore[assignment]
+
+    today = datetime.now(WIB).date()
+    db_session.add(
+        LeaveRequest(
+            student_id=student_a.id,
+            parent_id=parent_a.id,
+            request_type="sick",
+            start_date=today,
+            end_date=today,
+            reason="Demam ringan",
+            status="approved",
+        )
+    )
+    await db_session.commit()
+
+    # 1. Opening session auto-populates approved sick leave for student_a
+    open_res = await client.post(
+        "/api/v1/sessions",
+        headers=teacher_headers,
+        json={"class_id": class_a.id, "session_type": "subject"},
+    )
+    assert open_res.status_code == 201
+    opened = open_res.json()
+    session_id = opened["id"]
+    assert opened["total_students"] == 2
+    assert opened["sick_count"] == 1
+    assert opened["recorded_count"] == 1
+    assert opened["unrecorded_count"] == 1
+    assert opened["opened_at"].endswith("Z")
+
+    # 2. Duplicate open session for same (date, type, class, schedule) -> 409 with existing session_id
+    dup_res = await client.post(
+        "/api/v1/sessions",
+        headers=teacher_headers,
+        json={"class_id": class_a.id, "session_type": "subject"},
+    )
+    assert dup_res.status_code == 409
+    assert session_id in dup_res.json()["detail"]
+
+    # 3. schedule_id rejected on non-subject session -> 422
+    bad_sched_type = await client.post(
+        "/api/v1/sessions",
+        headers=teacher_headers,
+        json={"schedule_id": "any-id", "session_type": "gate_in"},
+    )
+    assert bad_sched_type.status_code == 422
+
+    # 4. Kiosk scan for student_a upgrades 'sick' -> 'present', notifies parent WA, already_recorded=False!
+    upgrade_scan = await client.post(
+        "/api/v1/attendance/scan",
+        headers=teacher_headers,
+        data={"session_id": session_id, "liveness_passed": "true"},
+        files={"file": ("a.png", png_a, "image/png")},
+    )
+    assert upgrade_scan.status_code == 200
+    up_data = upgrade_scan.json()
+    assert up_data["matched"] is True
+    assert up_data["already_recorded"] is False
+    assert up_data["status"] == "present"
+    assert up_data["wa_queued"] is True
+    assert up_data["scanned_at"].endswith("Z")
+    assert len(mock_wa.sent) == 1
+
+    # 5. Admin can list GET /sessions, read GET /sessions/{id}, and call resend-wa
+    admin_sessions = await client.get(
+        "/api/v1/sessions",
+        params={"status": "open", "class_id": class_a.id},
+        headers=admin_headers,
+    )
+    assert admin_sessions.status_code == 200
+    assert any(s["id"] == session_id for s in admin_sessions.json())
+
+    admin_detail = await client.get(f"/api/v1/sessions/{session_id}", headers=admin_headers)
+    assert admin_detail.status_code == 200
+
+    admin_resend = await client.post(
+        f"/api/v1/attendance/{up_data['attendance_id']}/resend-wa",
+        headers=admin_headers,
+    )
+    assert admin_resend.status_code == 200
+    assert admin_resend.json()["wa_sent"] is True
+
+    # 6. Approve leave for student_b BEFORE close, then close session -> student_b gets permit (not absent!)
+    db_session.add(
+        LeaveRequest(
+            student_id=student_b.id,
+            parent_id=seeded["parent_b"].id,  # type: ignore[union-attr]
+            request_type="permit",
+            start_date=today,
+            end_date=today,
+            reason="Izin keluarga",
+            status="approved",
+        )
+    )
+    await db_session.commit()
+
+    closed = (
+        await client.post(f"/api/v1/sessions/{session_id}/close", headers=teacher_headers)
+    ).json()
+    assert closed["summary"]["present_count"] == 1
+    assert closed["summary"]["permit_count"] == 1
+    assert closed["summary"]["absent_count"] == 0
+    assert closed["closed_at"].endswith("Z")
+
+
+async def test_gate_out_zero_embeddings_prior_day_open_and_manual_scanned_at(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    seeded_teacher: User,
+    teacher_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify gate_out behavior, 0-embedding non-pollution, prior-day open visibility, and manual scanned_at."""
+    from app.routers.attendance import _resolve_scan_status
+
+    # 1. gate_out never returns "late"
+    assert (
+        _resolve_scan_status(
+            date(2026, 11, 22),
+            time(7, 30),
+            0,
+            datetime(2026, 11, 22, 8, 0, tzinfo=timezone.utc),
+            session_type="gate_out",
+        )
+        == "present"
+    )
+
+    # 2. Class with 0 face embeddings -> scan returns 200 matched=False without polluting FaceRecognitionLog
+    empty_class = SchoolClass(name="X Kosong")
+    parent = Parent(name="Ortu Kosong", phone_wa="6281277889900")
+    db_session.add_all([empty_class, parent])
+    await db_session.flush()
+    stu = Student(
+        nis="2026777",
+        name="Siswa Tanpa Wajah",
+        class_id=empty_class.id,
+        parent_id=parent.id,
+    )
+    db_session.add(stu)
+    await db_session.commit()
+
+    sess_res = await client.post(
+        "/api/v1/sessions",
+        headers=teacher_headers,
+        json={"class_id": empty_class.id, "session_type": "subject"},
+    )
+    assert sess_res.status_code == 201
+    empty_sess_id = sess_res.json()["id"]
+
+    zero_scan = await client.post(
+        "/api/v1/attendance/scan",
+        headers=teacher_headers,
+        data={"session_id": empty_sess_id, "liveness_passed": "true"},
+        files={"file": ("probe.png", _make_textured_png(seed=55), "image/png")},
+    )
+    assert zero_scan.status_code == 200
+    assert zero_scan.json()["matched"] is False
+    assert "belum ada dataset" in zero_scan.json()["message"].lower()
+
+    logs = (
+        await db_session.scalars(
+            select(FaceRecognitionLog).where(FaceRecognitionLog.session_id == empty_sess_id)
+        )
+    ).all()
+    assert logs == []
+
+    # 3. Oversized kiosk scan (> MAX_FACE_IMAGE_BYTES) -> HTTP 413
+    import app.routers.attendance as attendance_mod
+
+    monkeypatch.setattr(attendance_mod, "MAX_FACE_IMAGE_BYTES", 1024)
+    oversized_scan = await client.post(
+        "/api/v1/attendance/scan",
+        headers=teacher_headers,
+        data={"session_id": empty_sess_id, "liveness_passed": "true"},
+        files={"file": ("huge.jpg", b"z" * 2048, "image/jpeg")},
+    )
+    assert oversized_scan.status_code == 413
+
+    # 4. Manual attendance: absent/sick/permit must have scanned_at=None
+    await client.put("/api/v1/auth/kiosk-pin", headers=teacher_headers, json={"pin": "1234"})
+    manual_sick = await client.post(
+        "/api/v1/attendance/manual",
+        headers=teacher_headers,
+        json={
+            "session_id": empty_sess_id,
+            "student_id": stu.id,
+            "status": "sick",
+            "kiosk_pin": "1234",
+            "notify_wa": False,
+        },
+    )
+    assert manual_sick.status_code == 201
+    assert manual_sick.json()["scanned_at"] is None
+
+    # 4. gate_out close does NOT mark unrecorded students as absent
+    gate_out_res = await client.post(
+        "/api/v1/sessions",
+        headers=teacher_headers,
+        json={"session_type": "gate_out"},
+    )
+    assert gate_out_res.status_code == 201
+    gate_out_id = gate_out_res.json()["id"]
+    gate_out_closed = (
+        await client.post(f"/api/v1/sessions/{gate_out_id}/close", headers=teacher_headers)
+    ).json()
+    assert gate_out_closed["status"] == "closed"
+    assert gate_out_closed["summary"]["absent_count"] == 0
+
+    # 5. Unclosed prior-day open session still appears in GET /teacher/dashboard
+    yesterday = datetime.now(WIB).date() - timedelta(days=1)
+    prior_open = AttendanceSession(
+        class_id=empty_class.id,
+        teacher_id=seeded_teacher.id,
+        session_type="subject",
+        session_date=yesterday,
+        status="open",
+    )
+    db_session.add(prior_open)
+    await db_session.commit()
+
+    dash = (await client.get("/api/v1/teacher/dashboard", headers=teacher_headers)).json()
+    session_ids_in_dash = {s["id"] for s in dash["sessions"]}
+    assert prior_open.id in session_ids_in_dash
+    assert empty_sess_id in session_ids_in_dash
+    # present_rate is over total_students (0 present out of total_students -> 0.0)
+    assert dash["stats"]["present_rate"] == pytest.approx(0.0)

@@ -3,15 +3,46 @@ from dataclasses import dataclass
 import hashlib
 import importlib.util
 from io import BytesIO
+import logging
+import threading
 from typing import Any, Protocol, runtime_checkable
+import warnings
 
-from fastapi import Request
+from fastapi import HTTPException, Request, UploadFile, status
 import numpy as np
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from app.config import Settings, get_settings
 
+logger = logging.getLogger(__name__)
+
 EMBEDDING_DIM = 512
+MAX_FACE_IMAGE_BYTES = 10 * 1024 * 1024
+UPLOAD_READ_CHUNK_BYTES = 64 * 1024
+ALLOWED_IMAGE_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
+
+Image.MAX_IMAGE_PIXELS = 16_000_000
+
+
+async def read_upload_bytes_limited(
+    file: UploadFile,
+    max_bytes: int = MAX_FACE_IMAGE_BYTES,
+) -> bytes:
+    """Read an uploaded file in 64 KiB chunks, aborting with HTTP 413 if it exceeds max_bytes."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(UPLOAD_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail="Ukuran file foto melebihi batas maksimal 10 MB.",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,17 +100,32 @@ def _l2_normalize(vector: np.ndarray) -> np.ndarray:
 
 
 def _decode_rgb_image(image_bytes: bytes, min_resolution: int = 64) -> Image.Image:
-    """Verify image integrity, decode to RGB, and enforce minimum pixel dimensions."""
+    """Verify image integrity, allowlist format, apply EXIF orientation, and decode RGB."""
     if not image_bytes:
         raise FaceValidationError("File gambar wajah kosong.")
 
     try:
-        with Image.open(BytesIO(image_bytes)) as probe:
-            probe.verify()
-        with Image.open(BytesIO(image_bytes)) as loaded:
-            loaded.load()
-            rgb = loaded.convert("RGB")
-    except Image.DecompressionBombError as exc:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(BytesIO(image_bytes)) as probe:
+                fmt = (probe.format or "").upper()
+                if fmt not in ALLOWED_IMAGE_FORMATS:
+                    raise FaceValidationError(
+                        "Format gambar tidak didukung. Gunakan foto berformat JPEG, PNG, atau WEBP."
+                    )
+                max_pixels = Image.MAX_IMAGE_PIXELS
+                if max_pixels is not None and probe.width * probe.height > max_pixels:
+                    raise FaceValidationError(
+                        "Ukuran piksel gambar wajah terlalu besar dan ditolak demi keamanan."
+                    )
+                probe.verify()
+            with Image.open(BytesIO(image_bytes)) as loaded:
+                loaded.load()
+                transposed = ImageOps.exif_transpose(loaded)
+                rgb = transposed.convert("RGB")
+    except FaceValidationError:
+        raise
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
         raise FaceValidationError(
             "Ukuran piksel gambar wajah terlalu besar dan ditolak demi keamanan."
         ) from exc
@@ -99,6 +145,14 @@ def _decode_rgb_image(image_bytes: bytes, min_resolution: int = 64) -> Image.Ima
             f"Resolusi gambar wajah terlalu kecil (minimal {min_resolution}x{min_resolution} piksel)."
         )
     return rgb
+
+
+def reencode_clean_jpeg(image_bytes: bytes, quality: int = 90) -> bytes:
+    """Decode, EXIF-transpose, strip metadata, and re-encode an image as clean JPEG bytes."""
+    rgb = _decode_rgb_image(image_bytes, min_resolution=64)
+    buf = BytesIO()
+    rgb.save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
 
 
 class DeterministicFaceEngine:
@@ -186,14 +240,22 @@ class InsightFaceEngine:
         self.providers = list(providers) if providers is not None else ["CPUExecutionProvider"]
         self.min_det_score = min_det_score
         self._face_app: Any = None
+        self._lock = threading.Lock()
 
     def _get_app(self) -> Any:
         if self._face_app is None:
-            from insightface.app import FaceAnalysis  # type: ignore[import-not-found]
+            with self._lock:
+                if self._face_app is None:
+                    from insightface.app import FaceAnalysis  # type: ignore[import-not-found]
 
-            face_app = FaceAnalysis(name=self.model_name, providers=self.providers)
-            face_app.prepare(ctx_id=0, det_size=(640, 640))
-            self._face_app = face_app
+                    face_app = FaceAnalysis(name=self.model_name, providers=self.providers)
+                    uses_gpu = any(
+                        "cuda" in provider.lower() or "tensorrt" in provider.lower()
+                        for provider in self.providers
+                    )
+                    ctx_id = 0 if uses_gpu else -1
+                    face_app.prepare(ctx_id=ctx_id, det_size=(640, 640))
+                    self._face_app = face_app
         return self._face_app
 
     def extract_single_face(self, image_bytes: bytes) -> FaceExtractionResult:
@@ -251,7 +313,13 @@ def create_face_engine(settings: Settings) -> FaceEngine:
     if mode == "insightface":
         return InsightFaceEngine()
     if mode == "auto":
-        return InsightFaceEngine() if _insightface_available() else DeterministicFaceEngine()
+        if _insightface_available():
+            return InsightFaceEngine()
+        logger.warning(
+            "InsightFace/ONNXRuntime tidak terpasang; FaceEngine dalam mode 'auto' "
+            "beralih ke DeterministicFaceEngine (fallback pengembangan/pengujian)."
+        )
+        return DeterministicFaceEngine()
     raise ValueError(f"Mode face_engine_mode tidak dikenali: {settings.face_engine_mode}")
 
 

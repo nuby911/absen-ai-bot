@@ -1,9 +1,9 @@
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 import logging
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -12,9 +12,7 @@ from app.config import KNOWN_DEFAULT_JWT_SECRETS, Settings, get_settings
 from app.database import (
     Base,
     create_engine_and_session,
-    dispose_default_engine,
     get_db,
-    get_default_engine,
 )
 from app.providers.face_engine import FaceEngine, create_face_engine
 from app.providers.llm import LLMProvider, create_llm_provider
@@ -24,6 +22,13 @@ from app.routers.attendance import router as attendance_router
 from app.routers.auth import router as auth_router
 from app.routers.leaves import router as leaves_router
 from app.routers.webhook import router as webhook_router
+from app.security import (
+    LOGIN_LOCKOUT_SECONDS,
+    LOGIN_MAX_FAILURES,
+    PIN_LOCKOUT_SECONDS,
+    PIN_MAX_FAILURES,
+    AttemptRateLimiter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,22 +51,17 @@ def create_app(
             )
 
         if get_db not in fastapi_app.dependency_overrides:
-            if settings is None:
-                engine = get_default_engine()
+            engine, session_factory = create_engine_and_session(cfg.database_url)
+            fastapi_app.state.engine = engine
+            fastapi_app.state.session_factory = session_factory
+            try:
                 async with engine.begin() as conn:
                     await conn.run_sync(Base.metadata.create_all)
-                try:
-                    yield
-                finally:
-                    await dispose_default_engine()
-            else:
-                engine, _ = create_engine_and_session(cfg.database_url)
-                try:
-                    async with engine.begin() as conn:
-                        await conn.run_sync(Base.metadata.create_all)
-                finally:
-                    await engine.dispose()
                 yield
+            finally:
+                await engine.dispose()
+                fastapi_app.state.engine = None
+                fastapi_app.state.session_factory = None
         else:
             yield
 
@@ -75,6 +75,16 @@ def create_app(
         app.dependency_overrides[get_settings] = lambda: settings
 
     app.state.settings = cfg
+    app.state.engine = None
+    app.state.session_factory = None
+    app.state.login_rate_limiter = AttemptRateLimiter(
+        max_failures=LOGIN_MAX_FAILURES,
+        window_seconds=LOGIN_LOCKOUT_SECONDS,
+    )
+    app.state.pin_rate_limiter = AttemptRateLimiter(
+        max_failures=PIN_MAX_FAILURES,
+        window_seconds=PIN_LOCKOUT_SECONDS,
+    )
     app.state.face_engine = (
         face_engine if face_engine is not None else create_face_engine(cfg)
     )
@@ -89,11 +99,22 @@ def create_app(
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=cfg.get_cors_origins(),
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def add_security_headers(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        return response
 
     @app.get("/health")
     async def health_check() -> dict[str, str]:

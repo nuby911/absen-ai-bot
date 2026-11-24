@@ -4,6 +4,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -129,6 +130,7 @@ def _to_leave_response(
         verified_by=leave_req.verified_by,
         verified_by_name=verified_by_name,
         verified_at=leave_req.verified_at,
+        verification_note=leave_req.verification_note,
         created_at=leave_req.created_at,
     )
 
@@ -201,6 +203,11 @@ async def verify_leave_request(
         )
 
     leave_req, student, school_class, parent = row
+    if not student.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Siswa berstatus tidak aktif. Pengajuan izin tidak dapat diverifikasi.",
+        )
     if leave_req.status != "pending":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -236,6 +243,7 @@ async def verify_leave_request(
             status=payload.decision,
             verified_by=teacher_id,
             verified_at=now_utc,
+            verification_note=payload.note,
         )
         .execution_options(synchronize_session=False)
     )
@@ -265,6 +273,7 @@ async def verify_leave_request(
         verified_by=teacher_id,
         verified_by_name=teacher_name,
         verified_at=now_utc,
+        verification_note=payload.note,
         created_at=leave_created_at,
     )
     wa_text = _build_leave_wa_message(
@@ -308,8 +317,15 @@ async def verify_leave_request(
             for sess in matching_sessions:
                 existing_att = existing_by_session.get(sess.id)
                 if existing_att is not None:
+                    if (
+                        existing_att.verification_method == "face_kiosk"
+                        and existing_att.status in {"present", "late"}
+                    ):
+                        continue
                     existing_att.status = leave_req_type
                     existing_att.verification_method = "leave_approved"
+                    existing_att.scanned_at = None
+                    existing_att.similarity_score = None
                     existing_att.wa_status = "pending"
                     synced_attendances.append(existing_att)
                 else:
@@ -323,8 +339,28 @@ async def verify_leave_request(
                         wa_status="pending",
                         wa_notified_at=None,
                     )
-                    db.add(new_att)
-                    synced_attendances.append(new_att)
+                    try:
+                        async with db.begin_nested():
+                            db.add(new_att)
+                            await db.flush()
+                        synced_attendances.append(new_att)
+                    except IntegrityError:
+                        concurrent_att = await db.scalar(
+                            select(Attendance).where(
+                                Attendance.session_id == sess.id,
+                                Attendance.student_id == student_id_val,
+                            )
+                        )
+                        if concurrent_att is not None and not (
+                            concurrent_att.verification_method == "face_kiosk"
+                            and concurrent_att.status in {"present", "late"}
+                        ):
+                            concurrent_att.status = leave_req_type
+                            concurrent_att.verification_method = "leave_approved"
+                            concurrent_att.scanned_at = None
+                            concurrent_att.similarity_score = None
+                            concurrent_att.wa_status = "pending"
+                            synced_attendances.append(concurrent_att)
 
     await db.flush()
     synced_ids = [att.id for att in synced_attendances]

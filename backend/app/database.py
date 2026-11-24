@@ -1,6 +1,7 @@
 from collections.abc import AsyncGenerator
 from typing import Any
 
+from fastapi import Request
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -78,8 +79,16 @@ async def dispose_default_engine() -> None:
         _default_session_factory = None
 
 
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """FastAPI dependency yielding an async database session."""
-    session_factory = get_default_session_factory()
+async def get_db(request: Request) -> AsyncGenerator[AsyncSession, None]:
+    """FastAPI dependency yielding an async database session bound to app.state."""
+    session_factory = getattr(request.app.state, "session_factory", None)
+    if session_factory is None:
+        settings = getattr(request.app.state, "settings", None)
+        if settings is not None:
+            engine, session_factory = create_engine_and_session(settings.database_url)
+            request.app.state.engine = engine
+            request.app.state.session_factory = session_factory
+        else:
+            session_factory = get_default_session_factory()
     async with session_factory() as session:
         yield session

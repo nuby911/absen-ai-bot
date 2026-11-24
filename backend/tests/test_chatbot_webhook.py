@@ -899,20 +899,20 @@ async def test_status_questions_with_sick_or_leave_keywords_do_not_create_leave(
 
 
 @pytest.mark.asyncio
-async def test_webhook_media_only_payload_returns_200_and_creates_leave(
+async def test_webhook_media_only_payload_asks_for_caption_instead_of_auto_filing(
     client: httpx.AsyncClient,
     db_session: AsyncSession,
     seeded_teacher: User,
     mock_wa: MockWhatsAppProvider,
 ) -> None:
-    """Media-only payloads (no message_text) must return 200 without AssertionError."""
+    """Captionless media returns 200 and politely asks for caption/reason without auto-filing leave."""
     data = await _seed_two_families(db_session, seeded_teacher)
     parent_a: Parent = data["parent_a"]
     student_a: Student = data["student_a"]
     parent_a_phone = parent_a.phone_wa
     student_a_id = student_a.id
 
-    # Standard format: phone_wa + media_url, message_text omitted
+    # Standard format: phone_wa + media_url, message_text omitted -> does NOT auto-file
     res_std = await client.post(
         "/api/v1/webhook/whatsapp",
         json={
@@ -924,37 +924,60 @@ async def test_webhook_media_only_payload_returns_200_and_creates_leave(
     body_std = res_std.json()
     assert body_std["ignored"] is False
     assert body_std["wa_sent"] is True
-    assert body_std["tool_called"] == "submit_leave_request"
+    assert body_std["tool_called"] is None
+    assert body_std["detected_intent"] == "media_missing_caption"
+    assert "caption" in body_std["reply_text"].lower() or "alasan" in body_std["reply_text"].lower()
 
-    # WAHA format: body empty + mediaUrl present
+    # WAHA format: body null + mediaUrl present -> also asks for caption without 422
     res_waha = await client.post(
         "/api/v1/webhook/whatsapp",
         json={
             "event": "message",
             "payload": {
-                "from": f"{parent_a_phone}@c.us",
-                "body": "",
+                "from": f"{parent_a_phone}:12@s.whatsapp.net",
+                "body": None,
                 "mediaUrl": "https://cdn.sekolah.sch.id/leaves/surat-dokter-2.jpg",
                 "fromMe": False,
             },
         },
     )
     assert res_waha.status_code == 200
-    assert res_waha.json()["tool_called"] == "submit_leave_request"
+    assert res_waha.json()["tool_called"] is None
+    assert res_waha.json()["detected_intent"] == "media_missing_caption"
+
+    # Zero leaves created from captionless media
+    db_session.expire_all()
+    leaves_empty = (
+        await db_session.scalars(
+            select(LeaveRequest).where(LeaveRequest.student_id == student_a_id)
+        )
+    ).all()
+    assert leaves_empty == []
+
+    # Sending media WITH a caption creates the leave request and preserves attachment_url
+    res_with_caption = await client.post(
+        "/api/v1/webhook/whatsapp",
+        json={
+            "event": "message",
+            "payload": {
+                "from": f"{parent_a_phone}@c.us",
+                "body": "Mohon izin Rubby sakit demam hari ini",
+                "mediaUrl": "https://cdn.sekolah.sch.id/leaves/surat-dokter-2.jpg",
+                "fromMe": False,
+            },
+        },
+    )
+    assert res_with_caption.status_code == 200
+    assert res_with_caption.json()["tool_called"] == "submit_leave_request"
 
     db_session.expire_all()
     leaves = (
         await db_session.scalars(
-            select(LeaveRequest)
-            .where(LeaveRequest.student_id == student_a_id)
-            .order_by(LeaveRequest.created_at.asc())
+            select(LeaveRequest).where(LeaveRequest.student_id == student_a_id)
         )
     ).all()
-    assert len(leaves) == 2
-    assert {lr.attachment_url for lr in leaves} == {
-        "/uploads/leaves/surat-izin-1.jpg",
-        "https://cdn.sekolah.sch.id/leaves/surat-dokter-2.jpg",
-    }
+    assert len(leaves) == 1
+    assert leaves[0].attachment_url == "https://cdn.sekolah.sch.id/leaves/surat-dokter-2.jpg"
 
 
 @pytest.mark.asyncio
@@ -999,7 +1022,7 @@ async def test_webhook_secret_enforcement_and_attachment_url_sanitization(
         )
         assert wrong_header.status_code == 401
 
-        # Valid secret + unsafe javascript: media_url -> 200 but unsafe URL dropped (stored as None)
+        # Valid secret + unsafe javascript: media_url (today) -> unsafe URL dropped (stored as None)
         unsafe_res = await async_client.post(
             "/api/v1/webhook/whatsapp",
             headers={"X-Webhook-Secret": "rahasia-waha-2026"},
@@ -1012,26 +1035,26 @@ async def test_webhook_secret_enforcement_and_attachment_url_sanitization(
         assert unsafe_res.status_code == 200
         assert unsafe_res.json()["tool_called"] == "submit_leave_request"
 
-        # Path traversal /uploads/../secret.txt also dropped
+        # Path traversal /uploads/../etc/passwd (besok) also dropped
         traversal_res = await async_client.post(
             "/api/v1/webhook/whatsapp",
             headers={"X-Webhook-Secret": "rahasia-waha-2026"},
             json={
                 "phone_wa": parent_a_phone,
-                "message_text": "Mohon izin hari ini Rubby acara keluarga",
+                "message_text": "Mohon izin besok Rubby acara keluarga",
                 "media_url": "/uploads/../etc/passwd",
             },
         )
         assert traversal_res.status_code == 200
         assert traversal_res.json()["tool_called"] == "submit_leave_request"
 
-        # Safe https:// URL preserved
+        # Safe https:// URL (lusa) preserved
         safe_res = await async_client.post(
             "/api/v1/webhook/whatsapp",
             headers={"X-Webhook-Secret": "rahasia-waha-2026"},
             json={
                 "phone_wa": parent_a_phone,
-                "message_text": "Mohon izin hari ini Rubby sakit flu",
+                "message_text": "Mohon izin lusa Rubby sakit flu",
                 "media_url": "https://files.sekolah.sch.id/surat-flu.jpg",
             },
         )
@@ -1049,3 +1072,253 @@ async def test_webhook_secret_enforcement_and_attachment_url_sanitization(
     assert stored_urls.count(None) == 2
     assert "https://files.sekolah.sch.id/surat-flu.jpg" in stored_urls
     assert all(url is None or not url.startswith("javascript:") for url in stored_urls)
+
+
+@pytest.mark.asyncio
+async def test_chatbot_multichild_disambiguation_indonesian_dates_ood_and_guards(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    seeded_teacher: User,
+    mock_wa: MockWhatsAppProvider,
+) -> None:
+    """Verify multi-child surname disambiguation, Indonesian date ranges, OOD guards, and leave limits."""
+    from app.providers.llm import (
+        CHATBOT_TOOL_DECLARATIONS,
+        _parse_dates_from_text,
+        _parse_day_of_week,
+        _parse_month_year,
+    )
+
+    # 1. attachment_url must NOT be in CHATBOT_TOOL_DECLARATIONS
+    submit_decl = next(
+        d for d in CHATBOT_TOOL_DECLARATIONS if d["name"] == "submit_leave_request"
+    )
+    assert "attachment_url" not in submit_decl["parameters"]["properties"]
+
+    # 2. Pure parser checks for Indonesian date ranges, past-tense symptom ignore, inverted range, & weeks
+    ref_today = date(2026, 11, 24)
+    assert _parse_dates_from_text("mohon izin besok dan lusa", ref_today) == (
+        "2026-11-25",
+        "2026-11-26",
+    )
+    assert _parse_dates_from_text("mohon izin hari ini dan besok", ref_today) == (
+        "2026-11-24",
+        "2026-11-25",
+    )
+    assert _parse_dates_from_text("mohon izin tanggal 25 november 2026", ref_today) == (
+        "2026-11-25",
+        "2026-11-25",
+    )
+    assert _parse_dates_from_text("mohon izin 25-27 november 2026", ref_today) == (
+        "2026-11-25",
+        "2026-11-27",
+    )
+    assert _parse_dates_from_text("mohon izin 2026-11-25 selama 3 hari", ref_today) == (
+        "2026-11-25",
+        "2026-11-27",
+    )
+    assert _parse_dates_from_text(
+        "anak saya sudah demam 3 hari, mohon izin hari ini", ref_today
+    ) == ("2026-11-24", "2026-11-24")
+    # Inverted range preserved so submit_leave_request rejects it
+    assert _parse_dates_from_text("mohon izin 27-25 november 2026", ref_today) == (
+        "2026-11-27",
+        "2026-11-25",
+    )
+    assert _parse_dates_from_text("izin selama 1 minggu karena operasi", ref_today) == (
+        "2026-11-24",
+        "2026-11-30",
+    )
+    assert _parse_day_of_week("jadwal pelajaran 1 minggu", ref_today) is None
+    assert _parse_day_of_week("jadwal pelajaran hari minggu", ref_today) == 7
+    assert _parse_day_of_week("jadwal pelajaran lusa", ref_today) == (
+        ref_today + timedelta(days=2)
+    ).isoweekday()
+    assert _parse_month_year("rekap absen nov 2026", ref_today) == (11, 2026)
+    assert _parse_month_year("rekap absen agust 2026", ref_today) == (8, 2026)
+    assert _parse_month_year("rekap absen okt 2026", ref_today) == (10, 2026)
+    assert _parse_month_year("rekap absen des 2026", ref_today) == (12, 2026)
+
+    # 3. Multi-child family with shared surname ("Anantara")
+    data = await _seed_two_families(db_session, seeded_teacher)
+    class_a: SchoolClass = data["class_a"]
+    parent_a: Parent = data["parent_a"]
+    student_a: Student = data["student_a"]
+    student_a.name = "Rubby Anantara"
+    sibling = Student(
+        nis="24781028",
+        name="Raka Anantara",
+        class_id=class_a.id,
+        parent_id=parent_a.id,
+        is_active=True,
+    )
+    inactive_child = Student(
+        nis="24781029",
+        name="Bintang Anantara",
+        class_id=class_a.id,
+        parent_id=parent_a.id,
+        is_active=False,
+    )
+    db_session.add_all([sibling, inactive_child])
+    await db_session.commit()
+    parent_a_phone = parent_a.phone_wa
+    sibling_id = sibling.id
+    inactive_id = inactive_child.id
+
+    # Shared surname ONLY -> tie -> must NOT guess wrong child (asks parent to specify child name)
+    ambig_res = await client.post(
+        "/api/v1/webhook/whatsapp",
+        json={
+            "phone_wa": parent_a_phone,
+            "message_text": "Mohon izin Anantara sakit demam hari ini",
+        },
+    )
+    assert ambig_res.status_code == 200
+    assert "lebih dari satu siswa" in ambig_res.json()["reply_text"].lower()
+
+    # Distinctive first name -> picks exact sibling ("Raka Anantara")
+    raka_res = await client.post(
+        "/api/v1/webhook/whatsapp",
+        json={
+            "phone_wa": parent_a_phone,
+            "message_text": "Mohon izin Raka sakit demam besok dan lusa",
+        },
+    )
+    assert raka_res.status_code == 200
+    assert "Raka Anantara" in raka_res.json()["reply_text"]
+    assert raka_res.json()["tool_called"] == "submit_leave_request"
+
+    # Overlapping leave for Raka on "besok" -> rejected cleanly
+    dup_overlap = await client.post(
+        "/api/v1/webhook/whatsapp",
+        json={
+            "phone_wa": parent_a_phone,
+            "message_text": "Mohon izin Raka sakit flu besok",
+        },
+    )
+    assert dup_overlap.status_code == 200
+    assert "sudah terdapat pengajuan" in dup_overlap.json()["reply_text"].lower()
+
+    # Duration > 30 days rejected
+    too_long = await client.post(
+        "/api/v1/webhook/whatsapp",
+        json={
+            "phone_wa": parent_a_phone,
+            "message_text": "Mohon izin Rubby acara keluarga selama 45 hari",
+        },
+    )
+    assert too_long.status_code == 200
+    assert "maksimal 30 hari" in too_long.json()["reply_text"].lower()
+
+    # Backdated > 7 days rejected
+    too_old_date = (datetime.now(WIB).date() - timedelta(days=15)).isoformat()
+    too_old = await client.post(
+        "/api/v1/webhook/whatsapp",
+        json={
+            "phone_wa": parent_a_phone,
+            "message_text": f"Mohon izin Rubby sakit tanggal {too_old_date}",
+        },
+    )
+    assert too_old.status_code == 200
+    assert "7 hari" in too_old.json()["reply_text"].lower()
+
+    # 4. OOD & inquiry false-positive guards: "izin tanya SPP", "tolong cek status izin...", "bulan lalu" OOD
+    spp_res = await client.post(
+        "/api/v1/webhook/whatsapp",
+        json={"phone_wa": parent_a_phone, "message_text": "Izin tanya SPP bulan ini berapa?"},
+    )
+    assert spp_res.status_code == 200
+    assert spp_res.json()["is_in_domain"] is False
+    assert spp_res.json()["tool_called"] is None
+
+    inquiry_res = await client.post(
+        "/api/v1/webhook/whatsapp",
+        json={
+            "phone_wa": parent_a_phone,
+            "message_text": "Tolong cek status izin Raka apakah sudah disetujui?",
+        },
+    )
+    assert inquiry_res.status_code == 200
+    assert inquiry_res.json()["tool_called"] == "get_today_attendance"
+
+    # Menu shortcut "1." works and always shows leave_status_today even when attendance records exist
+    db_session.add(
+        LeaveRequest(
+            student_id=student_a.id,
+            parent_id=parent_a.id,
+            request_type="permit",
+            start_date=datetime.now(WIB).date(),
+            end_date=datetime.now(WIB).date(),
+            reason="Izin pulang awal",
+            status="pending",
+        )
+    )
+    await db_session.commit()
+
+    menu_one_dot = await client.post(
+        "/api/v1/webhook/whatsapp",
+        json={"phone_wa": parent_a_phone, "message_text": "1."},
+    )
+    assert menu_one_dot.status_code == 200
+    assert menu_one_dot.json()["tool_called"] == "get_today_attendance"
+    assert "status pengajuan izin hari ini" in menu_one_dot.json()["reply_text"].lower()
+
+    # 5. WAHA @newsletter, @broadcast, sticker, revoked are ignored cleanly
+    for payload_body in [
+        {"from": "120363000000@newsletter", "body": "Berita", "fromMe": False},
+        {"from": "12345@broadcast", "body": "Promo", "fromMe": False},
+        {"from": f"{parent_a_phone}@c.us", "body": "", "type": "sticker", "fromMe": False},
+        {"from": f"{parent_a_phone}@c.us", "body": "", "type": "revoked", "fromMe": False},
+    ]:
+        ign = await client.post(
+            "/api/v1/webhook/whatsapp",
+            json={"event": "message", "payload": payload_body},
+        )
+        assert ign.status_code == 200
+        assert ign.json()["ignored"] is True
+
+    # 6. Direct tool check: inactive student rejected even when student_id is explicit
+    from app.services.chatbot import _resolve_owned_students
+
+    owned_inactive, err_inactive = await _resolve_owned_students(
+        db_session, parent_id=parent_a.id, student_id=inactive_id, allow_multiple=False
+    )
+    assert owned_inactive is None
+    assert err_inactive is not None and err_inactive["ok"] is False
+
+    # Confirm only 1 leave exists for Raka (the non-overlapping one)
+    raka_leaves = (
+        await db_session.scalars(
+            select(LeaveRequest).where(LeaveRequest.student_id == sibling_id)
+        )
+    ).all()
+    assert len(raka_leaves) == 1
+
+    # 7. LLM-injected attachment_url in submit_leave_request args must be ignored (server media_url only)
+    from app.providers.llm import RuleBasedLLMProvider
+    from app.services.chatbot import ChatbotOrchestrator
+
+    orch = ChatbotOrchestrator(
+        llm_provider=RuleBasedLLMProvider(),
+        whatsapp_provider=mock_wa,
+    )
+    executor = orch._build_tool_executor(
+        db=db_session,
+        parent_id=parent_a.id,
+        default_media_url=None,
+    )
+    future_date = (datetime.now(WIB).date() + timedelta(days=5)).isoformat()
+    tool_res = await executor(
+        "submit_leave_request",
+        {
+            "student_id": sibling_id,
+            "request_type": "permit",
+            "start_date": future_date,
+            "end_date": future_date,
+            "reason": "Keperluan keluarga",
+            "attachment_url": "https://evil.example/forged.jpg",
+        },
+    )
+    assert tool_res["ok"] is True
+    assert tool_res["attachment_url"] is None
+    await db_session.rollback()

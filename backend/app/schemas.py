@@ -1,12 +1,37 @@
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
 import math
 import re
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    field_validator,
+    model_validator,
+)
 
 from app.models import User
 from app.security import normalize_wa_phone
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _serialize_utc_datetime(value: datetime) -> str:
+    """Serialize any naive or aware datetime as an explicit UTC ISO-8601 `Z` string."""
+    dt_utc = (
+        value.replace(tzinfo=timezone.utc)
+        if value.tzinfo is None
+        else value.astimezone(timezone.utc)
+    )
+    return dt_utc.isoformat().replace("+00:00", "Z")
+
+
+UtcDateTime = Annotated[
+    datetime,
+    PlainSerializer(_serialize_utc_datetime, return_type=str, when_used="json"),
+]
 
 
 def _strip_required_text(value: str, field_label: str) -> str:
@@ -20,6 +45,26 @@ def _strip_optional_text(value: str | None, field_label: str) -> str | None:
     if value is None:
         return None
     return _strip_required_text(value, field_label)
+
+
+def _blank_to_none(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _validate_email_value(value: str) -> str:
+    cleaned = value.strip().lower()
+    if not cleaned or not _EMAIL_RE.fullmatch(cleaned):
+        raise ValueError("Format email tidak valid.")
+    return cleaned
+
+
+def _validate_pin_format(value: str) -> str:
+    if not re.fullmatch(r"\d{4,6}", value):
+        raise ValueError("PIN Kiosk harus terdiri dari 4 hingga 6 digit angka.")
+    return value
 
 
 class LoginRequest(BaseModel):
@@ -71,13 +116,17 @@ class KioskPinUpdateRequest(BaseModel):
     """Payload for setting or updating a teacher's 4–6 digit numeric kiosk PIN."""
 
     pin: str
+    current_pin: str | None = None
 
     @field_validator("pin")
     @classmethod
     def validate_pin(cls, value: str) -> str:
-        if not re.fullmatch(r"\d{4,6}", value):
-            raise ValueError("PIN Kiosk harus terdiri dari 4 hingga 6 digit angka.")
-        return value
+        return _validate_pin_format(value)
+
+    @field_validator("current_pin")
+    @classmethod
+    def normalize_current_pin(cls, value: str | None) -> str | None:
+        return _blank_to_none(value)
 
 
 class KioskPinUpdateResponse(BaseModel):
@@ -97,11 +146,97 @@ class VerifyPinResponse(BaseModel):
     """Result of kiosk PIN verification."""
 
     valid: bool
+    has_kiosk_pin: bool
 
 
 # ---------------------------------------------------------------------------
 # Master Data & Face Dataset Schemas (Task 3)
 # ---------------------------------------------------------------------------
+
+
+class TeacherCreate(BaseModel):
+    """Payload to create a teacher account (admin only)."""
+
+    name: str = Field(..., min_length=1, max_length=255)
+    email: str = Field(..., min_length=3, max_length=255)
+    password: str = Field(..., min_length=6, max_length=128)
+    nip: str | None = Field(default=None, max_length=50)
+    kiosk_pin: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return _strip_required_text(value, "Nama guru")
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value: str) -> str:
+        return _validate_email_value(value)
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, value: str) -> str:
+        if not value.strip() or len(value) < 6:
+            raise ValueError("Kata sandi minimal 6 karakter.")
+        return value
+
+    @field_validator("nip")
+    @classmethod
+    def normalize_nip(cls, value: str | None) -> str | None:
+        return _blank_to_none(value)
+
+    @field_validator("kiosk_pin")
+    @classmethod
+    def validate_kiosk_pin(cls, value: str | None) -> str | None:
+        cleaned = _blank_to_none(value)
+        if cleaned is None:
+            return None
+        return _validate_pin_format(cleaned)
+
+
+class TeacherUpdate(BaseModel):
+    """Payload to update an existing teacher account (admin only)."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    email: str | None = Field(default=None, min_length=3, max_length=255)
+    nip: str | None = Field(default=None, max_length=50)
+    password: str | None = Field(default=None, max_length=128)
+    kiosk_pin: str | None = None
+    reset_kiosk_pin: bool = False
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str | None) -> str | None:
+        return _strip_optional_text(value, "Nama guru")
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _validate_email_value(value)
+
+    @field_validator("nip")
+    @classmethod
+    def normalize_nip(cls, value: str | None) -> str | None:
+        return _blank_to_none(value)
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, value: str | None) -> str | None:
+        if value is None or value == "":
+            return None
+        if not value.strip() or len(value) < 6:
+            raise ValueError("Kata sandi minimal 6 karakter.")
+        return value
+
+    @field_validator("kiosk_pin")
+    @classmethod
+    def validate_kiosk_pin(cls, value: str | None) -> str | None:
+        cleaned = _blank_to_none(value)
+        if cleaned is None:
+            return None
+        return _validate_pin_format(cleaned)
 
 
 class SchoolClassCreate(BaseModel):
@@ -115,6 +250,11 @@ class SchoolClassCreate(BaseModel):
     def validate_name(cls, value: str) -> str:
         return _strip_required_text(value, "Nama kelas")
 
+    @field_validator("homeroom_teacher_id")
+    @classmethod
+    def normalize_homeroom_teacher_id(cls, value: str | None) -> str | None:
+        return _blank_to_none(value)
+
 
 class SchoolClassUpdate(BaseModel):
     """Payload to update an academic class."""
@@ -127,6 +267,11 @@ class SchoolClassUpdate(BaseModel):
     def validate_name(cls, value: str | None) -> str | None:
         return _strip_optional_text(value, "Nama kelas")
 
+    @field_validator("homeroom_teacher_id")
+    @classmethod
+    def normalize_homeroom_teacher_id(cls, value: str | None) -> str | None:
+        return _blank_to_none(value)
+
 
 class SchoolClassResponse(BaseModel):
     """Academic class metadata returned by admin and teacher endpoints."""
@@ -136,7 +281,7 @@ class SchoolClassResponse(BaseModel):
     homeroom_teacher_id: str | None
     homeroom_teacher_name: str | None = None
     student_count: int = 0
-    created_at: datetime
+    created_at: UtcDateTime
 
 
 class ParentCreate(BaseModel):
@@ -181,16 +326,18 @@ class ParentResponse(BaseModel):
     id: str
     name: str
     phone_wa: str
-    created_at: datetime
+    created_at: UtcDateTime
 
 
 class StudentCreate(BaseModel):
-    """Payload to register a student linked to a class and parent."""
+    """Payload to register a student linked to an existing or inline-created parent."""
 
     nis: str = Field(..., min_length=1, max_length=50)
     name: str = Field(..., min_length=1, max_length=255)
     class_id: str = Field(..., min_length=1)
-    parent_id: str = Field(..., min_length=1)
+    parent_id: str | None = None
+    parent_name: str | None = Field(default=None, max_length=255)
+    parent_phone_wa: str | None = Field(default=None, max_length=50)
     is_active: bool = True
 
     @field_validator("nis")
@@ -203,14 +350,40 @@ class StudentCreate(BaseModel):
     def validate_name(cls, value: str) -> str:
         return _strip_required_text(value, "Nama siswa")
 
+    @field_validator("parent_id", "parent_name")
+    @classmethod
+    def normalize_optional_parent_fields(cls, value: str | None) -> str | None:
+        return _blank_to_none(value)
+
+    @field_validator("parent_phone_wa")
+    @classmethod
+    def validate_parent_phone_wa(cls, value: str | None) -> str | None:
+        cleaned = _blank_to_none(value)
+        if cleaned is None:
+            return None
+        return normalize_wa_phone(cleaned)
+
+    @model_validator(mode="after")
+    def validate_parent_reference(self) -> "StudentCreate":
+        if self.parent_id is None and (
+            self.parent_name is None or self.parent_phone_wa is None
+        ):
+            raise ValueError(
+                "Wajib memilih orang tua (parent_id) atau mengisi nama dan nomor WhatsApp orang tua."
+            )
+        return self
+
 
 class StudentUpdate(BaseModel):
-    """Payload to update student details."""
+    """Payload to update student details and optionally link/update parent inline."""
 
     nis: str | None = Field(default=None, min_length=1, max_length=50)
     name: str | None = Field(default=None, min_length=1, max_length=255)
     class_id: str | None = None
     parent_id: str | None = None
+    parent_name: str | None = Field(default=None, max_length=255)
+    parent_phone_wa: str | None = Field(default=None, max_length=50)
+    update_linked_parent: bool = False
     is_active: bool | None = None
 
     @field_validator("nis")
@@ -222,6 +395,19 @@ class StudentUpdate(BaseModel):
     @classmethod
     def validate_name(cls, value: str | None) -> str | None:
         return _strip_optional_text(value, "Nama siswa")
+
+    @field_validator("class_id", "parent_id", "parent_name")
+    @classmethod
+    def normalize_optional_ids(cls, value: str | None) -> str | None:
+        return _blank_to_none(value)
+
+    @field_validator("parent_phone_wa")
+    @classmethod
+    def validate_parent_phone_wa(cls, value: str | None) -> str | None:
+        cleaned = _blank_to_none(value)
+        if cleaned is None:
+            return None
+        return normalize_wa_phone(cleaned)
 
 
 class StudentResponse(BaseModel):
@@ -237,7 +423,7 @@ class StudentResponse(BaseModel):
     parent_phone_wa: str
     is_active: bool
     face_count: int
-    created_at: datetime
+    created_at: UtcDateTime
 
 
 class ScheduleCreate(BaseModel):
@@ -304,7 +490,7 @@ class FaceEmbeddingResponse(BaseModel):
     image_url: str
     quality_score: float
     embedding_dim: int
-    created_at: datetime
+    created_at: UtcDateTime
 
 
 class FaceThresholdUpdateRequest(BaseModel):
@@ -369,8 +555,8 @@ class AttendanceSessionSummary(BaseModel):
     session_date: date
     expected_start_time: time | None = None
     late_tolerance_minutes: int
-    opened_at: datetime
-    closed_at: datetime | None = None
+    opened_at: UtcDateTime
+    closed_at: UtcDateTime | None = None
     status: str
     total_students: int = 0
     present_count: int = 0
@@ -394,10 +580,10 @@ class SessionStudentAttendanceItem(BaseModel):
     attendance_id: str | None = None
     status: str
     verification_method: str | None = None
-    scanned_at: datetime | None = None
+    scanned_at: UtcDateTime | None = None
     similarity_score: float | None = None
     wa_status: str | None = None
-    wa_notified_at: datetime | None = None
+    wa_notified_at: UtcDateTime | None = None
 
 
 class AttendanceSessionDetailResponse(AttendanceSessionSummary):
@@ -437,7 +623,7 @@ class AttendanceScanResponse(BaseModel):
     nis: str | None = None
     class_name: str | None = None
     status: str | None = None
-    scanned_at: datetime | None = None
+    scanned_at: UtcDateTime | None = None
     similarity_score: float
     threshold_used: float
     wa_status: str | None = None
@@ -466,9 +652,9 @@ class ManualAttendanceResponse(BaseModel):
     class_name: str
     status: str
     verification_method: str
-    scanned_at: datetime | None = None
+    scanned_at: UtcDateTime | None = None
     wa_status: str
-    wa_notified_at: datetime | None = None
+    wa_notified_at: UtcDateTime | None = None
     message: str
 
 
@@ -478,7 +664,7 @@ class ResendWaResponse(BaseModel):
     attendance_id: str
     wa_status: str
     wa_sent: bool
-    wa_notified_at: datetime | None = None
+    wa_notified_at: UtcDateTime | None = None
     message: str
 
 
@@ -507,8 +693,9 @@ class LeaveRequestResponse(BaseModel):
     status: str
     verified_by: str | None = None
     verified_by_name: str | None = None
-    verified_at: datetime | None = None
-    created_at: datetime
+    verified_at: UtcDateTime | None = None
+    verification_note: str | None = None
+    created_at: UtcDateTime
 
 
 class LeaveVerifyRequest(BaseModel):
@@ -540,16 +727,22 @@ class LeaveVerifyResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+_IGNORED_WAHA_MESSAGE_TYPES = frozenset(
+    {"sticker", "revoked", "e2e_notification", "protocol", "gp2", "call_log"}
+)
+
+
 class WahaMessagePayload(BaseModel):
-    """Nested WAHA webhook message payload (`{from, body, mediaUrl?, fromMe?}`)."""
+    """Nested WAHA webhook message payload (`{from, body, mediaUrl?, fromMe?, type?}`)."""
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     from_: str | None = Field(default=None, alias="from")
-    body: str = ""
+    body: str | None = ""
     media_url: str | None = Field(default=None, alias="mediaUrl")
     media: dict[str, Any] | None = None
     from_me: bool = Field(default=False, alias="fromMe")
+    type: str | None = None
 
 
 class WhatsAppWebhookRequest(BaseModel):
@@ -582,8 +775,17 @@ class WhatsAppWebhookRequest(BaseModel):
                 return None, None, None, True
             if self.payload.from_me:
                 return None, None, None, True
+            msg_type = (self.payload.type or "").strip().lower()
+            if msg_type in _IGNORED_WAHA_MESSAGE_TYPES:
+                return None, None, None, True
             sender_raw = (self.payload.from_ or "").strip()
-            if sender_raw == "status@broadcast" or sender_raw.lower().endswith("@g.us"):
+            lowered_sender = sender_raw.lower()
+            if (
+                lowered_sender == "status@broadcast"
+                or lowered_sender.endswith("@g.us")
+                or lowered_sender.endswith("@newsletter")
+                or lowered_sender.endswith("@broadcast")
+            ):
                 return None, None, None, True
 
             media_val = self.payload.media_url
@@ -592,7 +794,7 @@ class WhatsAppWebhookRequest(BaseModel):
                 if isinstance(raw_url, str) and raw_url.strip():
                     media_val = raw_url.strip()
 
-            return sender_raw, self.payload.body, media_val, False
+            return sender_raw, (self.payload.body or ""), media_val, False
 
         if self.event is not None and self.event != "message":
             return None, None, None, True
@@ -619,19 +821,29 @@ class WhatsAppWebhookResponse(BaseModel):
 
 
 class FaceLogLabelRequest(BaseModel):
-    """Payload for labeling a kiosk face recognition log as a student or impostor."""
+    """Payload for labeling or unlabeling a kiosk face recognition log."""
 
     actual_student_id: str | None = None
     is_impostor: bool = False
     condition_note: str | None = Field(default=None, max_length=255)
 
+    @field_validator("actual_student_id")
+    @classmethod
+    def normalize_actual_student_id(cls, value: str | None) -> str | None:
+        return _blank_to_none(value)
+
     @field_validator("condition_note")
     @classmethod
     def normalize_condition_note(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        stripped = value.strip()
-        return stripped or None
+        return _blank_to_none(value)
+
+    @model_validator(mode="after")
+    def validate_impostor_xor_student(self) -> "FaceLogLabelRequest":
+        if self.is_impostor and self.actual_student_id is not None:
+            raise ValueError(
+                "Tidak dapat menandai impostor sekaligus menetapkan actual_student_id."
+            )
+        return self
 
 
 class FaceRecognitionLogItem(BaseModel):
@@ -651,7 +863,16 @@ class FaceRecognitionLogItem(BaseModel):
     condition_note: str | None = None
     is_impostor: bool = False
     classification: str = "unlabeled"
-    created_at: datetime
+    created_at: UtcDateTime
+
+
+class PaginatedFaceLogsResponse(BaseModel):
+    """Paginated face recognition evaluation logs."""
+
+    items: list[FaceRecognitionLogItem] = Field(default_factory=list)
+    total: int = 0
+    limit: int = 20
+    offset: int = 0
 
 
 class FaceEvaluationMetrics(BaseModel):
@@ -674,9 +895,10 @@ class ChatbotLogItem(BaseModel):
     """Individual WhatsApp AI chatbot evaluation log item."""
 
     id: str
-    created_at: datetime
+    created_at: UtcDateTime
     phone_wa: str
     user_message: str
+    bot_response: str = ""
     detected_intent: str | None = None
     tool_called: str | None = None
     is_in_domain: bool
@@ -684,11 +906,44 @@ class ChatbotLogItem(BaseModel):
     latency_ms: int
 
 
+class PaginatedChatbotLogsResponse(BaseModel):
+    """Paginated WhatsApp AI chatbot evaluation logs."""
+
+    items: list[ChatbotLogItem] = Field(default_factory=list)
+    total: int = 0
+    limit: int = 20
+    offset: int = 0
+
+
+class ChatbotSimulateRequest(BaseModel):
+    """Admin dry-run simulation request for the WhatsApp AI chatbot."""
+
+    phone_wa: str = Field(..., min_length=1, max_length=50)
+    message_text: str = Field(..., min_length=1, max_length=2000)
+    media_url: str | None = None
+
+    @field_validator("phone_wa")
+    @classmethod
+    def validate_phone_wa(cls, value: str) -> str:
+        return normalize_wa_phone(value)
+
+    @field_validator("message_text")
+    @classmethod
+    def validate_message_text(cls, value: str) -> str:
+        return _strip_required_text(value, "Pesan simulasi")
+
+    @field_validator("media_url")
+    @classmethod
+    def normalize_media_url(cls, value: str | None) -> str | None:
+        return _blank_to_none(value)
+
+
 class ChatbotEvaluationMetrics(BaseModel):
     """Aggregated WhatsApp AI chatbot domain accuracy, fallback rate, and latency."""
 
     total_messages: int = 0
     in_domain_count: int = 0
+    out_of_domain_count: int = 0
     in_domain_rate: float = 0.0
     fallback_count: int = 0
     fallback_rate: float = 0.0
@@ -702,6 +957,7 @@ class ClassDailyRecap(BaseModel):
     class_id: str
     class_name: str
     homeroom_teacher_name: str | None = None
+    session_count: int = 0
     present_count: int = 0
     late_count: int = 0
     permit_or_sick_count: int = 0

@@ -1,13 +1,13 @@
 import asyncio
 import csv
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 import io
 from pathlib import Path
-from typing import TypeVar
+from typing import Literal, TypeVar
 import uuid
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,6 +19,7 @@ from app.models import (
     ChatbotLog,
     FaceEmbedding,
     FaceRecognitionLog,
+    LeaveRequest,
     Parent,
     Schedule,
     SchoolClass,
@@ -28,14 +29,23 @@ from app.models import (
 )
 from app.providers.face_engine import (
     EMBEDDING_DIM,
+    MAX_FACE_IMAGE_BYTES,
     FaceEngine,
     FaceValidationError,
     get_face_engine,
+    read_upload_bytes_limited,
+    reencode_clean_jpeg,
 )
-from app.providers.whatsapp import ATTENDANCE_STATUS_LABELS_ID
+from app.providers.llm import LLMProvider, get_llm_provider
+from app.providers.whatsapp import (
+    ATTENDANCE_STATUS_LABELS_ID,
+    WhatsAppProvider,
+    get_whatsapp_provider,
+)
 from app.schemas import (
     ChatbotEvaluationMetrics,
     ChatbotLogItem,
+    ChatbotSimulateRequest,
     ClassDailyRecap,
     EvaluationDashboardResponse,
     FaceEmbeddingResponse,
@@ -44,6 +54,8 @@ from app.schemas import (
     FaceRecognitionLogItem,
     FaceThresholdResponse,
     FaceThresholdUpdateRequest,
+    PaginatedChatbotLogsResponse,
+    PaginatedFaceLogsResponse,
     ParentCreate,
     ParentResponse,
     ParentUpdate,
@@ -56,9 +68,18 @@ from app.schemas import (
     StudentCreate,
     StudentResponse,
     StudentUpdate,
+    TeacherCreate,
+    TeacherUpdate,
     UserResponse,
+    WhatsAppWebhookResponse,
 )
-from app.security import get_current_user, require_admin
+from app.security import (
+    get_current_user,
+    hash_secret_async,
+    require_admin,
+    require_staff,
+)
+from app.services.chatbot import ChatbotOrchestrator
 
 router = APIRouter(prefix="/api/v1", tags=["admin"])
 
@@ -66,7 +87,14 @@ WIB = timezone(timedelta(hours=7))
 FACE_THRESHOLD_SETTING_KEY = "face_similarity_threshold"
 MAX_FACES_PER_STUDENT = 5
 MIN_FACE_QUALITY_SCORE = 0.5
-MAX_FACE_IMAGE_BYTES = 10 * 1024 * 1024
+
+_SESSION_TYPE_LABELS_ID: dict[str, str] = {
+    "gate_in": "Gerbang Masuk",
+    "gate_out": "Gerbang Pulang",
+    "subject": "Sesi Mata Pelajaran",
+}
+
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 _VERIFICATION_METHOD_LABELS_ID: dict[str, str] = {
     "face_kiosk": "Scan Wajah Kiosk",
@@ -159,12 +187,151 @@ async def _ensure_unique_student_nis(
         )
 
 
+async def _ensure_unique_user_email(
+    db: AsyncSession,
+    email: str,
+    exclude_id: str | None = None,
+) -> None:
+    stmt = select(User.id).where(func.lower(User.email) == email.lower())
+    if exclude_id is not None:
+        stmt = stmt.where(User.id != exclude_id)
+    if (await db.scalar(stmt)) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Email akun sudah terdaftar.",
+        )
+
+
+async def _ensure_unique_user_nip(
+    db: AsyncSession,
+    nip: str | None,
+    exclude_id: str | None = None,
+) -> None:
+    if nip is None:
+        return
+    stmt = select(User.id).where(User.nip == nip)
+    if exclude_id is not None:
+        stmt = stmt.where(User.id != exclude_id)
+    if (await db.scalar(stmt)) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="NIP guru sudah terdaftar.",
+        )
+
+
+async def _ensure_unique_class_name(
+    db: AsyncSession,
+    name: str,
+    exclude_id: str | None = None,
+) -> None:
+    stmt = select(SchoolClass.id).where(func.lower(SchoolClass.name) == name.lower())
+    if exclude_id is not None:
+        stmt = stmt.where(SchoolClass.id != exclude_id)
+    if (await db.scalar(stmt)) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Nama kelas sudah terdaftar.",
+        )
+
+
+async def _ensure_no_schedule_overlap(
+    db: AsyncSession,
+    *,
+    class_id: str,
+    teacher_id: str,
+    day_of_week: int,
+    start_time: time,
+    end_time: time,
+    exclude_id: str | None = None,
+) -> None:
+    class_stmt = select(Schedule.id).where(
+        Schedule.class_id == class_id,
+        Schedule.day_of_week == day_of_week,
+        Schedule.start_time < end_time,
+        Schedule.end_time > start_time,
+    )
+    if exclude_id is not None:
+        class_stmt = class_stmt.where(Schedule.id != exclude_id)
+    if (await db.scalar(class_stmt.limit(1))) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Jadwal bentrok dengan mata pelajaran lain di kelas yang sama.",
+        )
+
+    teacher_stmt = select(Schedule.id).where(
+        Schedule.teacher_id == teacher_id,
+        Schedule.day_of_week == day_of_week,
+        Schedule.start_time < end_time,
+        Schedule.end_time > start_time,
+    )
+    if exclude_id is not None:
+        teacher_stmt = teacher_stmt.where(Schedule.id != exclude_id)
+    if (await db.scalar(teacher_stmt.limit(1))) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Guru sudah memiliki jadwal mengajar yang bentrok pada hari dan jam tersebut.",
+        )
+
+
+def _raise_student_integrity_error(exc: IntegrityError) -> None:
+    raw = str(getattr(exc, "orig", exc)).lower()
+    if "phone_wa" in raw or "parents" in raw:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Nomor WhatsApp orang tua sudah terdaftar.",
+        ) from exc
+    if "nis" in raw:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="NIS siswa sudah terdaftar.",
+        ) from exc
+    if "foreign key" in raw:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Referensi kelas atau orang tua tidak valid.",
+        ) from exc
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Data siswa konflik dengan data yang sudah terdaftar.",
+    ) from exc
+
+
+def _raise_teacher_integrity_error(exc: IntegrityError) -> None:
+    raw = str(getattr(exc, "orig", exc)).lower()
+    if "nip" in raw:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="NIP guru sudah terdaftar.",
+        ) from exc
+    if "email" in raw:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Email akun sudah terdaftar.",
+        ) from exc
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Data guru konflik dengan akun yang sudah terdaftar.",
+    ) from exc
+
+
 def _delete_upload_file_if_exists(upload_dir: str, image_path: str) -> None:
-    candidate = Path(image_path)
-    if not candidate.is_absolute():
-        candidate = Path(upload_dir) / image_path
-    if candidate.exists() and candidate.is_file():
-        candidate.unlink()
+    if not image_path or not image_path.strip():
+        return
+    raw_path = Path(image_path)
+    if raw_path.is_absolute():
+        return
+    upload_root = Path(upload_dir).resolve()
+    raw_candidate = Path(upload_dir) / raw_path
+    if raw_candidate.is_symlink():
+        return
+    try:
+        resolved_candidate = raw_candidate.resolve()
+    except OSError:
+        return
+    if not resolved_candidate.is_relative_to(upload_root):
+        return
+    if resolved_candidate.exists() and resolved_candidate.is_file():
+        resolved_candidate.unlink()
 
 
 async def _query_classes(
@@ -176,6 +343,7 @@ async def _query_classes(
             Student.class_id,
             func.count(Student.id).label("student_count"),
         )
+        .where(Student.is_active.is_(True))
         .group_by(Student.class_id)
         .subquery()
     )
@@ -210,6 +378,7 @@ async def _query_students(
     db: AsyncSession,
     class_id: str | None = None,
     student_id: str | None = None,
+    is_active: bool | None = None,
 ) -> list[StudentResponse]:
     face_count_subq = (
         select(
@@ -236,6 +405,8 @@ async def _query_students(
         stmt = stmt.where(Student.class_id == class_id)
     if student_id is not None:
         stmt = stmt.where(Student.id == student_id)
+    if is_active is not None:
+        stmt = stmt.where(Student.is_active.is_(is_active))
 
     rows = (await db.execute(stmt)).all()
     return [
@@ -314,7 +485,7 @@ def _to_face_response(face: FaceEmbedding) -> FaceEmbeddingResponse:
 
 
 # ---------------------------------------------------------------------------
-# Teachers Listing
+# Teachers CRUD
 # ---------------------------------------------------------------------------
 
 
@@ -330,6 +501,130 @@ async def list_teachers(
         )
     ).all()
     return [UserResponse.from_user(teacher) for teacher in teachers]
+
+
+@router.post("/teachers", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+async def create_teacher(
+    payload: TeacherCreate,
+    _: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> UserResponse:
+    """Create a new teacher account (admin only)."""
+    await _ensure_unique_user_email(db, payload.email)
+    await _ensure_unique_user_nip(db, payload.nip)
+
+    password_hash = await hash_secret_async(payload.password)
+    kiosk_pin_hash = (
+        await hash_secret_async(payload.kiosk_pin) if payload.kiosk_pin is not None else None
+    )
+
+    teacher = User(
+        name=payload.name,
+        email=payload.email,
+        password_hash=password_hash,
+        role="teacher",
+        nip=payload.nip,
+        kiosk_pin_hash=kiosk_pin_hash,
+    )
+    db.add(teacher)
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        _raise_teacher_integrity_error(exc)
+    await db.refresh(teacher)
+    return UserResponse.from_user(teacher)
+
+
+@router.put("/teachers/{teacher_id}", response_model=UserResponse)
+async def update_teacher(
+    teacher_id: str,
+    payload: TeacherUpdate,
+    _: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> UserResponse:
+    """Update an existing teacher's profile, credentials, or kiosk PIN (admin only)."""
+    teacher = await db.scalar(
+        select(User).where(User.id == teacher_id, User.role == "teacher")
+    )
+    if teacher is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Guru tidak ditemukan.",
+        )
+
+    if "name" in payload.model_fields_set and payload.name is not None:
+        teacher.name = payload.name
+    if "email" in payload.model_fields_set and payload.email is not None:
+        await _ensure_unique_user_email(db, payload.email, exclude_id=teacher.id)
+        teacher.email = payload.email
+    if "nip" in payload.model_fields_set:
+        await _ensure_unique_user_nip(db, payload.nip, exclude_id=teacher.id)
+        teacher.nip = payload.nip
+    if payload.password is not None:
+        teacher.password_hash = await hash_secret_async(payload.password)
+    if payload.reset_kiosk_pin:
+        teacher.kiosk_pin_hash = None
+    elif payload.kiosk_pin is not None:
+        teacher.kiosk_pin_hash = await hash_secret_async(payload.kiosk_pin)
+
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        _raise_teacher_integrity_error(exc)
+    await db.refresh(teacher)
+    return UserResponse.from_user(teacher)
+
+
+@router.delete("/teachers/{teacher_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_teacher(
+    teacher_id: str,
+    _: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Delete a teacher if no schedules or attendance sessions depend on them."""
+    teacher = await db.scalar(
+        select(User).where(User.id == teacher_id, User.role == "teacher")
+    )
+    if teacher is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Guru tidak ditemukan.",
+        )
+
+    has_schedule = await db.scalar(
+        select(Schedule.id).where(Schedule.teacher_id == teacher.id).limit(1)
+    )
+    has_session = await db.scalar(
+        select(AttendanceSession.id).where(AttendanceSession.teacher_id == teacher.id).limit(1)
+    )
+    if has_schedule is not None or has_session is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Guru tidak dapat dihapus karena masih memiliki jadwal mengajar atau riwayat sesi presensi.",
+        )
+
+    try:
+        await db.execute(
+            update(SchoolClass)
+            .where(SchoolClass.homeroom_teacher_id == teacher.id)
+            .values(homeroom_teacher_id=None)
+        )
+        await db.execute(
+            update(LeaveRequest)
+            .where(LeaveRequest.verified_by == teacher.id)
+            .values(verified_by=None)
+        )
+        await db.delete(teacher)
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Guru tidak dapat dihapus karena masih terhubung dengan data lain.",
+        ) from exc
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +648,7 @@ async def create_class(
     db: AsyncSession = Depends(get_db),
 ) -> SchoolClassResponse:
     """Create a new academic class (admin only)."""
+    await _ensure_unique_class_name(db, payload.name)
     if payload.homeroom_teacher_id is not None:
         await _validate_teacher_user(
             db,
@@ -380,6 +676,7 @@ async def update_class(
     school_class = await _get_or_404(db, SchoolClass, class_id, "Kelas tidak ditemukan.")
 
     if "name" in payload.model_fields_set and payload.name is not None:
+        await _ensure_unique_class_name(db, payload.name, exclude_id=class_id)
         school_class.name = payload.name
     if "homeroom_teacher_id" in payload.model_fields_set:
         if payload.homeroom_teacher_id is not None:
@@ -507,6 +804,11 @@ async def delete_parent(
     """Delete a parent if no student or leave request references them."""
     parent = await _get_or_404(db, Parent, parent_id, "Data orang tua tidak ditemukan.")
     try:
+        await db.execute(
+            update(ChatbotLog)
+            .where(ChatbotLog.parent_id == parent.id)
+            .values(parent_id=None)
+        )
         await db.delete(parent)
         await db.commit()
     except IntegrityError as exc:
@@ -526,11 +828,12 @@ async def delete_parent(
 @router.get("/students", response_model=list[StudentResponse])
 async def list_students(
     class_id: str | None = Query(default=None),
-    _: User = Depends(require_admin),
+    is_active: bool | None = Query(default=None),
+    _: User = Depends(require_staff),
     db: AsyncSession = Depends(get_db),
 ) -> list[StudentResponse]:
-    """List students with class name, parent WA info, and registered face sample count."""
-    return await _query_students(db, class_id=class_id)
+    """List students with class name, parent WA info, and face count (admin & teachers)."""
+    return await _query_students(db, class_id=class_id, is_active=is_active)
 
 
 @router.post("/students", response_model=StudentResponse, status_code=status.HTTP_201_CREATED)
@@ -539,16 +842,34 @@ async def create_student(
     _: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> StudentResponse:
-    """Create a new student record linked to an existing class and parent."""
+    """Create a student, linking an existing parent or creating/reusing one inline by WA phone."""
     await _get_or_404(db, SchoolClass, payload.class_id, "Kelas tidak ditemukan.")
-    await _get_or_404(db, Parent, payload.parent_id, "Data orang tua tidak ditemukan.")
     await _ensure_unique_student_nis(db, payload.nis)
+
+    if payload.parent_id is not None:
+        await _get_or_404(db, Parent, payload.parent_id, "Data orang tua tidak ditemukan.")
+        resolved_parent_id = payload.parent_id
+    else:
+        assert payload.parent_phone_wa is not None and payload.parent_name is not None
+        existing_parent = await db.scalar(
+            select(Parent).where(Parent.phone_wa == payload.parent_phone_wa)
+        )
+        if existing_parent is not None:
+            resolved_parent_id = existing_parent.id
+        else:
+            new_parent = Parent(
+                name=payload.parent_name,
+                phone_wa=payload.parent_phone_wa,
+            )
+            db.add(new_parent)
+            await db.flush()
+            resolved_parent_id = new_parent.id
 
     student = Student(
         nis=payload.nis,
         name=payload.name,
         class_id=payload.class_id,
-        parent_id=payload.parent_id,
+        parent_id=resolved_parent_id,
         is_active=payload.is_active,
     )
     db.add(student)
@@ -556,10 +877,7 @@ async def create_student(
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="NIS siswa sudah terdaftar.",
-        ) from exc
+        _raise_student_integrity_error(exc)
     return (await _query_students(db, student_id=student.id))[0]
 
 
@@ -570,7 +888,7 @@ async def update_student(
     _: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> StudentResponse:
-    """Update student profile, class assignment, parent link, or active flag."""
+    """Update student profile, class assignment, active flag, or inline parent link/contact."""
     student = await _get_or_404(db, Student, student_id, "Siswa tidak ditemukan.")
 
     if "nis" in payload.model_fields_set and payload.nis is not None:
@@ -581,9 +899,46 @@ async def update_student(
     if "class_id" in payload.model_fields_set and payload.class_id is not None:
         await _get_or_404(db, SchoolClass, payload.class_id, "Kelas tidak ditemukan.")
         student.class_id = payload.class_id
-    if "parent_id" in payload.model_fields_set and payload.parent_id is not None:
+
+    if payload.parent_phone_wa is not None:
+        if payload.update_linked_parent:
+            linked_parent = await _get_or_404(
+                db, Parent, student.parent_id, "Data orang tua tidak ditemukan."
+            )
+            await _ensure_unique_parent_phone(
+                db, payload.parent_phone_wa, exclude_id=linked_parent.id
+            )
+            linked_parent.phone_wa = payload.parent_phone_wa
+            if payload.parent_name is not None:
+                linked_parent.name = payload.parent_name
+        else:
+            existing_parent = await db.scalar(
+                select(Parent).where(Parent.phone_wa == payload.parent_phone_wa)
+            )
+            if existing_parent is not None:
+                student.parent_id = existing_parent.id
+            else:
+                if payload.parent_name is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        detail="Nama orang tua wajib diisi saat mendaftarkan nomor WhatsApp baru.",
+                    )
+                new_parent = Parent(
+                    name=payload.parent_name,
+                    phone_wa=payload.parent_phone_wa,
+                )
+                db.add(new_parent)
+                await db.flush()
+                student.parent_id = new_parent.id
+    elif payload.update_linked_parent and payload.parent_name is not None:
+        linked_parent = await _get_or_404(
+            db, Parent, student.parent_id, "Data orang tua tidak ditemukan."
+        )
+        linked_parent.name = payload.parent_name
+    elif "parent_id" in payload.model_fields_set and payload.parent_id is not None:
         await _get_or_404(db, Parent, payload.parent_id, "Data orang tua tidak ditemukan.")
         student.parent_id = payload.parent_id
+
     if "is_active" in payload.model_fields_set and payload.is_active is not None:
         student.is_active = payload.is_active
 
@@ -591,10 +946,7 @@ async def update_student(
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="NIS siswa sudah terdaftar.",
-        ) from exc
+        _raise_student_integrity_error(exc)
     return (await _query_students(db, student_id=student.id))[0]
 
 
@@ -605,7 +957,7 @@ async def delete_student(
     db: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> Response:
-    """Delete a student without attendance history and remove stored face files."""
+    """Delete a student without attendance/leave history and remove stored face files."""
     student = await _get_or_404(db, Student, student_id, "Siswa tidak ditemukan.")
     face_paths = (
         await db.scalars(
@@ -614,6 +966,16 @@ async def delete_student(
     ).all()
 
     try:
+        await db.execute(
+            update(FaceRecognitionLog)
+            .where(FaceRecognitionLog.predicted_student_id == student.id)
+            .values(predicted_student_id=None)
+        )
+        await db.execute(
+            update(FaceRecognitionLog)
+            .where(FaceRecognitionLog.actual_student_id == student.id)
+            .values(actual_student_id=None)
+        )
         await db.delete(student)
         await db.commit()
     except IntegrityError as exc:
@@ -657,9 +1019,17 @@ async def create_schedule(
     _: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> ScheduleResponse:
-    """Create a weekly teaching schedule (admin only)."""
+    """Create a weekly teaching schedule (admin only) rejecting overlapping intervals."""
     await _get_or_404(db, SchoolClass, payload.class_id, "Kelas tidak ditemukan.")
     await _validate_teacher_user(db, payload.teacher_id)
+    await _ensure_no_schedule_overlap(
+        db,
+        class_id=payload.class_id,
+        teacher_id=payload.teacher_id,
+        day_of_week=payload.day_of_week,
+        start_time=payload.start_time,
+        end_time=payload.end_time,
+    )
 
     schedule = Schedule(
         class_id=payload.class_id,
@@ -682,7 +1052,7 @@ async def update_schedule(
     _: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> ScheduleResponse:
-    """Update an existing weekly teaching schedule (admin only)."""
+    """Update an existing weekly teaching schedule (admin only) rejecting overlaps."""
     schedule = await _get_or_404(db, Schedule, schedule_id, "Jadwal pelajaran tidak ditemukan.")
 
     if "class_id" in payload.model_fields_set and payload.class_id is not None:
@@ -710,6 +1080,16 @@ async def update_schedule(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Jam selesai harus lebih lambat dari jam mulai.",
         )
+
+    await _ensure_no_schedule_overlap(
+        db,
+        class_id=schedule.class_id,
+        teacher_id=schedule.teacher_id,
+        day_of_week=schedule.day_of_week,
+        start_time=schedule.start_time,
+        end_time=schedule.end_time,
+        exclude_id=schedule.id,
+    )
 
     await db.commit()
     return (await _query_schedules(db, schedule_id=schedule.id))[0]
@@ -786,16 +1166,11 @@ async def register_student_face(
             "Hapus salah satu sampel sebelum mengunggah foto baru.",
         )
 
-    image_bytes = await file.read()
+    image_bytes = await read_upload_bytes_limited(file, MAX_FACE_IMAGE_BYTES)
     if not image_bytes:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="File foto wajah kosong.",
-        )
-    if len(image_bytes) > MAX_FACE_IMAGE_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Ukuran file foto melebihi batas maksimal 10 MB.",
         )
 
     try:
@@ -832,11 +1207,19 @@ async def register_student_face(
             detail="Hasil ekstraksi vektor wajah tidak valid.",
         )
 
+    try:
+        clean_jpeg_bytes = await asyncio.to_thread(reencode_clean_jpeg, image_bytes, 90)
+    except FaceValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=exc.message,
+        ) from exc
+
     face_id = str(uuid.uuid4())
     relative_path = f"faces/{student.id}/{face_id}.jpg"
     target_path = Path(settings.upload_dir) / relative_path
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    target_path.write_bytes(image_bytes)
+    target_path.write_bytes(clean_jpeg_bytes)
 
     embedding_row = FaceEmbedding(
         id=face_id,
@@ -937,6 +1320,27 @@ def _is_impostor_note(condition_note: str | None) -> bool:
     return bool(condition_note and condition_note.strip().lower().startswith("impostor"))
 
 
+def _strip_impostor_prefix(condition_note: str | None) -> str | None:
+    if condition_note is None:
+        return None
+    stripped = condition_note.strip()
+    if not stripped:
+        return None
+    lowered = stripped.lower()
+    if lowered == "impostor":
+        return None
+    if lowered.startswith("impostor:"):
+        return stripped[len("impostor:") :].strip() or None
+    return stripped
+
+
+def _is_log_impostor(log: FaceRecognitionLog) -> bool:
+    return bool(
+        log.is_impostor
+        or (log.actual_student_id is None and _is_impostor_note(log.condition_note))
+    )
+
+
 def _classify_face_log(log: FaceRecognitionLog) -> str:
     """Classify one face scan log into TP, FP, FN, TN, or unlabeled."""
     if log.actual_student_id is not None:
@@ -946,7 +1350,7 @@ def _classify_face_log(log: FaceRecognitionLog) -> str:
             return "FP"
         return "FN"
 
-    if _is_impostor_note(log.condition_note):
+    if _is_log_impostor(log):
         return "FP" if log.is_match else "TN"
     return "unlabeled"
 
@@ -976,17 +1380,49 @@ def _to_face_log_item(
         is_match=log.is_match,
         latency_ms=log.latency_ms,
         condition_note=log.condition_note,
-        is_impostor=log.actual_student_id is None and _is_impostor_note(log.condition_note),
+        is_impostor=log.actual_student_id is None and _is_log_impostor(log),
         classification=_classify_face_log(log),
         created_at=log.created_at,
     )
 
 
+def _to_chatbot_log_item(row: ChatbotLog) -> ChatbotLogItem:
+    return ChatbotLogItem(
+        id=row.id,
+        created_at=row.created_at,
+        phone_wa=row.phone_wa,
+        user_message=row.user_message,
+        bot_response=row.bot_response,
+        detected_intent=row.detected_intent,
+        tool_called=row.tool_called,
+        is_in_domain=row.is_in_domain,
+        is_fallback=row.is_fallback,
+        latency_ms=row.latency_ms,
+    )
+
+
 def _format_wib_csv_timestamp(dt: datetime | None) -> str:
     if dt is None:
-        return "-"
+        return ""
     target = dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
     return target.astimezone(WIB).strftime("%d/%m/%Y %H:%M WIB")
+
+
+def _sanitize_csv_cell(value: object) -> str:
+    """Neutralize spreadsheet formula injection by prefixing risky leading characters with `'`."""
+    text = "" if value is None else str(value)
+    if text and (
+        text[0] in _CSV_FORMULA_PREFIXES
+        or text.lstrip()[0:1] in _CSV_FORMULA_PREFIXES
+    ):
+        return f"'{text}"
+    return text
+
+
+def _build_csv_session_label(session_type: str, subject_name: str | None) -> str:
+    if subject_name:
+        return f"Mata Pelajaran {subject_name}"
+    return _SESSION_TYPE_LABELS_ID.get(session_type, "Sesi Presensi")
 
 
 @router.get("/evaluation/metrics", response_model=EvaluationDashboardResponse)
@@ -1061,10 +1497,17 @@ async def get_evaluation_metrics(
         )
     ).all()
     total_messages = len(chatbot_logs)
-    in_domain_count = sum(1 for row in chatbot_logs if row.is_in_domain)
+    domain_eligible_logs = [
+        row for row in chatbot_logs if row.detected_intent != "unregistered_parent"
+    ]
+    in_domain_count = sum(1 for row in domain_eligible_logs if row.is_in_domain)
+    out_of_domain_count = sum(1 for row in domain_eligible_logs if not row.is_in_domain)
+    domain_denominator = len(domain_eligible_logs)
     fallback_count = sum(1 for row in chatbot_logs if row.is_fallback)
     in_domain_rate = (
-        round(in_domain_count / total_messages * 100.0, 2) if total_messages > 0 else 0.0
+        round(in_domain_count / domain_denominator * 100.0, 2)
+        if domain_denominator > 0
+        else 0.0
     )
     fallback_rate = (
         round(fallback_count / total_messages * 100.0, 2) if total_messages > 0 else 0.0
@@ -1078,24 +1521,12 @@ async def get_evaluation_metrics(
     chatbot_metrics = ChatbotEvaluationMetrics(
         total_messages=total_messages,
         in_domain_count=in_domain_count,
+        out_of_domain_count=out_of_domain_count,
         in_domain_rate=in_domain_rate,
         fallback_count=fallback_count,
         fallback_rate=fallback_rate,
         avg_latency_ms=avg_chatbot_latency_ms,
-        recent_logs=[
-            ChatbotLogItem(
-                id=row.id,
-                created_at=row.created_at,
-                phone_wa=row.phone_wa,
-                user_message=row.user_message,
-                detected_intent=row.detected_intent,
-                tool_called=row.tool_called,
-                is_in_domain=row.is_in_domain,
-                is_fallback=row.is_fallback,
-                latency_ms=row.latency_ms,
-            )
-            for row in chatbot_logs[:20]
-        ],
+        recent_logs=[_to_chatbot_log_item(row) for row in chatbot_logs[:20]],
     )
 
     class_rows = (
@@ -1114,20 +1545,38 @@ async def get_evaluation_metrics(
         )
         for school_class, teacher_name in class_rows
     }
+    session_ids_by_class: dict[str, set[str]] = {cid: set() for cid in recap_map}
+
+    day_sessions = (
+        await db.execute(
+            select(AttendanceSession.id, AttendanceSession.class_id).where(
+                AttendanceSession.session_date == target_date
+            )
+        )
+    ).all()
+    for sess_id, sess_class_id in day_sessions:
+        if sess_class_id is not None and sess_class_id in session_ids_by_class:
+            session_ids_by_class[sess_class_id].add(sess_id)
 
     attendance_rows = (
         await db.execute(
-            select(Student.class_id, Attendance.status, Attendance.wa_status)
+            select(
+                Student.class_id,
+                Attendance.session_id,
+                Attendance.status,
+                Attendance.wa_status,
+            )
             .join(AttendanceSession, Attendance.session_id == AttendanceSession.id)
             .join(Student, Attendance.student_id == Student.id)
             .where(AttendanceSession.session_date == target_date)
         )
     ).all()
 
-    for cls_id, att_status, wa_status in attendance_rows:
+    for cls_id, sess_id, att_status, wa_status in attendance_rows:
         recap = recap_map.get(cls_id)
         if recap is None:
             continue
+        session_ids_by_class[cls_id].add(sess_id)
         if att_status == "present":
             recap.present_count += 1
         elif att_status == "late":
@@ -1142,12 +1591,128 @@ async def get_evaluation_metrics(
             if wa_status == "sent":
                 recap.wa_sent_count += 1
 
+    for cls_id, recap in recap_map.items():
+        recap.session_count = len(session_ids_by_class[cls_id])
+
     return EvaluationDashboardResponse(
         recap_date=target_date,
         face_metrics=face_metrics,
         chatbot_metrics=chatbot_metrics,
         class_recaps=list(recap_map.values()),
         recent_face_logs=[_to_face_log_item(log, student_names) for log in face_logs[:20]],
+    )
+
+
+@router.get("/evaluation/face-logs", response_model=PaginatedFaceLogsResponse)
+async def list_evaluation_face_logs(
+    status_filter: Literal["all", "labeled", "unlabeled", "errors"] = Query(
+        default="all", alias="status"
+    ),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    _: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> PaginatedFaceLogsResponse:
+    """List paginated kiosk face recognition logs filterable by labeling status or errors."""
+    face_logs = (
+        await db.scalars(
+            select(FaceRecognitionLog).order_by(
+                FaceRecognitionLog.created_at.desc(),
+                FaceRecognitionLog.id.desc(),
+            )
+        )
+    ).all()
+
+    filtered: list[FaceRecognitionLog] = []
+    for log in face_logs:
+        cls_label = _classify_face_log(log)
+        if status_filter == "all":
+            filtered.append(log)
+        elif status_filter == "labeled" and cls_label != "unlabeled":
+            filtered.append(log)
+        elif status_filter == "unlabeled" and cls_label == "unlabeled":
+            filtered.append(log)
+        elif status_filter == "errors" and cls_label in {"FP", "FN"}:
+            filtered.append(log)
+
+    page = filtered[offset : offset + limit]
+    student_ids = {
+        sid
+        for log in page
+        for sid in (log.predicted_student_id, log.actual_student_id)
+        if sid is not None
+    }
+    student_names: dict[str, str] = {}
+    if student_ids:
+        rows = (
+            await db.execute(
+                select(Student.id, Student.name).where(Student.id.in_(student_ids))
+            )
+        ).all()
+        student_names = {sid: name for sid, name in rows}
+
+    return PaginatedFaceLogsResponse(
+        items=[_to_face_log_item(log, student_names) for log in page],
+        total=len(filtered),
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/evaluation/chatbot-logs", response_model=PaginatedChatbotLogsResponse)
+async def list_evaluation_chatbot_logs(
+    in_domain: Literal["all", "true", "false"] = Query(default="all"),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    _: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> PaginatedChatbotLogsResponse:
+    """List paginated WhatsApp AI chatbot logs with optional domain filtering."""
+    base_stmt = select(ChatbotLog)
+    count_stmt = select(func.count(ChatbotLog.id))
+    if in_domain == "true":
+        base_stmt = base_stmt.where(ChatbotLog.is_in_domain.is_(True))
+        count_stmt = count_stmt.where(ChatbotLog.is_in_domain.is_(True))
+    elif in_domain == "false":
+        base_stmt = base_stmt.where(ChatbotLog.is_in_domain.is_(False))
+        count_stmt = count_stmt.where(ChatbotLog.is_in_domain.is_(False))
+
+    total = int((await db.scalar(count_stmt)) or 0)
+    rows = (
+        await db.scalars(
+            base_stmt.order_by(ChatbotLog.created_at.desc(), ChatbotLog.id.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+    ).all()
+
+    return PaginatedChatbotLogsResponse(
+        items=[_to_chatbot_log_item(row) for row in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.post("/evaluation/chatbot-simulate", response_model=WhatsAppWebhookResponse)
+async def simulate_chatbot_message(
+    payload: ChatbotSimulateRequest,
+    _: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    llm_provider: LLMProvider = Depends(get_llm_provider),
+    whatsapp_provider: WhatsAppProvider = Depends(get_whatsapp_provider),
+) -> WhatsAppWebhookResponse:
+    """Run an admin dry-run simulation against ChatbotOrchestrator without sending WAHA messages."""
+    orchestrator = ChatbotOrchestrator(
+        llm_provider=llm_provider,
+        whatsapp_provider=whatsapp_provider,
+    )
+    return await orchestrator.handle_incoming_message(
+        db=db,
+        phone_wa_raw=payload.phone_wa,
+        message_text=payload.message_text,
+        media_url=payload.media_url,
+        send_wa=False,
     )
 
 
@@ -1161,7 +1726,7 @@ async def label_face_recognition_log(
     _: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> FaceRecognitionLogItem:
-    """Assign ground-truth student or impostor label to a face recognition log."""
+    """Assign or clear ground-truth student or impostor label on a face recognition log."""
     log = await _get_or_404(
         db,
         FaceRecognitionLog,
@@ -1170,27 +1735,33 @@ async def label_face_recognition_log(
     )
 
     if payload.is_impostor:
+        log.is_impostor = True
         log.actual_student_id = None
-        note = payload.condition_note or ""
-        if not note:
-            log.condition_note = "impostor"
-        elif _is_impostor_note(note):
-            log.condition_note = note
+        if "condition_note" in payload.model_fields_set:
+            log.condition_note = _strip_impostor_prefix(payload.condition_note)
         else:
-            log.condition_note = f"impostor:{note}"
-    else:
-        if payload.actual_student_id is not None:
-            await _get_or_404(
-                db,
-                Student,
-                payload.actual_student_id,
-                "Siswa tidak ditemukan.",
-            )
+            log.condition_note = _strip_impostor_prefix(log.condition_note)
+    elif payload.actual_student_id is not None:
+        await _get_or_404(
+            db,
+            Student,
+            payload.actual_student_id,
+            "Siswa tidak ditemukan.",
+        )
+        log.is_impostor = False
         log.actual_student_id = payload.actual_student_id
         if "condition_note" in payload.model_fields_set:
-            log.condition_note = payload.condition_note
-        elif payload.actual_student_id is not None and _is_impostor_note(log.condition_note):
-            log.condition_note = None
+            log.condition_note = _strip_impostor_prefix(payload.condition_note)
+        else:
+            log.condition_note = _strip_impostor_prefix(log.condition_note)
+    else:
+        # Cleanly unlabel the log
+        log.is_impostor = False
+        log.actual_student_id = None
+        if "condition_note" in payload.model_fields_set:
+            log.condition_note = _strip_impostor_prefix(payload.condition_note)
+        else:
+            log.condition_note = _strip_impostor_prefix(log.condition_note)
 
     await db.commit()
     await db.refresh(log)
@@ -1218,7 +1789,7 @@ async def export_attendance_csv(
     _: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    """Export attendance records as a downloadable UTF-8 CSV report."""
+    """Export attendance records as a formula-safe downloadable UTF-8 CSV report."""
     if start_date is not None and end_date is not None and end_date < start_date:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -1226,10 +1797,17 @@ async def export_attendance_csv(
         )
 
     stmt = (
-        select(Attendance, AttendanceSession, Student, SchoolClass)
+        select(
+            Attendance,
+            AttendanceSession,
+            Student,
+            SchoolClass,
+            Schedule.subject_name.label("subject_name"),
+        )
         .join(AttendanceSession, Attendance.session_id == AttendanceSession.id)
         .join(Student, Attendance.student_id == Student.id)
         .join(SchoolClass, Student.class_id == SchoolClass.id)
+        .outerjoin(Schedule, AttendanceSession.schedule_id == Schedule.id)
         .order_by(
             AttendanceSession.session_date.desc(),
             SchoolClass.name.asc(),
@@ -1250,6 +1828,7 @@ async def export_attendance_csv(
     writer.writerow(
         [
             "Tanggal",
+            "Sesi / Mata Pelajaran",
             "Kelas",
             "NIS",
             "Nama Siswa",
@@ -1259,21 +1838,21 @@ async def export_attendance_csv(
             "Status WA",
         ]
     )
-    for att, session_row, student, school_class in rows:
-        writer.writerow(
-            [
-                session_row.session_date.isoformat(),
-                school_class.name,
-                student.nis,
-                student.name,
-                ATTENDANCE_STATUS_LABELS_ID.get(att.status, att.status),
-                _VERIFICATION_METHOD_LABELS_ID.get(
-                    att.verification_method, att.verification_method
-                ),
-                _format_wib_csv_timestamp(att.scanned_at),
-                _WA_STATUS_LABELS_ID.get(att.wa_status, att.wa_status),
-            ]
-        )
+    for att, session_row, student, school_class, subject_name in rows:
+        raw_row = [
+            session_row.session_date.isoformat(),
+            _build_csv_session_label(session_row.session_type, subject_name),
+            school_class.name,
+            student.nis,
+            student.name,
+            ATTENDANCE_STATUS_LABELS_ID.get(att.status, att.status),
+            _VERIFICATION_METHOD_LABELS_ID.get(
+                att.verification_method, att.verification_method
+            ),
+            _format_wib_csv_timestamp(att.scanned_at),
+            _WA_STATUS_LABELS_ID.get(att.wa_status, att.wa_status),
+        ]
+        writer.writerow([_sanitize_csv_cell(cell) for cell in raw_row])
 
     return Response(
         content=output.getvalue(),

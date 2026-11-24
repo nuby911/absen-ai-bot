@@ -2,9 +2,10 @@ import asyncio
 from datetime import date, datetime, time, timedelta, timezone
 import logging
 import time as time_perf
+from typing import Literal
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,10 +25,12 @@ from app.models import (
 )
 from app.providers.face_engine import (
     EMBEDDING_DIM,
+    MAX_FACE_IMAGE_BYTES,
     FaceEngine,
     FaceValidationError,
     cosine_similarity,
     get_face_engine,
+    read_upload_bytes_limited,
 )
 from app.providers.whatsapp import (
     ATTENDANCE_STATUS_LABELS_ID,
@@ -50,14 +53,19 @@ from app.schemas import (
     TeacherDashboardResponse,
     TeacherDashboardStats,
 )
-from app.security import require_teacher, verify_secret
+from app.security import (
+    AttemptRateLimiter,
+    get_pin_rate_limiter,
+    require_staff,
+    require_teacher,
+    verify_secret_async,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["attendance"])
 
 WIB = timezone(timedelta(hours=7))
-MAX_FACE_IMAGE_BYTES = 10 * 1024 * 1024
 _SESSION_TYPE_LABELS: dict[str, str] = {
     "gate_in": "Gerbang Masuk",
     "gate_out": "Gerbang Pulang",
@@ -91,8 +99,9 @@ def _resolve_scan_status(
     expected_start_time: time | None,
     late_tolerance_minutes: int,
     scan_dt_utc: datetime,
+    session_type: str = "subject",
 ) -> str:
-    if expected_start_time is None:
+    if session_type == "gate_out" or expected_start_time is None:
         return "present"
     target_dt = (
         scan_dt_utc
@@ -106,6 +115,36 @@ def _resolve_scan_status(
         tzinfo=WIB,
     ) + timedelta(minutes=late_tolerance_minutes)
     return "late" if scan_wib > deadline else "present"
+
+
+async def _get_approved_leaves_for_students(
+    db: AsyncSession,
+    session_date: date,
+    student_ids: list[str],
+) -> dict[str, LeaveRequest]:
+    """Return latest approved LeaveRequest per student covering `session_date`."""
+    if not student_ids:
+        return {}
+    leaves = (
+        await db.scalars(
+            select(LeaveRequest)
+            .where(
+                LeaveRequest.status == "approved",
+                LeaveRequest.start_date <= session_date,
+                LeaveRequest.end_date >= session_date,
+                LeaveRequest.student_id.in_(student_ids),
+            )
+            .order_by(
+                LeaveRequest.verified_at.desc().nullslast(),
+                LeaveRequest.created_at.desc(),
+            )
+        )
+    ).all()
+    latest_by_student: dict[str, LeaveRequest] = {}
+    for lr in leaves:
+        if lr.student_id not in latest_by_student:
+            latest_by_student[lr.student_id] = lr
+    return latest_by_student
 
 
 def _compute_counters(
@@ -221,58 +260,47 @@ async def _build_session_detail(
         for attendance, student, s_class_name, phone_wa in attendance_rows
     }
 
-    items: list[SessionStudentAttendanceItem] = []
-    if session_row.class_id is not None:
-        roster_stmt = (
-            select(
-                Student,
-                SchoolClass.name.label("student_class_name"),
-                Parent.phone_wa.label("parent_phone_wa"),
-            )
-            .join(SchoolClass, Student.class_id == SchoolClass.id)
-            .join(Parent, Student.parent_id == Parent.id)
-            .where(
-                Student.class_id == session_row.class_id,
-                Student.is_active.is_(True),
-            )
-            .order_by(Student.name)
+    roster_stmt = (
+        select(
+            Student,
+            SchoolClass.name.label("student_class_name"),
+            Parent.phone_wa.label("parent_phone_wa"),
         )
-        roster_rows = (await db.execute(roster_stmt)).all()
-        seen_ids: set[str] = set()
-        for student, s_class_name, phone_wa in roster_rows:
-            seen_ids.add(student.id)
-            rec = attendance_by_student.get(student.id)
-            items.append(
-                _to_student_attendance_item(
-                    student,
-                    s_class_name,
-                    phone_wa,
-                    attendance=rec[0] if rec is not None else None,
-                )
-            )
+        .join(SchoolClass, Student.class_id == SchoolClass.id)
+        .join(Parent, Student.parent_id == Parent.id)
+        .where(Student.is_active.is_(True))
+        .order_by(Student.name)
+    )
+    if session_row.class_id is not None:
+        roster_stmt = roster_stmt.where(Student.class_id == session_row.class_id)
 
-        # Include any already-recorded students even if moved or deactivated later
-        for student_id, (att, student, s_class_name, phone_wa) in attendance_by_student.items():
-            if student_id in seen_ids:
-                continue
-            items.append(
-                _to_student_attendance_item(
-                    student,
-                    s_class_name,
-                    phone_wa,
-                    attendance=att,
-                )
+    roster_rows = (await db.execute(roster_stmt)).all()
+    items: list[SessionStudentAttendanceItem] = []
+    seen_ids: set[str] = set()
+    for student, s_class_name, phone_wa in roster_rows:
+        seen_ids.add(student.id)
+        rec = attendance_by_student.get(student.id)
+        items.append(
+            _to_student_attendance_item(
+                student,
+                s_class_name,
+                phone_wa,
+                attendance=rec[0] if rec is not None else None,
             )
-    else:
-        for att, student, s_class_name, phone_wa in attendance_rows:
-            items.append(
-                _to_student_attendance_item(
-                    student,
-                    s_class_name,
-                    phone_wa,
-                    attendance=att,
-                )
+        )
+
+    # Include any already-recorded students even if moved or deactivated later
+    for student_id, (att, student, s_class_name, phone_wa) in attendance_by_student.items():
+        if student_id in seen_ids:
+            continue
+        items.append(
+            _to_student_attendance_item(
+                student,
+                s_class_name,
+                phone_wa,
+                attendance=att,
             )
+        )
 
     summary = _compute_counters(items)
     return AttendanceSessionDetailResponse(
@@ -305,8 +333,12 @@ async def _build_session_detail(
 
 async def _query_session_summaries(
     db: AsyncSession,
-    teacher_id: str,
-    session_date: date,
+    *,
+    teacher_id: str | None = None,
+    session_date: date | None = None,
+    include_prior_open: bool = False,
+    status_filter: str | None = None,
+    class_id: str | None = None,
 ) -> list[AttendanceSessionSummary]:
     stmt = (
         select(
@@ -318,17 +350,31 @@ async def _query_session_summaries(
         .join(User, AttendanceSession.teacher_id == User.id)
         .outerjoin(SchoolClass, AttendanceSession.class_id == SchoolClass.id)
         .outerjoin(Schedule, AttendanceSession.schedule_id == Schedule.id)
-        .where(
-            AttendanceSession.teacher_id == teacher_id,
-            AttendanceSession.session_date == session_date,
-        )
-        .order_by(AttendanceSession.opened_at.desc())
+        .order_by(AttendanceSession.opened_at.desc(), AttendanceSession.id.desc())
     )
+    if teacher_id is not None:
+        stmt = stmt.where(AttendanceSession.teacher_id == teacher_id)
+    if session_date is not None:
+        if include_prior_open:
+            stmt = stmt.where(
+                or_(
+                    AttendanceSession.session_date == session_date,
+                    AttendanceSession.status == "open",
+                )
+            )
+        else:
+            stmt = stmt.where(AttendanceSession.session_date == session_date)
+    if status_filter is not None:
+        stmt = stmt.where(AttendanceSession.status == status_filter)
+    if class_id is not None:
+        stmt = stmt.where(AttendanceSession.class_id == class_id)
+
     session_rows = (await db.execute(stmt)).all()
     if not session_rows:
         return []
 
     class_ids = {s.class_id for s, _, _, _ in session_rows if s.class_id is not None}
+    has_general_gate = any(s.class_id is None for s, _, _, _ in session_rows)
     class_student_counts: dict[str, int] = {}
     if class_ids:
         roster_counts = (
@@ -339,6 +385,17 @@ async def _query_session_summaries(
             )
         ).all()
         class_student_counts = {cid: int(cnt) for cid, cnt in roster_counts}
+
+    total_active_students = 0
+    if has_general_gate:
+        total_active_students = int(
+            (
+                await db.scalar(
+                    select(func.count(Student.id)).where(Student.is_active.is_(True))
+                )
+            )
+            or 0
+        )
 
     session_ids = [s.id for s, _, _, _ in session_rows]
     status_counts_by_session: dict[str, dict[str, int]] = {sid: {} for sid in session_ids}
@@ -361,11 +418,12 @@ async def _query_session_summaries(
         sick_cnt = sc.get("sick", 0)
         absent_cnt = sc.get("absent", 0)
         recorded_cnt = present_cnt + late_cnt + permit_cnt + sick_cnt + absent_cnt
-        total_cnt = (
+        base_roster_cnt = (
             class_student_counts.get(session_row.class_id, 0)
             if session_row.class_id is not None
-            else recorded_cnt
+            else total_active_students
         )
+        total_cnt = max(base_roster_cnt, recorded_cnt)
         unrecorded_cnt = max(0, total_cnt - recorded_cnt)
         summaries.append(
             AttendanceSessionSummary(
@@ -455,7 +513,7 @@ async def _match_best_student(
     db: AsyncSession,
     query_embedding: list[float],
     class_id: str | None,
-) -> tuple[Student | None, SchoolClass | None, Parent | None, float]:
+) -> tuple[Student | None, SchoolClass | None, Parent | None, float, int]:
     stmt = (
         select(FaceEmbedding, Student, SchoolClass, Parent)
         .join(Student, FaceEmbedding.student_id == Student.id)
@@ -468,16 +526,18 @@ async def _match_best_student(
 
     candidates = (await db.execute(stmt)).all()
     if not candidates:
-        return None, None, None, 0.0
+        return None, None, None, 0.0, 0
 
     best_student: Student | None = None
     best_class: SchoolClass | None = None
     best_parent: Parent | None = None
     top_score = -1.0
+    valid_candidates = 0
 
     for face_row, student, school_class, parent in candidates:
         if len(face_row.embedding) != len(query_embedding):
             continue
+        valid_candidates += 1
         score = cosine_similarity(query_embedding, face_row.embedding)
         if score > top_score:
             top_score = score
@@ -486,8 +546,8 @@ async def _match_best_student(
             best_parent = parent
 
     if best_student is None:
-        return None, None, None, 0.0
-    return best_student, best_class, best_parent, max(0.0, top_score)
+        return None, None, None, 0.0, valid_candidates
+    return best_student, best_class, best_parent, max(0.0, top_score), valid_candidates
 
 
 # ---------------------------------------------------------------------------
@@ -500,18 +560,24 @@ async def get_teacher_dashboard(
     current_user: User = Depends(require_teacher),
     db: AsyncSession = Depends(get_db),
 ) -> TeacherDashboardResponse:
-    """Return today's stats, attendance sessions, and schedules for the authenticated teacher."""
+    """Return today's stats, today + prior unclosed open sessions, and schedules."""
     today = _wib_now().date()
     today_dow = today.isoweekday()
 
-    sessions = await _query_session_summaries(db, current_user.id, today)
+    sessions = await _query_session_summaries(
+        db,
+        teacher_id=current_user.id,
+        session_date=today,
+        include_prior_open=True,
+    )
 
-    present_count = sum(s.present_count for s in sessions)
-    late_count = sum(s.late_count for s in sessions)
-    total_recorded = sum(s.recorded_count for s in sessions)
+    today_sessions = [s for s in sessions if s.session_date == today]
+    present_count = sum(s.present_count for s in today_sessions)
+    late_count = sum(s.late_count for s in today_sessions)
+    total_students = sum(s.total_students for s in today_sessions)
     present_rate = (
-        round((present_count + late_count) / total_recorded * 100.0, 2)
-        if total_recorded > 0
+        round((present_count + late_count) / total_students * 100.0, 2)
+        if total_students > 0
         else 0.0
     )
 
@@ -562,6 +628,25 @@ async def get_teacher_dashboard(
     )
 
 
+@router.get("/sessions", response_model=list[AttendanceSessionSummary])
+async def list_attendance_sessions(
+    status_filter: Literal["open", "closed"] | None = Query(default=None, alias="status"),
+    session_date: date | None = Query(default=None),
+    class_id: str | None = Query(default=None),
+    teacher_id: str | None = Query(default=None),
+    _: User = Depends(require_staff),
+    db: AsyncSession = Depends(get_db),
+) -> list[AttendanceSessionSummary]:
+    """List attendance sessions with optional status, date, class, and teacher filters."""
+    return await _query_session_summaries(
+        db,
+        teacher_id=teacher_id,
+        session_date=session_date,
+        status_filter=status_filter,
+        class_id=class_id,
+    )
+
+
 @router.post(
     "/sessions",
     response_model=AttendanceSessionSummary,
@@ -572,13 +657,18 @@ async def create_attendance_session(
     current_user: User = Depends(require_teacher),
     db: AsyncSession = Depends(get_db),
 ) -> AttendanceSessionSummary:
-    """Open a new gate or subject attendance session."""
+    """Open a new gate or subject attendance session and pre-apply approved leaves."""
     class_id = payload.class_id
     expected_start_time = payload.expected_start_time
     late_tolerance_minutes = payload.late_tolerance_minutes
     subject_name: str | None = None
 
     if payload.schedule_id is not None:
+        if payload.session_type != "subject":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Jadwal mata pelajaran hanya dapat dipilih untuk sesi bertipe 'subject'.",
+            )
         schedule = await db.get(Schedule, payload.schedule_id)
         if schedule is None:
             raise HTTPException(
@@ -605,7 +695,6 @@ async def create_attendance_session(
         )
 
     class_name: str | None = None
-    total_students = 0
     if class_id is not None:
         school_class = await db.get(SchoolClass, class_id)
         if school_class is None:
@@ -614,31 +703,85 @@ async def create_attendance_session(
                 detail="Kelas tidak ditemukan.",
             )
         class_name = school_class.name
-        total_students = int(
-            (
-                await db.scalar(
-                    select(func.count(Student.id)).where(
-                        Student.class_id == class_id,
-                        Student.is_active.is_(True),
-                    )
-                )
-            )
-            or 0
+
+    resolved_session_date = payload.session_date or _wib_now().date()
+
+    # Duplicate open session guard on (session_date, session_type, class_id, schedule_id)
+    dup_stmt = select(AttendanceSession).where(
+        AttendanceSession.status == "open",
+        AttendanceSession.session_date == resolved_session_date,
+        AttendanceSession.session_type == payload.session_type,
+        (
+            AttendanceSession.class_id.is_(None)
+            if class_id is None
+            else AttendanceSession.class_id == class_id
+        ),
+        (
+            AttendanceSession.schedule_id.is_(None)
+            if payload.schedule_id is None
+            else AttendanceSession.schedule_id == payload.schedule_id
+        ),
+    )
+    existing_open = await db.scalar(dup_stmt.limit(1))
+    if existing_open is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Sesi presensi serupa masih berstatus terbuka (session_id={existing_open.id}). "
+                "Lanjutkan sesi yang sedang aktif atau tutup terlebih dahulu."
+            ),
         )
+
+    student_stmt = select(Student.id).where(Student.is_active.is_(True))
+    if class_id is not None:
+        student_stmt = student_stmt.where(Student.class_id == class_id)
+    active_student_ids = list((await db.scalars(student_stmt)).all())
+    total_students = len(active_student_ids)
 
     session_row = AttendanceSession(
         class_id=class_id,
         teacher_id=current_user.id,
         schedule_id=payload.schedule_id,
         session_type=payload.session_type,
-        session_date=payload.session_date or _wib_now().date(),
+        session_date=resolved_session_date,
         expected_start_time=expected_start_time,
         late_tolerance_minutes=15 if late_tolerance_minutes is None else late_tolerance_minutes,
         status="open",
     )
     db.add(session_row)
+    await db.flush()
+
+    # Auto-apply pre-approved leaves covering session_date
+    approved_leaves = await _get_approved_leaves_for_students(
+        db,
+        session_date=resolved_session_date,
+        student_ids=active_student_ids,
+    )
+    permit_count = 0
+    sick_count = 0
+    for stu_id, lr in approved_leaves.items():
+        db.add(
+            Attendance(
+                session_id=session_row.id,
+                student_id=stu_id,
+                status=lr.request_type,
+                verification_method="leave_approved",
+                scanned_at=None,
+                similarity_score=None,
+                wa_status="skipped",
+                wa_notified_at=None,
+            )
+        )
+        if lr.request_type == "sick":
+            sick_count += 1
+        else:
+            permit_count += 1
+
     await db.commit()
     await db.refresh(session_row)
+
+    recorded_count = permit_count + sick_count
+    unrecorded_count = max(0, total_students - recorded_count)
 
     return AttendanceSessionSummary(
         id=session_row.id,
@@ -656,14 +799,17 @@ async def create_attendance_session(
         closed_at=session_row.closed_at,
         status=session_row.status,
         total_students=total_students,
-        unrecorded_count=total_students,
+        permit_count=permit_count,
+        sick_count=sick_count,
+        recorded_count=recorded_count,
+        unrecorded_count=unrecorded_count,
     )
 
 
 @router.get("/sessions/{session_id}", response_model=AttendanceSessionDetailResponse)
 async def get_attendance_session_detail(
     session_id: str,
-    _: User = Depends(require_teacher),
+    _: User = Depends(require_staff),
     db: AsyncSession = Depends(get_db),
 ) -> AttendanceSessionDetailResponse:
     """Return session metadata, summary counters, and real-time per-student statuses."""
@@ -676,7 +822,7 @@ async def close_attendance_session(
     _: User = Depends(require_teacher),
     db: AsyncSession = Depends(get_db),
 ) -> AttendanceSessionDetailResponse:
-    """Close an open session and automatically mark unrecorded class students as absent."""
+    """Close an open session, syncing approved leaves and marking unrecorded students absent."""
     session_row = await db.get(AttendanceSession, session_id)
     if session_row is None:
         raise HTTPException(
@@ -689,15 +835,12 @@ async def close_attendance_session(
             detail="Sesi presensi sudah ditutup sebelumnya.",
         )
 
-    if session_row.class_id is not None:
-        active_student_ids = (
-            await db.scalars(
-                select(Student.id).where(
-                    Student.class_id == session_row.class_id,
-                    Student.is_active.is_(True),
-                )
-            )
-        ).all()
+    if session_row.session_type in {"gate_in", "subject"}:
+        active_stmt = select(Student.id).where(Student.is_active.is_(True))
+        if session_row.class_id is not None:
+            active_stmt = active_stmt.where(Student.class_id == session_row.class_id)
+        active_student_ids = list((await db.scalars(active_stmt)).all())
+
         recorded_student_ids = set(
             (
                 await db.scalars(
@@ -705,20 +848,37 @@ async def close_attendance_session(
                 )
             ).all()
         )
-        for student_id in active_student_ids:
-            if student_id not in recorded_student_ids:
-                db.add(
-                    Attendance(
-                        session_id=session_row.id,
-                        student_id=student_id,
-                        status="absent",
-                        verification_method="manual_teacher",
-                        scanned_at=None,
-                        similarity_score=None,
-                        wa_status="skipped",
-                        wa_notified_at=None,
-                    )
-                )
+        unrecorded_ids = [
+            student_id for student_id in active_student_ids if student_id not in recorded_student_ids
+        ]
+        if unrecorded_ids:
+            approved_leaves = await _get_approved_leaves_for_students(
+                db,
+                session_date=session_row.session_date,
+                student_ids=unrecorded_ids,
+            )
+            for student_id in unrecorded_ids:
+                approved_lr = approved_leaves.get(student_id)
+                att_status = approved_lr.request_type if approved_lr is not None else "absent"
+                att_method = "leave_approved" if approved_lr is not None else "manual_teacher"
+                try:
+                    async with db.begin_nested():
+                        db.add(
+                            Attendance(
+                                session_id=session_row.id,
+                                student_id=student_id,
+                                status=att_status,
+                                verification_method=att_method,
+                                scanned_at=None,
+                                similarity_score=None,
+                                wa_status="skipped",
+                                wa_notified_at=None,
+                            )
+                        )
+                        await db.flush()
+                except IntegrityError:
+                    # Concurrent scan recorded this student while closing; keep the recorded row.
+                    continue
 
     session_row.status = "closed"
     session_row.closed_at = _utc_now()
@@ -752,25 +912,35 @@ async def scan_kiosk_face(
             detail="Sesi presensi sudah ditutup. Tidak dapat memindai wajah.",
         )
 
+    normalized_note = condition_note.strip() or None if condition_note is not None else None
+    threshold = await get_active_face_threshold(db, default=settings.face_similarity_threshold)
+
     if not liveness_passed:
+        db.add(
+            FaceRecognitionLog(
+                session_id=session_row.id,
+                predicted_student_id=None,
+                top_similarity_score=0.0,
+                threshold_used=threshold,
+                liveness_passed=False,
+                is_match=False,
+                latency_ms=0,
+                condition_note=normalized_note,
+            )
+        )
+        await db.commit()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Verifikasi keaktifan (liveness) gagal. Mohon berkedip saat memindai.",
         )
 
-    image_bytes = await file.read()
+    image_bytes = await read_upload_bytes_limited(file, MAX_FACE_IMAGE_BYTES)
     if not image_bytes:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="File foto wajah kosong.",
         )
-    if len(image_bytes) > MAX_FACE_IMAGE_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Ukuran file foto melebihi batas maksimal 10 MB.",
-        )
 
-    normalized_note = condition_note.strip() or None if condition_note is not None else None
     started_at = time_perf.perf_counter()
 
     try:
@@ -793,12 +963,21 @@ async def scan_kiosk_face(
     expected_start_time_val = session_row.expected_start_time
     late_tolerance_minutes_val = session_row.late_tolerance_minutes
 
-    best_student, best_class, best_parent, top_score = await _match_best_student(
+    best_student, best_class, best_parent, top_score, candidate_count = await _match_best_student(
         db, extraction.embedding, session_row.class_id
     )
     latency_ms = max(0, int(round((time_perf.perf_counter() - started_at) * 1000)))
-    threshold = await get_active_face_threshold(db, default=settings.face_similarity_threshold)
     rounded_score = round(float(top_score), 4)
+
+    if candidate_count == 0:
+        return AttendanceScanResponse(
+            matched=False,
+            already_recorded=False,
+            similarity_score=0.0,
+            threshold_used=threshold,
+            wa_queued=False,
+            message="Belum ada dataset wajah siswa terdaftar untuk sesi ini.",
+        )
 
     if best_student is None or best_class is None or best_parent is None or top_score < threshold:
         db.add(
@@ -835,7 +1014,7 @@ async def scan_kiosk_face(
             Attendance.student_id == best_student_id,
         )
     )
-    if existing_attendance is not None:
+    if existing_attendance is not None and existing_attendance.status in {"present", "late"}:
         existing_att_id = existing_attendance.id
         existing_att_status = existing_attendance.status
         existing_att_scanned_at = existing_attendance.scanned_at
@@ -876,15 +1055,7 @@ async def scan_kiosk_face(
         expected_start_time_val,
         late_tolerance_minutes_val,
         scanned_at,
-    )
-    attendance = Attendance(
-        session_id=session_id_val,
-        student_id=best_student_id,
-        status=attendance_status,
-        verification_method="face_kiosk",
-        scanned_at=scanned_at,
-        similarity_score=rounded_score,
-        wa_status="pending",
+        session_type=session_type_val,
     )
     face_log = FaceRecognitionLog(
         session_id=session_id_val,
@@ -896,52 +1067,94 @@ async def scan_kiosk_face(
         latency_ms=latency_ms,
         condition_note=normalized_note,
     )
-    db.add_all([attendance, face_log])
-    try:
+
+    if existing_attendance is not None:
+        # Upgrade existing absent/permit/sick record because student physically scanned at kiosk
+        existing_attendance.status = attendance_status
+        existing_attendance.verification_method = "face_kiosk"
+        existing_attendance.scanned_at = scanned_at
+        existing_attendance.similarity_score = rounded_score
+        existing_attendance.wa_status = "pending"
+        attendance = existing_attendance
+        db.add(face_log)
         await db.commit()
-    except IntegrityError:
-        await db.rollback()
-        concurrent_existing = await db.scalar(
-            select(Attendance).where(
-                Attendance.session_id == session_id_val,
-                Attendance.student_id == best_student_id,
-            )
+    else:
+        attendance = Attendance(
+            session_id=session_id_val,
+            student_id=best_student_id,
+            status=attendance_status,
+            verification_method="face_kiosk",
+            scanned_at=scanned_at,
+            similarity_score=rounded_score,
+            wa_status="pending",
         )
-        if concurrent_existing is not None:
-            concurrent_att_id = concurrent_existing.id
-            concurrent_att_status = concurrent_existing.status
-            concurrent_att_scanned_at = concurrent_existing.scanned_at
-            concurrent_att_wa_status = concurrent_existing.wa_status
-            db.add(
-                FaceRecognitionLog(
-                    session_id=session_id_val,
-                    predicted_student_id=best_student_id,
-                    top_similarity_score=rounded_score,
-                    threshold_used=threshold,
-                    liveness_passed=True,
-                    is_match=True,
-                    latency_ms=latency_ms,
-                    condition_note=normalized_note,
+        db.add_all([attendance, face_log])
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+            concurrent_existing = await db.scalar(
+                select(Attendance).where(
+                    Attendance.session_id == session_id_val,
+                    Attendance.student_id == best_student_id,
                 )
             )
-            await db.commit()
-            return AttendanceScanResponse(
-                matched=True,
-                already_recorded=True,
-                attendance_id=concurrent_att_id,
-                student_id=best_student_id,
-                student_name=best_student_name,
-                nis=best_student_nis,
-                class_name=best_class_name,
-                status=concurrent_att_status,
-                scanned_at=concurrent_att_scanned_at,
-                similarity_score=rounded_score,
-                threshold_used=threshold,
-                wa_status=concurrent_att_wa_status,
-                wa_queued=False,
-                message=f"{best_student_name} sudah tercatat presensi pada sesi ini.",
-            )
-        raise
+            if concurrent_existing is not None:
+                if concurrent_existing.status in {"present", "late"}:
+                    concurrent_att_id = concurrent_existing.id
+                    concurrent_att_status = concurrent_existing.status
+                    concurrent_att_scanned_at = concurrent_existing.scanned_at
+                    concurrent_att_wa_status = concurrent_existing.wa_status
+                    db.add(
+                        FaceRecognitionLog(
+                            session_id=session_id_val,
+                            predicted_student_id=best_student_id,
+                            top_similarity_score=rounded_score,
+                            threshold_used=threshold,
+                            liveness_passed=True,
+                            is_match=True,
+                            latency_ms=latency_ms,
+                            condition_note=normalized_note,
+                        )
+                    )
+                    await db.commit()
+                    return AttendanceScanResponse(
+                        matched=True,
+                        already_recorded=True,
+                        attendance_id=concurrent_att_id,
+                        student_id=best_student_id,
+                        student_name=best_student_name,
+                        nis=best_student_nis,
+                        class_name=best_class_name,
+                        status=concurrent_att_status,
+                        scanned_at=concurrent_att_scanned_at,
+                        similarity_score=rounded_score,
+                        threshold_used=threshold,
+                        wa_status=concurrent_att_wa_status,
+                        wa_queued=False,
+                        message=f"{best_student_name} sudah tercatat presensi pada sesi ini.",
+                    )
+                concurrent_existing.status = attendance_status
+                concurrent_existing.verification_method = "face_kiosk"
+                concurrent_existing.scanned_at = scanned_at
+                concurrent_existing.similarity_score = rounded_score
+                concurrent_existing.wa_status = "pending"
+                attendance = concurrent_existing
+                db.add(
+                    FaceRecognitionLog(
+                        session_id=session_id_val,
+                        predicted_student_id=best_student_id,
+                        top_similarity_score=rounded_score,
+                        threshold_used=threshold,
+                        liveness_passed=True,
+                        is_match=True,
+                        latency_ms=latency_ms,
+                        condition_note=normalized_note,
+                    )
+                )
+                await db.commit()
+            else:
+                raise
 
     await db.refresh(attendance)
     attendance_id_val = attendance.id
@@ -988,6 +1201,7 @@ async def create_manual_attendance(
     current_user: User = Depends(require_teacher),
     db: AsyncSession = Depends(get_db),
     whatsapp_provider: WhatsAppProvider = Depends(get_whatsapp_provider),
+    pin_limiter: AttemptRateLimiter = Depends(get_pin_rate_limiter),
 ) -> ManualAttendanceResponse:
     """Record or update manual teacher attendance after verifying the teacher's kiosk PIN."""
     if not current_user.kiosk_pin_hash:
@@ -995,11 +1209,22 @@ async def create_manual_attendance(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="PIN Kiosk belum diatur. Silakan atur PIN Kiosk terlebih dahulu.",
         )
-    if not verify_secret(payload.kiosk_pin, current_user.kiosk_pin_hash):
+    allowed, retry_after = pin_limiter.check_allowed(current_user.id)
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                f"Terlalu banyak percobaan PIN Kiosk gagal. Coba lagi dalam {retry_after} detik."
+            ),
+            headers={"Retry-After": str(retry_after)},
+        )
+    if not (await verify_secret_async(payload.kiosk_pin, current_user.kiosk_pin_hash)):
+        pin_limiter.record_failure(current_user.id)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="PIN Kiosk tidak valid.",
         )
+    pin_limiter.reset(current_user.id)
 
     session_row, _, _, subject_name = await _get_session_with_meta(db, payload.session_id)
     if session_row.status != "open":
@@ -1044,6 +1269,8 @@ async def create_manual_attendance(
     parent_phone_wa_val = parent.phone_wa
 
     now_utc = _utc_now()
+    resolved_scanned_at = now_utc if payload.status in {"present", "late"} else None
+
     attendance = await db.scalar(
         select(Attendance).where(
             Attendance.session_id == session_id_val,
@@ -1056,7 +1283,7 @@ async def create_manual_attendance(
             student_id=student_id_val,
             status=payload.status,
             verification_method="manual_teacher",
-            scanned_at=now_utc,
+            scanned_at=resolved_scanned_at,
             similarity_score=None,
             wa_status="pending" if payload.notify_wa else "skipped",
         )
@@ -1064,14 +1291,35 @@ async def create_manual_attendance(
     else:
         attendance.status = payload.status
         attendance.verification_method = "manual_teacher"
-        if attendance.scanned_at is None:
-            attendance.scanned_at = now_utc
+        attendance.scanned_at = resolved_scanned_at
+        attendance.similarity_score = None
         if payload.notify_wa:
             attendance.wa_status = "pending"
         elif attendance.wa_status != "sent":
             attendance.wa_status = "skipped"
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        attendance = await db.scalar(
+            select(Attendance).where(
+                Attendance.session_id == session_id_val,
+                Attendance.student_id == student_id_val,
+            )
+        )
+        if attendance is None:
+            raise
+        attendance.status = payload.status
+        attendance.verification_method = "manual_teacher"
+        attendance.scanned_at = resolved_scanned_at
+        attendance.similarity_score = None
+        if payload.notify_wa:
+            attendance.wa_status = "pending"
+        elif attendance.wa_status != "sent":
+            attendance.wa_status = "skipped"
+        await db.commit()
+
     await db.refresh(attendance)
 
     attendance_id_val = attendance.id
@@ -1113,7 +1361,7 @@ async def create_manual_attendance(
 @router.post("/attendance/{attendance_id}/resend-wa", response_model=ResendWaResponse)
 async def resend_attendance_wa(
     attendance_id: str,
-    _: User = Depends(require_teacher),
+    _: User = Depends(require_staff),
     db: AsyncSession = Depends(get_db),
     whatsapp_provider: WhatsAppProvider = Depends(get_whatsapp_provider),
 ) -> ResendWaResponse:
