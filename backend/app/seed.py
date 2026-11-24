@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.models  # noqa: F401
-from app.database import Base, create_engine_and_session
+from app.database import Base, create_engine_and_session, sync_schema_columns
 from app.config import get_settings
 from app.models import (
     Attendance,
@@ -643,6 +643,7 @@ async def _run_cli() -> None:
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(sync_schema_columns)
         async with session_factory() as session:
             summary = await seed_demo_data(session)
         print(f"Demo data seeded successfully: {summary}")

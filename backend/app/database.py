@@ -19,6 +19,48 @@ class Base(DeclarativeBase):
     """Base class for all SQLAlchemy ORM models."""
 
 
+def sync_schema_columns(sync_conn: Any) -> None:
+    """Ensure missing columns in existing tables are added automatically."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(sync_conn)
+    dialect = sync_conn.dialect
+    dialect_name = dialect.name
+
+    for table_name, table in Base.metadata.tables.items():
+        if not inspector.has_table(table_name):
+            continue
+        existing_cols = {col["name"] for col in inspector.get_columns(table_name)}
+        for column in table.columns:
+            if column.name not in existing_cols:
+                col_type = column.type.compile(dialect=dialect)
+                default_clause = ""
+                if column.server_default is not None:
+                    default_clause = f" DEFAULT {column.server_default.arg}"
+                elif column.default is not None and getattr(column.default, "is_scalar", False):
+                    val = column.default.arg
+                    if isinstance(val, bool):
+                        val_str = "1" if val else "0" if dialect_name == "sqlite" else ("TRUE" if val else "FALSE")
+                    elif isinstance(val, (int, float)):
+                        val_str = str(val)
+                    else:
+                        val_str = f"'{val}'"
+                    default_clause = f" DEFAULT {val_str}"
+                elif column.name == "is_active":
+                    default_clause = " DEFAULT 1" if dialect_name == "sqlite" else " DEFAULT TRUE"
+                elif column.name == "is_impostor":
+                    default_clause = " DEFAULT 0" if dialect_name == "sqlite" else " DEFAULT FALSE"
+
+                null_clause = ""
+                if not column.nullable and default_clause:
+                    null_clause = " NOT NULL"
+                elif column.nullable and dialect_name != "sqlite":
+                    null_clause = " NULL"
+
+                sql = f"ALTER TABLE {table_name} ADD COLUMN {column.name} {col_type}{null_clause}{default_clause}"
+                sync_conn.execute(text(sql))
+
+
 def _enable_sqlite_foreign_keys(dbapi_connection: Any, _connection_record: Any) -> None:
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")

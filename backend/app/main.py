@@ -13,6 +13,7 @@ from app.database import (
     Base,
     create_engine_and_session,
     get_db,
+    sync_schema_columns,
 )
 from app.providers.face_engine import FaceEngine, create_face_engine
 from app.providers.llm import LLMProvider, create_llm_provider
@@ -57,6 +58,7 @@ def create_app(
             try:
                 async with engine.begin() as conn:
                     await conn.run_sync(Base.metadata.create_all)
+                    await conn.run_sync(sync_schema_columns)
                 yield
             finally:
                 await engine.dispose()
