@@ -6,6 +6,10 @@ class FaceSample {
     required this.headEulerAngleY,
     required this.headEulerAngleZ,
     required this.timestamp,
+    this.faceCount = 1,
+    this.faceWidthRatio,
+    this.isCentered,
+    this.meanLuma,
   });
 
   final double? leftEyeOpenProbability;
@@ -18,11 +22,27 @@ class FaceSample {
   final double? headEulerAngleZ;
 
   final DateTime timestamp;
+
+  /// Jumlah wajah terdeteksi pada frame saat ini.
+  final int faceCount;
+
+  /// Rasio lebar bounding box wajah utama terhadap lebar frame tegak (0.0–1.0).
+  final double? faceWidthRatio;
+
+  /// Apakah titik tengah wajah berada di dalam area oval tengah.
+  final bool? isCentered;
+
+  /// Rata-rata kecerahan Y-plane frame (0–255).
+  final double? meanLuma;
 }
 
 /// Tahapan mesin status verifikasi keaktifan berbasis kedipan mata.
 enum LivenessStatus {
   noFace,
+  multipleFaces,
+  tooFar,
+  tooClose,
+  poorLighting,
   poseInvalid,
   waitingOpen,
   waitingBlink,
@@ -51,27 +71,40 @@ enum _BlinkPhase {
 }
 
 /// State machine anti-spoofing berbasis kedipan mata (open -> closed -> open)
-/// dengan validasi sudut kepala lurus dan cooldown pasca-scan Kiosk.
+/// dengan validasi jumlah wajah, jarak, pencahayaan, sudut kepala lurus,
+/// dan cooldown pasca-scan Kiosk.
 class BlinkLivenessDetector {
   BlinkLivenessDetector({
     this.openEyeThreshold = 0.7,
     this.closedEyeThreshold = 0.25,
     this.maxYawDegrees = 18.0,
     this.maxRollDegrees = 15.0,
+    this.minFaceWidthRatio = 0.20,
+    this.maxFaceWidthRatio = 0.80,
+    this.minMeanLuma = 40.0,
     this.blinkWindow = const Duration(milliseconds: 2500),
     this.cooldownDuration = const Duration(milliseconds: 2500),
+    this.nullEyeWarningDuration = const Duration(milliseconds: 1500),
+    this.maxTransientNullEyeFramesOnReopen = 1,
   });
 
   final double openEyeThreshold;
   final double closedEyeThreshold;
   final double maxYawDegrees;
   final double maxRollDegrees;
+  final double minFaceWidthRatio;
+  final double maxFaceWidthRatio;
+  final double minMeanLuma;
   final Duration blinkWindow;
   final Duration cooldownDuration;
+  final Duration nullEyeWarningDuration;
+  final int maxTransientNullEyeFramesOnReopen;
 
   _BlinkPhase _phase = _BlinkPhase.waitingOpen;
   DateTime? _blinkWindowStart;
   DateTime? _cooldownStart;
+  DateTime? _nullEyeSince;
+  int _reopenNullEyeCount = 0;
 
   /// Mengembalikan `true` jika detektor sedang dalam masa tunggu pasca-scan.
   bool isInCooldown(DateTime now) {
@@ -95,9 +128,13 @@ class BlinkLivenessDetector {
     _resetBlinkPhase();
   }
 
-  void _resetBlinkPhase() {
+  void _resetBlinkPhase({bool clearNullEyeSince = true}) {
     _phase = _BlinkPhase.waitingOpen;
     _blinkWindowStart = null;
+    _reopenNullEyeCount = 0;
+    if (clearNullEyeSince) {
+      _nullEyeSince = null;
+    }
   }
 
   /// Mengevaluasi satu frame wajah dan mengembalikan instruksi serta keputusan capture.
@@ -116,11 +153,49 @@ class BlinkLivenessDetector {
       _cooldownStart = null;
     }
 
-    if (sample == null) {
+    if (sample == null || sample.faceCount <= 0) {
       _resetBlinkPhase();
       return const LivenessDecision(
         status: LivenessStatus.noFace,
         instruction: 'Arahkan wajah ke dalam bingkai oval',
+        shouldCapture: false,
+      );
+    }
+
+    if (sample.faceCount > 1) {
+      _resetBlinkPhase();
+      return const LivenessDecision(
+        status: LivenessStatus.multipleFaces,
+        instruction: 'Terdeteksi lebih dari 1 wajah — maju satu per satu',
+        shouldCapture: false,
+      );
+    }
+
+    if (sample.meanLuma != null && sample.meanLuma! < minMeanLuma) {
+      _resetBlinkPhase();
+      return const LivenessDecision(
+        status: LivenessStatus.poorLighting,
+        instruction: 'Pencahayaan terlalu gelap — cari area terang',
+        shouldCapture: false,
+      );
+    }
+
+    if (sample.faceWidthRatio != null &&
+        sample.faceWidthRatio! < minFaceWidthRatio) {
+      _resetBlinkPhase();
+      return const LivenessDecision(
+        status: LivenessStatus.tooFar,
+        instruction: 'Dekatkan wajah ke kamera (30–80 cm)',
+        shouldCapture: false,
+      );
+    }
+
+    if (sample.faceWidthRatio != null &&
+        sample.faceWidthRatio! > maxFaceWidthRatio) {
+      _resetBlinkPhase();
+      return const LivenessDecision(
+        status: LivenessStatus.tooClose,
+        instruction: 'Sedikit menjauh dari kamera',
         shouldCapture: false,
       );
     }
@@ -139,15 +214,48 @@ class BlinkLivenessDetector {
       );
     }
 
+    if (sample.isCentered == false) {
+      _resetBlinkPhase();
+      return const LivenessDecision(
+        status: LivenessStatus.poseInvalid,
+        instruction: 'Posisikan wajah di tengah bingkai oval',
+        shouldCapture: false,
+      );
+    }
+
     final left = sample.leftEyeOpenProbability;
     final right = sample.rightEyeOpenProbability;
     if (left == null || right == null) {
-      if (_phase == _BlinkPhase.blinkDetectedWaitingReopen &&
+      _nullEyeSince ??= timestamp;
+
+      if (_phase == _BlinkPhase.blinkDetectedWaitingReopen) {
+        if (_isWindowExpired(timestamp)) {
+          _resetBlinkPhase(clearNullEyeSince: false);
+        } else {
+          _reopenNullEyeCount += 1;
+          if (_reopenNullEyeCount > maxTransientNullEyeFramesOnReopen) {
+            _resetBlinkPhase(clearNullEyeSince: false);
+          }
+        }
+      } else if (_phase == _BlinkPhase.waitingBlink &&
           _isWindowExpired(timestamp)) {
-        _resetBlinkPhase();
+        _resetBlinkPhase(clearNullEyeSince: false);
+      }
+
+      final nullElapsed = timestamp.difference(_nullEyeSince!);
+      if (!nullElapsed.isNegative && nullElapsed > nullEyeWarningDuration) {
+        return LivenessDecision(
+          status: _currentStatusForPhase(),
+          instruction:
+              'Mata tidak terbaca jelas — kurangi pantulan kacamata/cahaya',
+          shouldCapture: false,
+        );
       }
       return _currentWaitingDecision();
     }
+
+    _nullEyeSince = null;
+    _reopenNullEyeCount = 0;
 
     final bothOpen = left > openEyeThreshold && right > openEyeThreshold;
     final bothClosed = left < closedEyeThreshold && right < closedEyeThreshold;
@@ -188,6 +296,7 @@ class BlinkLivenessDetector {
             );
           }
           _phase = _BlinkPhase.blinkDetectedWaitingReopen;
+          _reopenNullEyeCount = 0;
           return const LivenessDecision(
             status: LivenessStatus.blinkDetectedWaitingReopen,
             instruction: 'Kedipan terdeteksi, buka mata kembali...',
@@ -240,6 +349,17 @@ class BlinkLivenessDetector {
     }
     final elapsed = timestamp.difference(windowStart);
     return elapsed.isNegative || elapsed > blinkWindow;
+  }
+
+  LivenessStatus _currentStatusForPhase() {
+    switch (_phase) {
+      case _BlinkPhase.waitingOpen:
+        return LivenessStatus.waitingOpen;
+      case _BlinkPhase.waitingBlink:
+        return LivenessStatus.waitingBlink;
+      case _BlinkPhase.blinkDetectedWaitingReopen:
+        return LivenessStatus.blinkDetectedWaitingReopen;
+    }
   }
 
   LivenessDecision _currentWaitingDecision() {

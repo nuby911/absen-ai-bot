@@ -11,15 +11,20 @@ class LeaveVerificationScreen extends StatefulWidget {
     super.key,
     required this.apiClient,
     this.onLeaveChanged,
+    this.onPendingCountLoaded,
     this.initialLeaves,
     this.onVerify,
+    this.onVerifyWithNote,
     this.refreshTrigger = 0,
   });
 
   final ApiClient apiClient;
   final VoidCallback? onLeaveChanged;
+  final ValueChanged<int>? onPendingCountLoaded;
   final List<LeaveRequestItem>? initialLeaves;
   final Future<void> Function(String leaveId, String decision)? onVerify;
+  final Future<void> Function(String leaveId, String decision, String? note)?
+      onVerifyWithNote;
   final int refreshTrigger;
 
   @override
@@ -32,7 +37,7 @@ class _LeaveVerificationScreenState extends State<LeaveVerificationScreen>
   List<LeaveRequestItem> _leaves = const [];
   bool _isLoading = false;
   String? _errorMessage;
-  final Set<String> _processingIds = {};
+  final Map<String, String> _processingDecisionById = {};
 
   @override
   void initState() {
@@ -72,10 +77,12 @@ class _LeaveVerificationScreenState extends State<LeaveVerificationScreen>
     try {
       final items = await widget.apiClient.getLeaveRequests();
       if (!mounted) return;
+      final pendingCount = items.where((item) => item.status == 'pending').length;
       setState(() {
         _leaves = items;
         _isLoading = false;
       });
+      widget.onPendingCountLoaded?.call(pendingCount);
     } on ApiException catch (exc) {
       if (!mounted) return;
       setState(() {
@@ -92,26 +99,39 @@ class _LeaveVerificationScreenState extends State<LeaveVerificationScreen>
   }
 
   Future<void> _handleDecision(LeaveRequestItem item, String decision) async {
-    if (_processingIds.contains(item.id)) return;
+    if (_processingDecisionById.containsKey(item.id)) return;
 
+    final confirmation = await showDialog<_LeaveDecisionConfirmation>(
+      context: context,
+      builder: (_) => _LeaveDecisionConfirmDialog(
+        item: item,
+        decision: decision,
+      ),
+    );
+    if (confirmation == null || !mounted) return;
+
+    final note = confirmation.note;
     setState(() {
-      _processingIds.add(item.id);
+      _processingDecisionById[item.id] = decision;
     });
 
     try {
+      if (widget.onVerifyWithNote != null) {
+        await widget.onVerifyWithNote!(item.id, decision, note);
+        widget.onLeaveChanged?.call();
+        return;
+      }
+
       if (widget.onVerify != null) {
         await widget.onVerify!(item.id, decision);
         widget.onLeaveChanged?.call();
-        if (!mounted) return;
-        setState(() {
-          _processingIds.remove(item.id);
-        });
         return;
       }
 
       final result = await widget.apiClient.verifyLeaveRequest(
         leaveId: item.id,
         decision: decision,
+        note: note,
       );
       if (!mounted) return;
 
@@ -132,10 +152,18 @@ class _LeaveVerificationScreenState extends State<LeaveVerificationScreen>
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(exc.message), backgroundColor: AppColors.danger),
       );
+    } catch (exc) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Gagal memverifikasi pengajuan izin: $exc'),
+          backgroundColor: AppColors.danger,
+        ),
+      );
     } finally {
       if (mounted) {
         setState(() {
-          _processingIds.remove(item.id);
+          _processingDecisionById.remove(item.id);
         });
       }
     }
@@ -149,51 +177,90 @@ class _LeaveVerificationScreenState extends State<LeaveVerificationScreen>
       context: context,
       builder: (dialogContext) => AlertDialog(
         title: Text('Lampiran • ${item.studentName}'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ClipRRect(
-              borderRadius: BorderRadius.circular(12),
-              child: Image.network(
-                resolvedUrl,
-                height: 280,
-                fit: BoxFit.contain,
-                errorBuilder: (_, _, _) => Container(
-                  height: 160,
+        content: SizedBox(
+          width: double.maxFinite,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: Container(
+                  height: 300,
                   width: double.infinity,
-                  alignment: Alignment.center,
-                  decoration: BoxDecoration(
-                    color: AppColors.background,
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: AppColors.border),
-                  ),
-                  child: const Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        Icons.broken_image_outlined,
-                        size: 36,
-                        color: AppColors.textMuted,
+                  color: AppColors.background,
+                  child: InteractiveViewer(
+                    minScale: 1.0,
+                    maxScale: 4.0,
+                    child: Image.network(
+                      resolvedUrl,
+                      fit: BoxFit.contain,
+                      loadingBuilder: (context, child, loadingProgress) {
+                        if (loadingProgress == null) return child;
+                        final expected = loadingProgress.expectedTotalBytes;
+                        final progress = expected != null && expected > 0
+                            ? loadingProgress.cumulativeBytesLoaded / expected
+                            : null;
+                        return Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              CircularProgressIndicator(value: progress),
+                              const SizedBox(height: 10),
+                              const Text(
+                                'Memuat lampiran...',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: AppColors.textSecondary,
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                      errorBuilder: (_, _, _) => Container(
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          color: AppColors.background,
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: AppColors.border),
+                        ),
+                        child: const Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.broken_image_outlined,
+                              size: 36,
+                              color: AppColors.textMuted,
+                            ),
+                            SizedBox(height: 8),
+                            Text(
+                              'Pratinjau gambar tidak tersedia.',
+                              style: TextStyle(color: AppColors.textSecondary),
+                            ),
+                          ],
+                        ),
                       ),
-                      SizedBox(height: 8),
-                      Text(
-                        'Pratinjau gambar tidak tersedia.',
-                        style: TextStyle(color: AppColors.textSecondary),
-                      ),
-                    ],
+                    ),
                   ),
                 ),
               ),
-            ),
-            const SizedBox(height: 10),
-            Text(
-              _extractAttachmentName(item.attachmentUrl!),
-              style: const TextStyle(
-                fontSize: 12,
-                color: AppColors.textSecondary,
+              const SizedBox(height: 8),
+              const Text(
+                'Cubit gambar untuk memperbesar (pinch-to-zoom)',
+                style: TextStyle(fontSize: 11, color: AppColors.textMuted),
               ),
-            ),
-          ],
+              const SizedBox(height: 4),
+              Text(
+                _extractAttachmentName(item.attachmentUrl!),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 12,
+                  color: AppColors.textSecondary,
+                ),
+              ),
+            ],
+          ),
         ),
         actions: [
           TextButton(
@@ -385,7 +452,7 @@ class _LeaveVerificationScreenState extends State<LeaveVerificationScreen>
                 final item = items[index];
                 return _LeaveRequestCard(
                   item: item,
-                  isProcessing: _processingIds.contains(item.id),
+                  processingDecision: _processingDecisionById[item.id],
                   onApprove: () => _handleDecision(item, 'approved'),
                   onReject: () => _handleDecision(item, 'rejected'),
                   onTapAttachment: item.attachmentUrl != null &&
@@ -395,6 +462,100 @@ class _LeaveVerificationScreenState extends State<LeaveVerificationScreen>
                 );
               },
             ),
+    );
+  }
+}
+
+class _LeaveDecisionConfirmation {
+  const _LeaveDecisionConfirmation({this.note});
+
+  final String? note;
+}
+
+class _LeaveDecisionConfirmDialog extends StatefulWidget {
+  const _LeaveDecisionConfirmDialog({
+    required this.item,
+    required this.decision,
+  });
+
+  final LeaveRequestItem item;
+  final String decision;
+
+  @override
+  State<_LeaveDecisionConfirmDialog> createState() =>
+      _LeaveDecisionConfirmDialogState();
+}
+
+class _LeaveDecisionConfirmDialogState
+    extends State<_LeaveDecisionConfirmDialog> {
+  final _noteController = TextEditingController();
+
+  @override
+  void dispose() {
+    _noteController.dispose();
+    super.dispose();
+  }
+
+  void _confirm() {
+    final trimmed = _noteController.text.trim();
+    Navigator.of(context).pop(
+      _LeaveDecisionConfirmation(note: trimmed.isEmpty ? null : trimmed),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isApprove = widget.decision == 'approved';
+    final typeLabel = widget.item.requestType == 'sick' ? 'SAKIT' : 'IZIN';
+    final dateRangeText = widget.item.startDate == widget.item.endDate
+        ? AppFormatters.formatIndonesianDate(widget.item.startDate)
+        : '${AppFormatters.formatIndonesianDate(widget.item.startDate)} – ${AppFormatters.formatIndonesianDate(widget.item.endDate)}';
+
+    return AlertDialog(
+      title: Text(
+        isApprove ? 'Setujui Pengajuan $typeLabel?' : 'Tolak Pengajuan $typeLabel?',
+      ),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              isApprove
+                  ? 'Pengajuan $typeLabel untuk ${widget.item.studentName} (${widget.item.className}) pada $dateRangeText akan disetujui, presensi akan disinkronkan otomatis, dan orang tua akan dikabari lewat WhatsApp.'
+                  : 'Pengajuan $typeLabel untuk ${widget.item.studentName} (${widget.item.className}) pada $dateRangeText akan ditolak dan orang tua akan dikabari lewat WhatsApp.',
+              style: const TextStyle(fontSize: 13, color: AppColors.textSecondary),
+            ),
+            const SizedBox(height: 14),
+            TextField(
+              key: const Key('leave_verification_note_field'),
+              controller: _noteController,
+              maxLength: 500,
+              maxLines: 3,
+              minLines: 2,
+              decoration: const InputDecoration(
+                labelText: 'Catatan guru untuk orang tua (opsional)',
+                hintText: 'Contoh: Semoga lekas sembuh / mohon lampirkan surat dokter',
+                alignLabelWithHint: true,
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Batal'),
+        ),
+        ElevatedButton(
+          key: const Key('leave_confirm_decision_button'),
+          style: ElevatedButton.styleFrom(
+            backgroundColor: isApprove ? AppColors.success : AppColors.danger,
+          ),
+          onPressed: _confirm,
+          child: Text(isApprove ? 'Ya, Setujui' : 'Ya, Tolak'),
+        ),
+      ],
     );
   }
 }
@@ -449,14 +610,14 @@ class _TabLabelWithCount extends StatelessWidget {
 class _LeaveRequestCard extends StatelessWidget {
   const _LeaveRequestCard({
     required this.item,
-    required this.isProcessing,
+    required this.processingDecision,
     required this.onApprove,
     required this.onReject,
     this.onTapAttachment,
   });
 
   final LeaveRequestItem item;
-  final bool isProcessing;
+  final String? processingDecision;
   final VoidCallback onApprove;
   final VoidCallback onReject;
   final VoidCallback? onTapAttachment;
@@ -467,6 +628,9 @@ class _LeaveRequestCard extends StatelessWidget {
     final typeLabel = isSick ? 'SAKIT' : 'IZIN';
     final typeFg = isSick ? AppColors.warning : AppColors.primary;
     final typeBg = isSick ? AppColors.warningTint : AppColors.primaryTint;
+    final isProcessing = processingDecision != null;
+    final isRejecting = processingDecision == 'rejected';
+    final isApproving = processingDecision == 'approved';
 
     final dateRangeText = item.startDate == item.endDate
         ? AppFormatters.formatIndonesianDate(item.startDate)
@@ -586,6 +750,26 @@ class _LeaveRequestCard extends StatelessWidget {
               ),
             ],
           ),
+          const SizedBox(height: 4),
+          Row(
+            children: [
+              const Icon(
+                Icons.schedule_rounded,
+                size: 14,
+                color: AppColors.textMuted,
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  'Diajukan ${AppFormatters.formatWibDateTime(item.createdAt)}',
+                  style: const TextStyle(
+                    fontSize: 11.5,
+                    color: AppColors.textMuted,
+                  ),
+                ),
+              ),
+            ],
+          ),
           const SizedBox(height: 10),
           Container(
             width: double.infinity,
@@ -653,7 +837,16 @@ class _LeaveRequestCard extends StatelessWidget {
                       side: const BorderSide(color: AppColors.danger),
                     ),
                     onPressed: isProcessing ? null : onReject,
-                    icon: const Icon(Icons.close_rounded, size: 18),
+                    icon: isRejecting
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: AppColors.danger,
+                            ),
+                          )
+                        : const Icon(Icons.close_rounded, size: 18),
                     label: const Text('Tolak'),
                   ),
                 ),
@@ -665,7 +858,7 @@ class _LeaveRequestCard extends StatelessWidget {
                       backgroundColor: AppColors.success,
                     ),
                     onPressed: isProcessing ? null : onApprove,
-                    icon: isProcessing
+                    icon: isApproving
                         ? const SizedBox(
                             width: 16,
                             height: 16,
@@ -692,38 +885,64 @@ class _LeaveRequestCard extends StatelessWidget {
     final badgeFg = isApproved ? AppColors.success : AppColors.danger;
     final badgeBg = isApproved ? AppColors.successTint : AppColors.dangerTint;
     final badgeLabel = isApproved ? 'DISETUJUI' : 'DITOLAK';
+    final note = item.verificationNote?.trim();
 
-    return Row(
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-          decoration: BoxDecoration(
-            color: badgeBg,
-            borderRadius: BorderRadius.circular(999),
-          ),
-          child: Text(
-            badgeLabel,
-            style: TextStyle(
-              fontSize: 11,
-              fontWeight: FontWeight.w800,
-              color: badgeFg,
+        Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: badgeBg,
+                borderRadius: BorderRadius.circular(999),
+              ),
+              child: Text(
+                badgeLabel,
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w800,
+                  color: badgeFg,
+                ),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                item.verifiedByName != null
+                    ? 'Oleh ${item.verifiedByName} • ${AppFormatters.formatWibDateTime(item.verifiedAt)}'
+                    : AppFormatters.formatWibDateTime(item.verifiedAt),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 11.5,
+                  color: AppColors.textSecondary,
+                ),
+              ),
+            ),
+          ],
+        ),
+        if (note != null && note.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            decoration: BoxDecoration(
+              color: AppColors.background,
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: AppColors.border),
+            ),
+            child: Text(
+              'Catatan guru: $note',
+              style: const TextStyle(
+                fontSize: 12,
+                color: AppColors.textSecondary,
+                fontStyle: FontStyle.italic,
+              ),
             ),
           ),
-        ),
-        const SizedBox(width: 10),
-        Expanded(
-          child: Text(
-            item.verifiedByName != null
-                ? 'Oleh ${item.verifiedByName} • ${AppFormatters.formatWibDateTime(item.verifiedAt)}'
-                : AppFormatters.formatWibDateTime(item.verifiedAt),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(
-              fontSize: 11.5,
-              color: AppColors.textSecondary,
-            ),
-          ),
-        ),
+        ],
       ],
     );
   }

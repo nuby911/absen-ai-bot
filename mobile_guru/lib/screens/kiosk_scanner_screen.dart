@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
@@ -12,6 +13,99 @@ import '../core/theme.dart';
 import '../models/models.dart';
 import '../services/liveness_detector.dart';
 import '../widgets/kiosk_pin_sheet.dart';
+import '../widgets/manual_attendance_dialog.dart';
+
+/// Mengonversi 3-plane Android `YUV_420_888` (format raw `35`) menjadi buffer
+/// `NV21` (Y diikuti VU interleaved) dengan menghormati `bytesPerRow` dan `bytesPerPixel`.
+@visibleForTesting
+Uint8List convertYuv420ToNv21({
+  required int width,
+  required int height,
+  required Uint8List yBytes,
+  required int yRowStride,
+  required int yPixelStride,
+  required Uint8List uBytes,
+  required int uRowStride,
+  required int uPixelStride,
+  required Uint8List vBytes,
+  required int vRowStride,
+  required int vPixelStride,
+}) {
+  final ySize = width * height;
+  final uvWidth = width ~/ 2;
+  final uvHeight = height ~/ 2;
+  final nv21 = Uint8List(ySize + uvWidth * uvHeight * 2);
+
+  for (var row = 0; row < height; row++) {
+    final dstRowStart = row * width;
+    final srcRowStart = row * yRowStride;
+    if (yPixelStride == 1 && srcRowStart + width <= yBytes.length) {
+      nv21.setRange(dstRowStart, dstRowStart + width, yBytes, srcRowStart);
+    } else {
+      for (var col = 0; col < width; col++) {
+        final srcIdx = srcRowStart + col * yPixelStride;
+        if (srcIdx < yBytes.length) {
+          nv21[dstRowStart + col] = yBytes[srcIdx];
+        }
+      }
+    }
+  }
+
+  var outIdx = ySize;
+  for (var row = 0; row < uvHeight; row++) {
+    final uRowStart = row * uRowStride;
+    final vRowStart = row * vRowStride;
+    for (var col = 0; col < uvWidth; col++) {
+      final vIdx = vRowStart + col * vPixelStride;
+      final uIdx = uRowStart + col * uPixelStride;
+      nv21[outIdx++] = vIdx < vBytes.length ? vBytes[vIdx] : 128;
+      nv21[outIdx++] = uIdx < uBytes.length ? uBytes[uIdx] : 128;
+    }
+  }
+
+  return nv21;
+}
+
+/// Menghitung rata-rata kecerahan (`0–255`) dari plane Y (atau BGRA pada iOS) secara sampling.
+@visibleForTesting
+double? computeSampledMeanLuma({
+  required Uint8List bytes,
+  required int width,
+  required int height,
+  required int bytesPerRow,
+  int bytesPerPixel = 1,
+  bool isBgra = false,
+  int step = 8,
+}) {
+  if (bytes.isEmpty || width <= 0 || height <= 0 || bytesPerRow <= 0) {
+    return null;
+  }
+  final effectiveStep = step < 1 ? 1 : step;
+  final pixelStride = bytesPerPixel < 1 ? (isBgra ? 4 : 1) : bytesPerPixel;
+  double sum = 0;
+  var count = 0;
+
+  for (var row = 0; row < height; row += effectiveStep) {
+    final rowOffset = row * bytesPerRow;
+    for (var col = 0; col < width; col += effectiveStep) {
+      final idx = rowOffset + col * pixelStride;
+      if (isBgra) {
+        if (idx + 2 >= bytes.length) break;
+        final b = bytes[idx];
+        final g = bytes[idx + 1];
+        final r = bytes[idx + 2];
+        sum += 0.114 * b + 0.587 * g + 0.299 * r;
+      } else {
+        if (idx >= bytes.length) break;
+        sum += bytes[idx];
+      }
+      count += 1;
+    }
+  }
+
+  if (count == 0) return null;
+  return sum / count;
+}
 
 /// Layar 04 & 05 Figma: Mode Kiosk Hands-Free (Live Kamera, Liveness Kedip, & Overlay Konfirmasi).
 class KioskScannerScreen extends StatefulWidget {
@@ -48,7 +142,12 @@ class KioskScannerScreen extends StatefulWidget {
   State<KioskScannerScreen> createState() => _KioskScannerScreenState();
 }
 
-class _KioskScannerScreenState extends State<KioskScannerScreen> {
+class _KioskScannerScreenState extends State<KioskScannerScreen>
+    with WidgetsBindingObserver {
+  static const int _androidYuv420888Raw = 35;
+  static const int _androidNv21Raw = 17;
+  static const int _maxConsecutiveFrameErrors = 5;
+
   static const Map<DeviceOrientation, int> _deviceOrientations = {
     DeviceOrientation.portraitUp: 0,
     DeviceOrientation.landscapeLeft: 90,
@@ -62,11 +161,20 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
   StreamSubscription<FaceSample?>? _sampleSubscription;
   Timer? _resetTimer;
 
+  List<CameraDescription> _availableCameras = const [];
+  CameraLensDirection _currentLensDirection = CameraLensDirection.front;
+
   bool _isInitializingCamera = false;
+  bool _isSwitchingCamera = false;
+  bool _wasPausedForLifecycle = false;
   String? _cameraError;
+  String? _frameErrorBanner;
+  int _consecutiveFrameErrors = 0;
+
   bool _isDetectingFrame = false;
   bool _isSubmittingScan = false;
   bool _isPinSheetOpen = false;
+  bool _sessionClosed = false;
 
   late int _recordedCount;
   ScanResult? _overlayResult;
@@ -77,123 +185,234 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
     shouldCapture: false,
   );
 
+  bool get _shouldUseHardwareCamera =>
+      widget.enableHardwareCamera &&
+      widget.sampleStream == null &&
+      widget.previewBuilder == null;
+
+  String get _activeCameraLabel =>
+      _currentLensDirection == CameraLensDirection.front
+          ? 'kamera depan'
+          : 'kamera belakang';
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _livenessDetector = widget.livenessDetector ?? BlinkLivenessDetector();
     _recordedCount = widget.session.summary.recordedCount;
+
+    unawaited(
+      SystemChrome.setPreferredOrientations(const [
+        DeviceOrientation.portraitUp,
+      ]).catchError((_) {}),
+    );
 
     if (widget.sampleStream != null) {
       _sampleSubscription = widget.sampleStream!.listen(_handleFaceSample);
     }
 
-    final shouldUseHardwareCamera = widget.enableHardwareCamera &&
-        widget.sampleStream == null &&
-        widget.previewBuilder == null;
-    if (shouldUseHardwareCamera) {
+    if (_shouldUseHardwareCamera) {
       _initializeHardwarePipeline();
     }
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (!_shouldUseHardwareCamera) return;
+
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused) {
+      _resetTimer?.cancel();
+      _wasPausedForLifecycle = true;
+      unawaited(_stopCameraSafely(closeDetector: true));
+    } else if (state == AppLifecycleState.resumed) {
+      if (_wasPausedForLifecycle && !_sessionClosed && !_isPinSheetOpen) {
+        _wasPausedForLifecycle = false;
+        unawaited(
+          _initializeHardwarePipeline(preferredDirection: _currentLensDirection),
+        );
+      }
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _resetTimer?.cancel();
     _sampleSubscription?.cancel();
-    _stopCameraSafely();
-    _faceDetector?.close();
+    unawaited(_stopCameraSafely(closeDetector: true));
+    unawaited(
+      SystemChrome.setPreferredOrientations(const []).catchError((_) {}),
+    );
     super.dispose();
   }
 
-  Future<void> _stopCameraSafely() async {
+  Future<void> _stopCameraSafely({bool closeDetector = false}) async {
     final controller = _cameraController;
     _cameraController = null;
-    if (controller == null) return;
-    try {
-      if (controller.value.isStreamingImages) {
-        await controller.stopImageStream();
+    if (controller != null) {
+      try {
+        if (controller.value.isStreamingImages) {
+          await controller.stopImageStream();
+        }
+      } catch (_) {
+        // Abaikan error saat penghentian stream pada teardown.
       }
-    } catch (_) {
-      // Abaikan error saat penghentian stream pada teardown.
+      try {
+        await controller.dispose();
+      } catch (_) {
+        // Abaikan error saat dispose controller.
+      }
     }
-    try {
-      await controller.dispose();
-    } catch (_) {
-      // Abaikan error saat dispose controller.
+    if (closeDetector) {
+      final detector = _faceDetector;
+      _faceDetector = null;
+      if (detector != null) {
+        try {
+          await detector.close();
+        } catch (_) {
+          // Abaikan error saat menutup detector.
+        }
+      }
     }
   }
 
-  Future<void> _initializeHardwarePipeline() async {
+  Future<void> _initializeHardwarePipeline({
+    CameraLensDirection? preferredDirection,
+  }) async {
+    if (!mounted || _sessionClosed) return;
+
+    await _stopCameraSafely(closeDetector: true);
+    if (!mounted || _sessionClosed) return;
+
+    final targetDirection = preferredDirection ?? _currentLensDirection;
     setState(() {
+      _currentLensDirection = targetDirection;
       _isInitializingCamera = true;
       _cameraError = null;
+      _frameErrorBanner = null;
+      _consecutiveFrameErrors = 0;
     });
+
+    CameraController? localController;
+    FaceDetector? localDetector;
 
     try {
       final cameras = await availableCameras();
       if (cameras.isEmpty) {
         if (!mounted) return;
         setState(() {
+          _availableCameras = const [];
           _isInitializingCamera = false;
           _cameraError = 'Tidak ada kamera yang terdeteksi pada perangkat ini.';
         });
         return;
       }
 
-      final frontCamera = cameras.firstWhere(
-        (cam) => cam.lensDirection == CameraLensDirection.front,
-        orElse: () => cameras.first,
+      _availableCameras = cameras;
+      final selectedCamera = cameras.firstWhere(
+        (cam) => cam.lensDirection == targetDirection,
+        orElse: () => cameras.firstWhere(
+          (cam) => cam.lensDirection == CameraLensDirection.front,
+          orElse: () => cameras.first,
+        ),
       );
+      _currentLensDirection = selectedCamera.lensDirection;
 
       final imageFormat = defaultTargetPlatform == TargetPlatform.android
           ? ImageFormatGroup.nv21
           : ImageFormatGroup.bgra8888;
 
-      final controller = CameraController(
-        frontCamera,
+      localController = CameraController(
+        selectedCamera,
         ResolutionPreset.medium,
         enableAudio: false,
         imageFormatGroup: imageFormat,
       );
-      await controller.initialize();
+      await localController.initialize();
+      try {
+        await localController.lockCaptureOrientation(DeviceOrientation.portraitUp);
+      } catch (_) {
+        // Beberapa perangkat tidak mendukung lockCaptureOrientation.
+      }
 
-      final detector = FaceDetector(
+      localDetector = FaceDetector(
         options: FaceDetectorOptions(
           enableClassification: true,
           enableTracking: true,
-          performanceMode: FaceDetectorMode.fast,
-          minFaceSize: 0.2,
+          performanceMode: FaceDetectorMode.accurate,
+          minFaceSize: 0.15,
         ),
       );
 
-      if (!mounted) {
-        await controller.dispose();
-        await detector.close();
+      if (!mounted || _sessionClosed) {
+        await localController.dispose();
+        await localDetector.close();
         return;
       }
 
-      _cameraController = controller;
-      _faceDetector = detector;
+      _cameraController = localController;
+      _faceDetector = localDetector;
 
-      await controller.startImageStream(_processCameraImage);
+      await localController.startImageStream(_processCameraImage);
 
       if (!mounted) return;
       setState(() {
         _isInitializingCamera = false;
+        _isSwitchingCamera = false;
       });
     } catch (exc) {
+      if (localController != null && _cameraController != localController) {
+        try {
+          if (localController.value.isStreamingImages) {
+            await localController.stopImageStream();
+          }
+        } catch (_) {}
+        try {
+          await localController.dispose();
+        } catch (_) {}
+      }
+      if (localDetector != null && _faceDetector != localDetector) {
+        try {
+          await localDetector.close();
+        } catch (_) {}
+      }
       if (!mounted) return;
       setState(() {
         _isInitializingCamera = false;
+        _isSwitchingCamera = false;
         _cameraError =
-            'Gagal mengaktifkan kamera depan atau izin kamera ditolak ($exc).';
+            'Gagal mengaktifkan $_activeCameraLabel atau izin kamera ditolak ($exc).';
       });
     }
+  }
+
+  Future<void> _toggleCameraDirection() async {
+    if (_availableCameras.length < 2 ||
+        _isInitializingCamera ||
+        _isSwitchingCamera ||
+        _isSubmittingScan ||
+        _sessionClosed) {
+      return;
+    }
+
+    final nextDirection = _currentLensDirection == CameraLensDirection.front
+        ? CameraLensDirection.back
+        : CameraLensDirection.front;
+
+    setState(() {
+      _isSwitchingCamera = true;
+    });
+    _livenessDetector.reset();
+    await _initializeHardwarePipeline(preferredDirection: nextDirection);
   }
 
   Future<void> _processCameraImage(CameraImage image) async {
     if (_isDetectingFrame ||
         _isSubmittingScan ||
         _isPinSheetOpen ||
+        _sessionClosed ||
         _overlayResult != null ||
         _scanError != null) {
       return;
@@ -206,41 +425,112 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
     }
 
     _isDetectingFrame = true;
+    FaceSample? extractedSample;
+    var hasProcessedFrame = false;
+
     try {
-      final inputImage = _buildInputImage(image, controller);
-      if (inputImage == null) return;
-
-      final faces = await detector.processImage(inputImage);
-      if (!mounted) return;
-
-      if (faces.isEmpty) {
-        _handleFaceSample(null);
+      final prepared = _buildInputImage(image, controller);
+      if (prepared == null) {
+        _recordFrameError('Format frame kamera tidak dikenali.');
         return;
       }
 
-      final primaryFace = faces.reduce((a, b) {
-        final areaA = a.boundingBox.width * a.boundingBox.height;
-        final areaB = b.boundingBox.width * b.boundingBox.height;
-        return areaA >= areaB ? a : b;
-      });
+      final faces = await detector.processImage(prepared.inputImage);
+      if (!mounted) return;
 
-      _handleFaceSample(
-        FaceSample(
+      hasProcessedFrame = true;
+      if (_consecutiveFrameErrors > 0 || _frameErrorBanner != null) {
+        setState(() {
+          _consecutiveFrameErrors = 0;
+          _frameErrorBanner = null;
+        });
+      }
+
+      if (faces.isEmpty) {
+        extractedSample = null;
+      } else {
+        final primaryFace = faces.reduce((a, b) {
+          final areaA = a.boundingBox.width * a.boundingBox.height;
+          final areaB = b.boundingBox.width * b.boundingBox.height;
+          return areaA >= areaB ? a : b;
+        });
+
+        final isRotated =
+            prepared.rotation == InputImageRotation.rotation90deg ||
+            prepared.rotation == InputImageRotation.rotation270deg;
+        final uprightWidth = (isRotated ? image.height : image.width).toDouble();
+        final uprightHeight = (isRotated ? image.width : image.height).toDouble();
+
+        final box = primaryFace.boundingBox;
+        final faceWidthRatio =
+            uprightWidth > 0 ? box.width / uprightWidth : null;
+        final centerX =
+            uprightWidth > 0 ? box.center.dx / uprightWidth : 0.5;
+        final centerY =
+            uprightHeight > 0 ? box.center.dy / uprightHeight : 0.5;
+        final isCentered =
+            centerX >= 0.20 &&
+            centerX <= 0.80 &&
+            centerY >= 0.18 &&
+            centerY <= 0.82;
+
+        final meanLuma = _computeFrameMeanLuma(image);
+
+        extractedSample = FaceSample(
           leftEyeOpenProbability: primaryFace.leftEyeOpenProbability,
           rightEyeOpenProbability: primaryFace.rightEyeOpenProbability,
           headEulerAngleY: primaryFace.headEulerAngleY,
           headEulerAngleZ: primaryFace.headEulerAngleZ,
           timestamp: DateTime.now(),
-        ),
+          faceCount: faces.length,
+          faceWidthRatio: faceWidthRatio,
+          isCentered: isCentered,
+          meanLuma: meanLuma,
+        );
+      }
+    } catch (exc, stack) {
+      debugPrint(
+        'Kiosk frame processing error (#${_consecutiveFrameErrors + 1}): $exc\n$stack',
       );
-    } catch (_) {
-      // Abaikan frame yang gagal diproses agar stream kamera tetap berjalan stabil.
+      _recordFrameError('Gangguan membaca frame kamera/ML Kit ($exc).');
     } finally {
       _isDetectingFrame = false;
     }
+
+    if (hasProcessedFrame && mounted) {
+      _handleFaceSample(extractedSample);
+    }
   }
 
-  InputImage? _buildInputImage(CameraImage image, CameraController controller) {
+  void _recordFrameError(String reason) {
+    _consecutiveFrameErrors += 1;
+    if (_consecutiveFrameErrors >= _maxConsecutiveFrameErrors && mounted) {
+      setState(() {
+        _frameErrorBanner =
+            'Pemrosesan kamera mengalami gangguan berulang. Ketuk Coba Ulang untuk memuat ulang kamera.';
+      });
+      debugPrint('Kiosk frame error banner activated: $reason');
+    }
+  }
+
+  double? _computeFrameMeanLuma(CameraImage image) {
+    if (image.planes.isEmpty) return null;
+    final plane0 = image.planes.first;
+    final isBgra = defaultTargetPlatform == TargetPlatform.iOS;
+    return computeSampledMeanLuma(
+      bytes: plane0.bytes,
+      width: image.width,
+      height: image.height,
+      bytesPerRow: plane0.bytesPerRow,
+      bytesPerPixel: plane0.bytesPerPixel ?? (isBgra ? 4 : 1),
+      isBgra: isBgra,
+    );
+  }
+
+  ({InputImage inputImage, InputImageRotation rotation})? _buildInputImage(
+    CameraImage image,
+    CameraController controller,
+  ) {
     final camera = controller.description;
     InputImageRotation? rotation;
 
@@ -248,8 +538,7 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
       rotation = InputImageRotationValue.fromRawValue(camera.sensorOrientation);
     } else if (defaultTargetPlatform == TargetPlatform.android) {
       var rotationCompensation =
-          _deviceOrientations[controller.value.deviceOrientation];
-      if (rotationCompensation == null) return null;
+          _deviceOrientations[controller.value.deviceOrientation] ?? 0;
       if (camera.lensDirection == CameraLensDirection.front) {
         rotationCompensation =
             (camera.sensorOrientation + rotationCompensation) % 360;
@@ -260,12 +549,56 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
       rotation = InputImageRotationValue.fromRawValue(rotationCompensation);
     }
 
-    if (rotation == null) return null;
+    if (rotation == null || image.planes.isEmpty) return null;
+
+    if (image.format.raw == _androidYuv420888Raw && image.planes.length == 3) {
+      final yPlane = image.planes[0];
+      final uPlane = image.planes[1];
+      final vPlane = image.planes[2];
+      final nv21Bytes = convertYuv420ToNv21(
+        width: image.width,
+        height: image.height,
+        yBytes: yPlane.bytes,
+        yRowStride: yPlane.bytesPerRow,
+        yPixelStride: yPlane.bytesPerPixel ?? 1,
+        uBytes: uPlane.bytes,
+        uRowStride: uPlane.bytesPerRow,
+        uPixelStride: uPlane.bytesPerPixel ?? 1,
+        vBytes: vPlane.bytes,
+        vRowStride: vPlane.bytesPerRow,
+        vPixelStride: vPlane.bytesPerPixel ?? 1,
+      );
+      return (
+        inputImage: InputImage.fromBytes(
+          bytes: nv21Bytes,
+          metadata: InputImageMetadata(
+            size: Size(image.width.toDouble(), image.height.toDouble()),
+            rotation: rotation,
+            format: InputImageFormat.nv21,
+            bytesPerRow: image.width,
+          ),
+        ),
+        rotation: rotation,
+      );
+    }
+
+    if (image.format.raw == _androidNv21Raw && image.planes.length == 1) {
+      return (
+        inputImage: InputImage.fromBytes(
+          bytes: image.planes.first.bytes,
+          metadata: InputImageMetadata(
+            size: Size(image.width.toDouble(), image.height.toDouble()),
+            rotation: rotation,
+            format: InputImageFormat.nv21,
+            bytesPerRow: image.planes.first.bytesPerRow,
+          ),
+        ),
+        rotation: rotation,
+      );
+    }
 
     final format = InputImageFormatValue.fromRawValue(image.format.raw);
     if (format == null) return null;
-
-    if (image.planes.isEmpty) return null;
 
     final Uint8List bytes;
     if (image.planes.length == 1) {
@@ -278,14 +611,17 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
       bytes = buffer.done().buffer.asUint8List();
     }
 
-    return InputImage.fromBytes(
-      bytes: bytes,
-      metadata: InputImageMetadata(
-        size: Size(image.width.toDouble(), image.height.toDouble()),
-        rotation: rotation,
-        format: format,
-        bytesPerRow: image.planes.first.bytesPerRow,
+    return (
+      inputImage: InputImage.fromBytes(
+        bytes: bytes,
+        metadata: InputImageMetadata(
+          size: Size(image.width.toDouble(), image.height.toDouble()),
+          rotation: rotation,
+          format: format,
+          bytesPerRow: image.planes.first.bytesPerRow,
+        ),
       ),
+      rotation: rotation,
     );
   }
 
@@ -293,6 +629,7 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
     if (!mounted ||
         _isSubmittingScan ||
         _isPinSheetOpen ||
+        _sessionClosed ||
         _overlayResult != null ||
         _scanError != null) {
       return;
@@ -313,7 +650,7 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
   }
 
   Future<void> _captureAndSubmitScan() async {
-    if (_isSubmittingScan || !mounted) return;
+    if (_isSubmittingScan || _sessionClosed || !mounted) return;
 
     setState(() {
       _isSubmittingScan = true;
@@ -332,11 +669,27 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
             message: 'Kamera belum siap untuk mengambil gambar wajah.',
           );
         }
-        if (controller.value.isStreamingImages) {
-          await controller.stopImageStream();
+        XFile? captured;
+        try {
+          if (controller.value.isStreamingImages) {
+            await controller.stopImageStream();
+          }
+          captured = await controller.takePicture().timeout(
+                const Duration(seconds: 8),
+              );
+          imageBytes = await captured.readAsBytes();
+        } finally {
+          if (captured != null) {
+            try {
+              final tempFile = File(captured.path);
+              if (await tempFile.exists()) {
+                await tempFile.delete();
+              }
+            } catch (_) {
+              // Abaikan error pembersihan berkas temporer.
+            }
+          }
         }
-        final captured = await controller.takePicture();
-        imageBytes = await captured.readAsBytes();
       }
 
       final result = await widget.apiClient.scanKioskFace(
@@ -361,9 +714,30 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
       _scheduleAutoReset();
     } on ApiException catch (exc) {
       if (!mounted) return;
+      final isSessionClosedError = exc.statusCode == 400 &&
+          !exc.message.toLowerCase().contains('liveness');
+      if (isSessionClosedError) {
+        _resetTimer?.cancel();
+        unawaited(_stopCameraSafely());
+        setState(() {
+          _sessionClosed = true;
+          _isSubmittingScan = false;
+          _overlayResult = null;
+          _scanError = null;
+        });
+        return;
+      }
       _livenessDetector.markScanCompleted(DateTime.now());
       setState(() {
         _scanError = exc.message;
+        _isSubmittingScan = false;
+      });
+      _scheduleAutoReset();
+    } on TimeoutException {
+      if (!mounted) return;
+      _livenessDetector.markScanCompleted(DateTime.now());
+      setState(() {
+        _scanError = 'Pengambilan foto kamera terlalu lama. Mencoba ulang...';
         _isSubmittingScan = false;
       });
       _scheduleAutoReset();
@@ -388,12 +762,13 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
   }
 
   void _scheduleAutoReset() {
+    if (_sessionClosed) return;
     _resetTimer?.cancel();
     _resetTimer = Timer(widget.autoResetDuration, _resetForNextStudent);
   }
 
   Future<void> _resetForNextStudent() async {
-    if (!mounted) return;
+    if (!mounted || _sessionClosed) return;
     _livenessDetector.reset();
     setState(() {
       _overlayResult = null;
@@ -408,11 +783,16 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
   }
 
   Future<void> _resumeCameraStreamIfNeeded() async {
-    final controller = _cameraController;
     if (!mounted ||
-        controller == null ||
-        !controller.value.isInitialized ||
-        _isPinSheetOpen) {
+        _isSubmittingScan ||
+        _overlayResult != null ||
+        _scanError != null ||
+        _isPinSheetOpen ||
+        _sessionClosed) {
+      return;
+    }
+    final controller = _cameraController;
+    if (controller == null || !controller.value.isInitialized) {
       return;
     }
     if (!controller.value.isStreamingImages) {
@@ -437,42 +817,169 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
       } catch (_) {}
     }
 
-    if (!mounted) return;
-    final verifiedPin = await KioskPinSheet.show(
+    if (!mounted) {
+      _isPinSheetOpen = false;
+      return;
+    }
+
+    final result = await KioskPinSheet.showWithAction(
       context,
       title: 'Masukkan PIN Kiosk Guru',
-      subtitle:
-          'Mode Kiosk terkunci. Masukkan PIN Guru untuk kembali ke Detail Sesi.',
+      subtitle: _sessionClosed
+          ? 'Sesi telah ditutup. Masukkan PIN Guru untuk keluar dari Mode Kiosk.'
+          : 'Mode Kiosk terkunci. Masukkan PIN Guru untuk keluar atau mencatat absen manual.',
       confirmLabel: 'Buka Kunci & Keluar Kiosk',
+      secondaryActionLabel: _sessionClosed ? null : 'Absen Manual',
       cancelLabel: 'Batal — Kembali ke Pemindaian Wajah',
       onVerify: widget.verifyPinCallback ?? widget.apiClient.verifyKioskPin,
     );
 
-    _isPinSheetOpen = false;
-    if (!mounted) return;
+    if (!mounted) {
+      _isPinSheetOpen = false;
+      return;
+    }
 
-    if (verifiedPin != null && verifiedPin.isNotEmpty) {
+    if (result != null && result.pin.isNotEmpty) {
+      if (result.action == KioskPinAction.secondary && !_sessionClosed) {
+        await _openManualAttendanceWithPin(result.pin);
+        _isPinSheetOpen = false;
+        await _resumeCameraStreamIfNeeded();
+        return;
+      }
+
+      _isPinSheetOpen = false;
       _resetTimer?.cancel();
       Navigator.of(context).pop();
       return;
     }
 
+    _isPinSheetOpen = false;
     await _resumeCameraStreamIfNeeded();
   }
 
+  Future<void> _openManualAttendanceWithPin(String verifiedPin) async {
+    List<StudentAttendanceItem> candidates;
+    SessionDetail activeDetail = widget.session;
+    try {
+      activeDetail = await widget.apiClient.getSessionDetail(widget.session.id);
+    } catch (_) {
+      activeDetail = widget.session;
+    }
+
+    try {
+      candidates = await loadManualAttendanceCandidates(
+        widget.apiClient,
+        activeDetail,
+      );
+    } on ApiException catch (exc) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(exc.message), backgroundColor: AppColors.danger),
+      );
+      return;
+    } catch (exc) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Gagal memuat daftar siswa: $exc'),
+          backgroundColor: AppColors.danger,
+        ),
+      );
+      return;
+    }
+
+    if (!mounted) return;
+    if (candidates.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Belum ada data siswa aktif untuk input manual.'),
+          backgroundColor: AppColors.danger,
+        ),
+      );
+      return;
+    }
+
+    final selection = await showDialog<ManualAttendanceSelection>(
+      context: context,
+      builder: (_) => ManualAttendanceDialog(
+        students: candidates,
+        isGeneralGate: activeDetail.classId == null,
+      ),
+    );
+
+    if (selection == null || !mounted) return;
+
+    final previousItem = candidates.firstWhere(
+      (s) => s.studentId == selection.studentId,
+      orElse: () => candidates.first,
+    );
+
+    try {
+      final manualResult = await widget.apiClient.submitManualAttendance(
+        sessionId: widget.session.id,
+        studentId: selection.studentId,
+        status: selection.status,
+        kioskPin: verifiedPin,
+        notifyWa: selection.notifyWa,
+      );
+      if (!mounted) return;
+      if (previousItem.status == 'unrecorded') {
+        setState(() => _recordedCount += 1);
+      }
+      widget.onAttendanceRecorded?.call();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(manualResult.message),
+          backgroundColor: AppColors.success,
+        ),
+      );
+    } on ApiException catch (exc) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(exc.message), backgroundColor: AppColors.danger),
+      );
+    } catch (exc) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Gagal menyimpan presensi manual: $exc'),
+          backgroundColor: AppColors.danger,
+        ),
+      );
+    }
+  }
+
   Color _ovalBorderColor() {
+    if (_sessionClosed) return AppColors.danger;
     final result = _overlayResult;
     if (result != null) {
       if (result.matched) return AppColors.success;
       return AppColors.warning;
     }
-    if (_scanError != null || _decision.status == LivenessStatus.poseInvalid) {
+    if (_scanError != null || _frameErrorBanner != null) {
       return AppColors.warning;
     }
-    return AppColors.kioskCyan;
+    switch (_decision.status) {
+      case LivenessStatus.multipleFaces:
+      case LivenessStatus.tooFar:
+      case LivenessStatus.tooClose:
+      case LivenessStatus.poorLighting:
+      case LivenessStatus.poseInvalid:
+        return AppColors.warning;
+      case LivenessStatus.noFace:
+      case LivenessStatus.waitingOpen:
+      case LivenessStatus.waitingBlink:
+      case LivenessStatus.blinkDetectedWaitingReopen:
+      case LivenessStatus.passed:
+      case LivenessStatus.cooldown:
+        return AppColors.kioskCyan;
+    }
   }
 
   String _positionPillText() {
+    if (_sessionClosed) {
+      return 'Sesi Telah Ditutup';
+    }
     if (_overlayResult != null && _overlayResult!.matched) {
       return 'Wajah Teridentifikasi';
     }
@@ -482,6 +989,14 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
     switch (_decision.status) {
       case LivenessStatus.noFace:
         return 'Mencari Wajah di Kamera';
+      case LivenessStatus.multipleFaces:
+        return 'Terdeteksi Banyak Wajah';
+      case LivenessStatus.tooFar:
+        return 'Wajah Terlalu Jauh';
+      case LivenessStatus.tooClose:
+        return 'Wajah Terlalu Dekat';
+      case LivenessStatus.poorLighting:
+        return 'Cahaya Terlalu Gelap';
       case LivenessStatus.poseInvalid:
         return 'Jarak & Sudut Kurang Lurus';
       case LivenessStatus.waitingOpen:
@@ -524,7 +1039,7 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
                           fit: StackFit.expand,
                           children: [
                             _buildViewportContent(),
-                            _buildOvalGuide(ovalColor),
+                            if (!_sessionClosed) _buildOvalGuide(ovalColor),
                             Positioned(
                               top: 16,
                               left: 16,
@@ -558,8 +1073,10 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
 
   Widget _buildTopHud() {
     final total = widget.session.summary.totalStudents;
-    final progressLabel =
-        total > 0 ? '$_recordedCount/$total tercatat' : '$_recordedCount tercatat';
+    final isGeneralGate = widget.session.classId == null;
+    final progressLabel = (!isGeneralGate && total > 0)
+        ? '$_recordedCount/$total tercatat'
+        : '$_recordedCount tercatat';
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
@@ -568,23 +1085,29 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
             decoration: BoxDecoration(
-              color: AppColors.success.withValues(alpha: 0.16),
+              color: (_sessionClosed ? AppColors.danger : AppColors.success)
+                  .withValues(alpha: 0.16),
               borderRadius: BorderRadius.circular(999),
               border: Border.all(
-                color: AppColors.success.withValues(alpha: 0.45),
+                color: (_sessionClosed ? AppColors.danger : AppColors.success)
+                    .withValues(alpha: 0.45),
               ),
             ),
-            child: const Row(
+            child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Icon(Icons.circle, size: 8, color: AppColors.success),
-                SizedBox(width: 6),
+                Icon(
+                  Icons.circle,
+                  size: 8,
+                  color: _sessionClosed ? AppColors.danger : AppColors.success,
+                ),
+                const SizedBox(width: 6),
                 Text(
-                  'LIVE KIOSK',
+                  _sessionClosed ? 'SESI TUTUP' : 'LIVE KIOSK',
                   style: TextStyle(
                     fontSize: 11,
                     fontWeight: FontWeight.w800,
-                    color: AppColors.success,
+                    color: _sessionClosed ? AppColors.danger : AppColors.success,
                     letterSpacing: 0.4,
                   ),
                 ),
@@ -618,6 +1141,34 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
               ],
             ),
           ),
+          if (_availableCameras.length > 1 && !_sessionClosed) ...[
+            const SizedBox(width: 6),
+            Material(
+              color: AppColors.kioskViewport,
+              borderRadius: BorderRadius.circular(14),
+              child: InkWell(
+                key: const Key('kiosk_switch_camera_button'),
+                onTap: (_isInitializingCamera || _isSwitchingCamera)
+                    ? null
+                    : _toggleCameraDirection,
+                borderRadius: BorderRadius.circular(14),
+                child: Container(
+                  padding: const EdgeInsets.all(9),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(
+                      color: Colors.white.withValues(alpha: 0.18),
+                    ),
+                  ),
+                  child: const Icon(
+                    Icons.cameraswitch_rounded,
+                    size: 18,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+            ),
+          ],
           const SizedBox(width: 8),
           Material(
             color: AppColors.kioskViewport,
@@ -658,20 +1209,67 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
   }
 
   Widget _buildViewportContent() {
+    if (_sessionClosed) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: AppColors.danger.withValues(alpha: 0.16),
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(
+                  Icons.lock_clock_rounded,
+                  size: 48,
+                  color: AppColors.danger,
+                ),
+              ),
+              const SizedBox(height: 14),
+              const Text(
+                'Sesi Telah Ditutup',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 6),
+              const Text(
+                'Sesi presensi ini sudah ditutup oleh guru/admin. Pemindaian wajah dihentikan.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Color(0xFFCBD5E1), fontSize: 13.5),
+              ),
+              const SizedBox(height: 18),
+              ElevatedButton.icon(
+                key: const Key('kiosk_session_closed_exit_button'),
+                onPressed: _promptPinToExit,
+                icon: const Icon(Icons.lock_open_rounded),
+                label: const Text('Keluar Kiosk (PIN Guru)'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     if (widget.previewBuilder != null) {
       return widget.previewBuilder!(context);
     }
 
     if (_isInitializingCamera) {
-      return const Center(
+      return Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            CircularProgressIndicator(color: AppColors.kioskCyan),
-            SizedBox(height: 12),
+            const CircularProgressIndicator(color: AppColors.kioskCyan),
+            const SizedBox(height: 12),
             Text(
-              'Menyiapkan kamera depan Kiosk...',
-              style: TextStyle(color: Color(0xFFCBD5E1), fontSize: 13.5),
+              'Menyiapkan $_activeCameraLabel Kiosk...',
+              style: const TextStyle(color: Color(0xFFCBD5E1), fontSize: 13.5),
             ),
           ],
         ),
@@ -698,7 +1296,9 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
               ),
               const SizedBox(height: 14),
               ElevatedButton.icon(
-                onPressed: _initializeHardwarePipeline,
+                onPressed: () => _initializeHardwarePipeline(
+                  preferredDirection: _currentLensDirection,
+                ),
                 icon: const Icon(Icons.refresh_rounded),
                 label: const Text('Coba Aktifkan Kamera'),
               ),
@@ -756,6 +1356,51 @@ class _KioskScannerScreenState extends State<KioskScannerScreen> {
   }
 
   Widget _buildBottomFeedback(Color accentColor) {
+    if (_sessionClosed) {
+      return const _BannerMessageCard(
+        icon: Icons.lock_outline_rounded,
+        accentColor: AppColors.danger,
+        title: 'Sesi Telah Ditutup',
+        message: 'Masukkan PIN Guru untuk keluar dan melihat rekap sesi.',
+      );
+    }
+
+    if (_frameErrorBanner != null) {
+      return Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: AppColors.kioskBackground.withValues(alpha: 0.94),
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: AppColors.warning, width: 1.5),
+        ),
+        child: Row(
+          children: [
+            const Icon(Icons.error_outline_rounded, color: AppColors.warning),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                _frameErrorBanner!,
+                style: const TextStyle(color: Colors.white, fontSize: 12.5),
+              ),
+            ),
+            const SizedBox(width: 8),
+            TextButton(
+              onPressed: () {
+                setState(() {
+                  _consecutiveFrameErrors = 0;
+                  _frameErrorBanner = null;
+                });
+                _initializeHardwarePipeline(
+                  preferredDirection: _currentLensDirection,
+                );
+              },
+              child: const Text('Coba Ulang'),
+            ),
+          ],
+        ),
+      );
+    }
+
     if (_overlayResult != null) {
       return _buildOverlayResultCard(_overlayResult!);
     }

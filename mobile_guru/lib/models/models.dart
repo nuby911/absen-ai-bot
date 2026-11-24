@@ -1,8 +1,24 @@
-DateTime? _parseNullableDateTime(dynamic value) {
+final RegExp _isoDateTimePattern = RegExp(r'^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}');
+final RegExp _timezoneSuffixPattern = RegExp(r'(?:[zZ]|[+-]\d{2}:?\d{2})$');
+
+/// Mengurai timestamp ISO dari backend secara aman.
+/// String date-time tanpa penanda zona waktu (`Z` atau offset `±HH:MM`)
+/// diperlakukan sebagai UTC dengan menambahkan `'Z'` sebelum `DateTime.tryParse`
+/// agar konversi ke WIB (`UTC+7`) tidak meleset -7 jam.
+DateTime? parseNullableDateTime(dynamic value) {
   if (value == null) return null;
   if (value is DateTime) return value;
-  return DateTime.tryParse(value.toString());
+  final raw = value.toString().trim();
+  if (raw.isEmpty) return null;
+  var candidate = raw;
+  if (_isoDateTimePattern.hasMatch(candidate) &&
+      !_timezoneSuffixPattern.hasMatch(candidate)) {
+    candidate = '${candidate.replaceFirst(' ', 'T')}Z';
+  }
+  return DateTime.tryParse(candidate);
 }
+
+DateTime? _parseNullableDateTime(dynamic value) => parseNullableDateTime(value);
 
 DateTime _parseRequiredDateTime(dynamic value) {
   final parsed = _parseNullableDateTime(value);
@@ -103,6 +119,88 @@ class LoginResult {
       accessToken: json['access_token'] as String,
       tokenType: json['token_type'] as String? ?? 'bearer',
       user: UserProfile.fromJson(json['user'] as Map<String, dynamic>),
+    );
+  }
+}
+
+/// Hasil verifikasi PIN Kiosk (`VerifyPinResponse` di `backend/app/schemas.py`).
+class VerifyPinResult {
+  const VerifyPinResult({
+    required this.valid,
+    required this.hasKioskPin,
+  });
+
+  final bool valid;
+  final bool hasKioskPin;
+
+  factory VerifyPinResult.fromJson(Map<String, dynamic> json) {
+    return VerifyPinResult(
+      valid: json['valid'] as bool? ?? false,
+      hasKioskPin: json['has_kiosk_pin'] as bool? ?? true,
+    );
+  }
+}
+
+/// Data siswa aktif (`StudentResponse` dari `GET /api/v1/students`).
+class StudentListItem {
+  const StudentListItem({
+    required this.id,
+    required this.nis,
+    required this.name,
+    required this.classId,
+    required this.className,
+    required this.parentId,
+    required this.parentName,
+    required this.parentPhoneWa,
+    required this.isActive,
+    required this.faceCount,
+    required this.createdAt,
+  });
+
+  final String id;
+  final String nis;
+  final String name;
+  final String classId;
+  final String className;
+  final String parentId;
+  final String parentName;
+  final String parentPhoneWa;
+  final bool isActive;
+  final int faceCount;
+  final DateTime createdAt;
+
+  factory StudentListItem.fromJson(Map<String, dynamic> json) {
+    return StudentListItem(
+      id: json['id'] as String,
+      nis: json['nis'] as String,
+      name: json['name'] as String,
+      classId: json['class_id'] as String,
+      className: json['class_name'] as String,
+      parentId: json['parent_id'] as String,
+      parentName: json['parent_name'] as String,
+      parentPhoneWa: json['parent_phone_wa'] as String,
+      isActive: json['is_active'] as bool? ?? true,
+      faceCount: _asInt(json['face_count']),
+      createdAt: _parseRequiredDateTime(json['created_at']),
+    );
+  }
+
+  /// Mengonversi data master siswa menjadi item presensi `unrecorded` untuk picker manual.
+  StudentAttendanceItem toUnrecordedAttendanceItem() {
+    return StudentAttendanceItem(
+      studentId: id,
+      nis: nis,
+      studentName: name,
+      classId: classId,
+      className: className,
+      parentPhoneWa: parentPhoneWa,
+      attendanceId: null,
+      status: 'unrecorded',
+      verificationMethod: null,
+      scannedAt: null,
+      similarityScore: null,
+      waStatus: null,
+      waNotifiedAt: null,
     );
   }
 }
@@ -684,6 +782,7 @@ class LeaveRequestItem {
     required this.verifiedBy,
     required this.verifiedByName,
     required this.verifiedAt,
+    this.verificationNote,
     required this.createdAt,
   });
 
@@ -705,6 +804,7 @@ class LeaveRequestItem {
   final String? verifiedBy;
   final String? verifiedByName;
   final DateTime? verifiedAt;
+  final String? verificationNote;
   final DateTime createdAt;
 
   factory LeaveRequestItem.fromJson(Map<String, dynamic> json) {
@@ -727,6 +827,7 @@ class LeaveRequestItem {
       verifiedBy: json['verified_by'] as String?,
       verifiedByName: json['verified_by_name'] as String?,
       verifiedAt: _parseNullableDateTime(json['verified_at']),
+      verificationNote: json['verification_note'] as String?,
       createdAt: _parseRequiredDateTime(json['created_at']),
     );
   }

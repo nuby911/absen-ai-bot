@@ -113,6 +113,7 @@ class ApiClient {
         },
         onError: (error, handler) {
           if (error.response?.statusCode == 401 &&
+              !_isRestoringSession &&
               !error.requestOptions.path.endsWith('/auth/login')) {
             onUnauthorized?.call();
           }
@@ -138,6 +139,7 @@ class ApiClient {
   String _baseUrl;
   String? _accessToken;
   UserProfile? _currentUser;
+  bool _isRestoringSession = false;
 
   String get baseUrl => _baseUrl;
   String? get accessToken => _accessToken;
@@ -152,12 +154,40 @@ class ApiClient {
   }
 
   String? resolveAssetUrl(String? pathOrUrl) {
-    if (pathOrUrl == null || pathOrUrl.trim().isEmpty) return null;
-    if (pathOrUrl.startsWith('http://') || pathOrUrl.startsWith('https://')) {
-      return pathOrUrl;
+    if (pathOrUrl == null) return null;
+    final trimmed = pathOrUrl.trim();
+    if (trimmed.isEmpty) return null;
+    final lower = trimmed.toLowerCase();
+    if (lower.startsWith('http://') || lower.startsWith('https://')) {
+      return trimmed;
     }
-    final normalized = pathOrUrl.startsWith('/') ? pathOrUrl : '/$pathOrUrl';
+    final normalized = trimmed.startsWith('/') ? trimmed : '/$trimmed';
     return '$apiOrigin$normalized';
+  }
+
+  /// Memvalidasi URL API (`http`/`https` + host tidak kosong) dan menambahkan `/api/v1` bila belum ada.
+  static ({String? url, String? error}) validateAndNormalizeBaseUrl(String raw) {
+    var trimmed = raw.trim();
+    if (trimmed.isEmpty) {
+      return (url: null, error: 'Alamat server API wajib diisi.');
+    }
+    while (trimmed.endsWith('/')) {
+      trimmed = trimmed.substring(0, trimmed.length - 1);
+    }
+    final uri = Uri.tryParse(trimmed);
+    if (uri == null ||
+        (uri.scheme.toLowerCase() != 'http' && uri.scheme.toLowerCase() != 'https') ||
+        uri.host.trim().isEmpty) {
+      return (
+        url: null,
+        error:
+            'URL server tidak valid. Gunakan format http:// atau https:// disertai alamat host (contoh: http://10.0.2.2:8000/api/v1).',
+      );
+    }
+    if (!trimmed.toLowerCase().endsWith('/api/v1')) {
+      trimmed = '$trimmed/api/v1';
+    }
+    return (url: trimmed, error: null);
   }
 
   static String _normalizeBaseUrl(String raw) {
@@ -168,12 +198,20 @@ class ApiClient {
     if (trimmed.isEmpty) {
       return defaultBaseUrl;
     }
-    return trimmed;
+    final validated = validateAndNormalizeBaseUrl(trimmed);
+    return validated.url ?? trimmed;
   }
 
   /// Mengubah alamat server API saat runtime dan menyimpannya secara persisten.
   Future<void> setBaseUrl(String newBaseUrl) async {
-    final normalized = _normalizeBaseUrl(newBaseUrl);
+    final validated = validateAndNormalizeBaseUrl(newBaseUrl);
+    if (validated.url == null) {
+      throw ApiException(
+        statusCode: 0,
+        message: validated.error ?? 'URL server tidak valid.',
+      );
+    }
+    final normalized = validated.url!;
     _baseUrl = normalized;
     _dio.options.baseUrl = normalized;
     await _storage.write(_baseUrlKey, normalized);
@@ -206,6 +244,7 @@ class ApiClient {
       }
     }
 
+    _isRestoringSession = true;
     try {
       final profile = await getMe();
       _currentUser = profile;
@@ -219,6 +258,8 @@ class ApiClient {
       return _currentUser;
     } catch (_) {
       return _currentUser;
+    } finally {
+      _isRestoringSession = false;
     }
   }
 
@@ -270,11 +311,16 @@ class ApiClient {
     return profile;
   }
 
-  Future<void> updateKioskPin(String pin) async {
+  Future<void> updateKioskPin(String pin, {String? currentPin}) async {
+    final trimmedCurrent = currentPin?.trim();
     await _request<Map<String, dynamic>>(
       () => _dio.put<dynamic>(
         '/auth/kiosk-pin',
-        data: {'pin': pin.trim()},
+        data: {
+          'pin': pin.trim(),
+          if (trimmedCurrent != null && trimmedCurrent.isNotEmpty)
+            'current_pin': trimmedCurrent,
+        },
       ),
     );
     if (_currentUser != null) {
@@ -283,18 +329,34 @@ class ApiClient {
     }
   }
 
-  Future<bool> verifyKioskPin(String pin) async {
+  Future<VerifyPinResult> verifyKioskPinResult(String pin) async {
     final data = await _request<Map<String, dynamic>>(
       () => _dio.post<dynamic>(
         '/auth/verify-pin',
         data: {'pin': pin.trim()},
       ),
     );
-    return data['valid'] as bool? ?? false;
+    final result = VerifyPinResult.fromJson(data);
+    if (_currentUser != null && _currentUser!.hasKioskPin != result.hasKioskPin) {
+      _currentUser = _currentUser!.copyWith(hasKioskPin: result.hasKioskPin);
+      await _storage.write(_userKey, jsonEncode(_currentUser!.toJson()));
+    }
+    return result;
+  }
+
+  Future<bool> verifyKioskPin(String pin) async {
+    final result = await verifyKioskPinResult(pin);
+    if (!result.hasKioskPin) {
+      throw const ApiException(
+        statusCode: 403,
+        message: 'PIN Kiosk belum diatur. Silakan atur PIN Kiosk terlebih dahulu.',
+      );
+    }
+    return result.valid;
   }
 
   // ---------------------------------------------------------------------------
-  // Dashboard Guru, Kelas, Jadwal & Sesi Presensi
+  // Dashboard Guru, Kelas, Siswa, Jadwal & Sesi Presensi
   // ---------------------------------------------------------------------------
 
   Future<TeacherDashboardData> getTeacherDashboard() async {
@@ -310,6 +372,22 @@ class ApiClient {
     );
     return data
         .map((item) => SchoolClassItem.fromJson(item as Map<String, dynamic>))
+        .toList();
+  }
+
+  Future<List<StudentListItem>> getStudents({
+    String? classId,
+    bool? isActive = true,
+  }) async {
+    final query = <String, dynamic>{
+      if (classId != null && classId.isNotEmpty) 'class_id': classId,
+      'is_active': ?isActive,
+    };
+    final data = await _request<List<dynamic>>(
+      () => _dio.get<dynamic>('/students', queryParameters: query),
+    );
+    return data
+        .map((item) => StudentListItem.fromJson(item as Map<String, dynamic>))
         .toList();
   }
 

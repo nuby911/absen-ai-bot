@@ -191,6 +191,80 @@ void main() {
         expect(submittedPins, ['1245', '5678']);
       },
     );
+
+    testWidgets(
+      'otomatis mengosongkan PIN saat salah sehingga guru langsung mengetik ulang tanpa tombol C',
+      (WidgetTester tester) async {
+        final submittedPins = <String>[];
+
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: AppTheme.light(),
+            home: Scaffold(
+              body: KioskPinSheet(
+                onVerify: (pin) async {
+                  submittedPins.add(pin);
+                  return pin == '1234';
+                },
+              ),
+            ),
+          ),
+        );
+
+        // Masukkan PIN salah 9999
+        for (final digit in ['9', '9', '9', '9']) {
+          await tester.tap(find.text(digit));
+        }
+        await tester.pump();
+        await tester.tap(find.text('Buka Kunci & Keluar Kiosk'));
+        await tester.pumpAndSettle();
+
+        expect(find.textContaining('PIN Kiosk salah'), findsOneWidget);
+
+        // Langsung ketik 1234 tanpa menekan C atau ⌫
+        for (final digit in ['1', '2', '3', '4']) {
+          await tester.tap(find.text(digit));
+        }
+        await tester.pump();
+        await tester.tap(find.text('Buka Kunci & Keluar Kiosk'));
+        await tester.pumpAndSettle();
+
+        expect(submittedPins, ['9999', '1234']);
+      },
+    );
+
+    testWidgets(
+      'menampilkan "PIN Kiosk belum diatur" saat backend verify-pin mengembalikan has_kiosk_pin == false',
+      (WidgetTester tester) async {
+        final apiClient = _createStubApiClient((options) {
+          if (options.path == '/auth/verify-pin') {
+            return {'valid': false, 'has_kiosk_pin': false};
+          }
+          return <String, dynamic>{};
+        });
+
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: AppTheme.light(),
+            home: Scaffold(
+              body: KioskPinSheet(
+                onVerify: apiClient.verifyKioskPin,
+              ),
+            ),
+          ),
+        );
+
+        for (final digit in ['1', '2', '3', '4']) {
+          await tester.tap(find.text(digit));
+        }
+        await tester.pump();
+        await tester.tap(find.text('Buka Kunci & Keluar Kiosk'));
+        await tester.pumpAndSettle();
+
+        expect(find.textContaining('PIN Kiosk belum diatur'), findsOneWidget);
+        expect(find.textContaining('PIN Kiosk salah'), findsNothing);
+      },
+    );
   });
 
   group('KioskScannerScreen', () {
@@ -547,5 +621,350 @@ void main() {
         await tester.pump(const Duration(milliseconds: 2600));
       },
     );
+
+    testWidgets(
+      'menampilkan format HUD "3 tercatat" tanpa pecahan mustahil pada sesi Gerbang Umum (classId == null)',
+      (WidgetTester tester) async {
+        final gateSession = SessionDetail(
+          id: 'sess-gate',
+          classId: null,
+          className: null,
+          teacherId: 'tch-1',
+          teacherName: 'Ibu Sari',
+          scheduleId: null,
+          subjectName: null,
+          sessionType: 'gate_in',
+          sessionDate: '2026-11-23',
+          expectedStartTime: '07:00:00',
+          lateToleranceMinutes: 15,
+          openedAt: DateTime.utc(2026, 11, 23, 0, 0),
+          closedAt: null,
+          status: 'open',
+          summary: const SessionSummaryCounters(
+            totalStudents: 2,
+            presentCount: 3,
+            lateCount: 0,
+            permitCount: 0,
+            sickCount: 0,
+            absentCount: 0,
+            unrecordedCount: 0,
+            recordedCount: 3,
+          ),
+          students: const [],
+        );
+
+        final apiClient = _createStubApiClient((_) => <String, dynamic>{});
+
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: AppTheme.light(),
+            home: KioskScannerScreen(
+              apiClient: apiClient,
+              session: gateSession,
+              enableHardwareCamera: false,
+              previewBuilder: (_) => const SizedBox.expand(),
+            ),
+          ),
+        );
+        await tester.pump();
+
+        expect(find.textContaining('3 tercatat'), findsOneWidget);
+        expect(find.textContaining('3/2'), findsNothing);
+      },
+    );
+
+    testWidgets(
+      'menangani HTTP 400 sesi ditutup dengan layar persisten "Sesi Telah Ditutup" dan keluar lewat PIN',
+      (WidgetTester tester) async {
+        final sampleController = StreamController<FaceSample?>();
+        addTearDown(sampleController.close);
+
+        final dio = Dio(BaseOptions(baseUrl: 'http://localhost:8000/api/v1'));
+        dio.httpClientAdapter = _KioskStatusStubAdapter((options) {
+          if (options.path == '/attendance/scan') {
+            return (
+              statusCode: 400,
+              body: {
+                'detail': 'Sesi presensi sudah ditutup. Tidak dapat memindai wajah.',
+              },
+            );
+          }
+          if (options.path == '/auth/verify-pin') {
+            return (
+              statusCode: 200,
+              body: {'valid': true, 'has_kiosk_pin': true},
+            );
+          }
+          return (statusCode: 200, body: <String, dynamic>{});
+        });
+
+        final apiClient = ApiClient(
+          baseUrl: 'http://localhost:8000/api/v1',
+          dio: dio,
+          storage: MemoryKeyValueStorage(),
+        );
+
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: AppTheme.light(),
+            home: Builder(
+              builder: (ctx) => Scaffold(
+                body: ElevatedButton(
+                  onPressed: () {
+                    Navigator.of(ctx).push(
+                      MaterialPageRoute<void>(
+                        builder: (_) => KioskScannerScreen(
+                          apiClient: apiClient,
+                          session: _sampleSession(),
+                          enableHardwareCamera: false,
+                          sampleStream: sampleController.stream,
+                          previewBuilder: (_) => const SizedBox.expand(),
+                          onCaptureFaceBytes: () async =>
+                              Uint8List.fromList([1, 2, 3]),
+                        ),
+                      ),
+                    );
+                  },
+                  child: const Text('Mulai Kiosk'),
+                ),
+              ),
+            ),
+          ),
+        );
+
+        await tester.tap(find.text('Mulai Kiosk'));
+        await tester.pumpAndSettle();
+
+        final t0 = DateTime(2026, 11, 23, 7, 30, 0);
+        sampleController.add(
+          FaceSample(
+            leftEyeOpenProbability: 0.9,
+            rightEyeOpenProbability: 0.9,
+            headEulerAngleY: 0,
+            headEulerAngleZ: 0,
+            timestamp: t0,
+          ),
+        );
+        await tester.pump();
+        sampleController.add(
+          FaceSample(
+            leftEyeOpenProbability: 0.1,
+            rightEyeOpenProbability: 0.1,
+            headEulerAngleY: 0,
+            headEulerAngleZ: 0,
+            timestamp: t0.add(const Duration(milliseconds: 200)),
+          ),
+        );
+        await tester.pump();
+        sampleController.add(
+          FaceSample(
+            leftEyeOpenProbability: 0.9,
+            rightEyeOpenProbability: 0.9,
+            headEulerAngleY: 0,
+            headEulerAngleZ: 0,
+            timestamp: t0.add(const Duration(milliseconds: 450)),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(find.text('Sesi Telah Ditutup'), findsWidgets);
+        expect(
+          find.byKey(const Key('kiosk_session_closed_exit_button')),
+          findsOneWidget,
+        );
+
+        // Pastikan setelah lewat 4 detik tetap persisten (tidak auto-reset loop)
+        await tester.pump(const Duration(seconds: 4));
+        expect(find.text('Sesi Telah Ditutup'), findsWidgets);
+      },
+    );
+
+    testWidgets(
+      'shortcut Absen Manual di KioskPinSheet hanya meminta PIN sekali dan mengirim manual attendance dengan PIN terverifikasi',
+      (WidgetTester tester) async {
+        var verifyPinCalls = 0;
+        Map<String, dynamic>? manualPayload;
+
+        final sessionWithStudent = SessionDetail(
+          id: 'sess-1',
+          classId: 'cls-1',
+          className: 'XI IPA 1',
+          teacherId: 'tch-1',
+          teacherName: 'Ibu Sari',
+          scheduleId: 'sch-1',
+          subjectName: 'Pemrograman Mobile',
+          sessionType: 'subject',
+          sessionDate: '2026-11-23',
+          expectedStartTime: '07:30:00',
+          lateToleranceMinutes: 15,
+          openedAt: DateTime.utc(2026, 11, 23, 0, 25),
+          closedAt: null,
+          status: 'open',
+          summary: const SessionSummaryCounters(
+            totalStudents: 1,
+            presentCount: 0,
+            lateCount: 0,
+            permitCount: 0,
+            sickCount: 0,
+            absentCount: 0,
+            unrecordedCount: 1,
+            recordedCount: 0,
+          ),
+          students: const [
+            StudentAttendanceItem(
+              studentId: 'stu-1',
+              nis: '24781025',
+              studentName: 'Rubby Ibnu Anantara',
+              classId: 'cls-1',
+              className: 'XI IPA 1',
+              parentPhoneWa: '6281279001234',
+              attendanceId: null,
+              status: 'unrecorded',
+              verificationMethod: null,
+              scannedAt: null,
+              similarityScore: null,
+              waStatus: null,
+              waNotifiedAt: null,
+            ),
+          ],
+        );
+
+        final apiClient = _createStubApiClient((options) {
+          if (options.path == '/auth/verify-pin') {
+            verifyPinCalls += 1;
+            final body = options.data as Map<String, dynamic>;
+            return {'valid': body['pin'] == '1234', 'has_kiosk_pin': true};
+          }
+          if (options.path == '/sessions/sess-1') {
+            return {
+              'id': 'sess-1',
+              'class_id': 'cls-1',
+              'class_name': 'XI IPA 1',
+              'teacher_id': 'tch-1',
+              'teacher_name': 'Ibu Sari',
+              'schedule_id': 'sch-1',
+              'subject_name': 'Pemrograman Mobile',
+              'session_type': 'subject',
+              'session_date': '2026-11-23',
+              'expected_start_time': '07:30:00',
+              'late_tolerance_minutes': 15,
+              'opened_at': '2026-11-23T00:25:00Z',
+              'closed_at': null,
+              'status': 'open',
+              'summary': {
+                'total_students': 1,
+                'present_count': 0,
+                'late_count': 0,
+                'permit_count': 0,
+                'sick_count': 0,
+                'absent_count': 0,
+                'unrecorded_count': 1,
+                'recorded_count': 0,
+              },
+              'students': [
+                {
+                  'student_id': 'stu-1',
+                  'nis': '24781025',
+                  'student_name': 'Rubby Ibnu Anantara',
+                  'class_id': 'cls-1',
+                  'class_name': 'XI IPA 1',
+                  'parent_phone_wa': '6281279001234',
+                  'attendance_id': null,
+                  'status': 'unrecorded',
+                  'verification_method': null,
+                  'scanned_at': null,
+                  'similarity_score': null,
+                  'wa_status': null,
+                  'wa_notified_at': null,
+                },
+              ],
+            };
+          }
+          if (options.path == '/attendance/manual') {
+            manualPayload = Map<String, dynamic>.from(
+              options.data as Map<String, dynamic>,
+            );
+            return {
+              'attendance_id': 'att-manual-1',
+              'session_id': 'sess-1',
+              'student_id': 'stu-1',
+              'student_name': 'Rubby Ibnu Anantara',
+              'nis': '24781025',
+              'class_name': 'XI IPA 1',
+              'status': 'present',
+              'verification_method': 'manual_teacher',
+              'scanned_at': '2026-11-23T00:30:00Z',
+              'wa_status': 'sent',
+              'wa_notified_at': '2026-11-23T00:30:01Z',
+              'message': 'Presensi manual untuk Rubby Ibnu Anantara berhasil disimpan.',
+            };
+          }
+          return <String, dynamic>{};
+        });
+
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: AppTheme.light(),
+            home: KioskScannerScreen(
+              apiClient: apiClient,
+              session: sessionWithStudent,
+              enableHardwareCamera: false,
+              previewBuilder: (_) => const SizedBox.expand(),
+            ),
+          ),
+        );
+        await tester.pump();
+
+        await tester.tap(find.byKey(const Key('kiosk_pin_button')));
+        await tester.pumpAndSettle();
+
+        for (final digit in ['1', '2', '3', '4']) {
+          await tester.tap(find.text(digit));
+        }
+        await tester.pump();
+
+        await tester.tap(
+          find.byKey(const Key('kiosk_pin_secondary_action_button')),
+        );
+        await tester.pumpAndSettle();
+
+        expect(verifyPinCalls, 1);
+        expect(find.text('Input Presensi Manual'), findsOneWidget);
+
+        await tester.tap(find.text('Simpan Presensi'));
+        await tester.pumpAndSettle();
+
+        expect(verifyPinCalls, 1);
+        expect(manualPayload?['student_id'], 'stu-1');
+        expect(manualPayload?['kiosk_pin'], '1234');
+        expect(find.textContaining('1/1 tercatat'), findsOneWidget);
+      },
+    );
   });
+}
+
+class _KioskStatusStubAdapter implements HttpClientAdapter {
+  _KioskStatusStubAdapter(this.handler);
+
+  final ({int statusCode, dynamic body}) Function(RequestOptions options) handler;
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    final result = handler(options);
+    final bytes = utf8.encode(jsonEncode(result.body));
+    return ResponseBody.fromBytes(
+      bytes,
+      result.statusCode,
+      headers: {
+        Headers.contentTypeHeader: [Headers.jsonContentType],
+      },
+    );
+  }
 }

@@ -104,7 +104,7 @@ absen-ai-bot/
 │   │   ├── services/chatbot.py  # ChatbotOrchestrator (4 tool terisolasi parent_id + keyword fallback)
 │   │   ├── routers/             # auth, admin, attendance, leaves, webhook
 │   │   └── seed.py              # Seeder data demo idempoten
-│   ├── tests/                   # 52 automated tests (Pytest)
+│   ├── tests/                   # 62 automated tests (Pytest)
 │   ├── Dockerfile               # Multi-stage Docker build (uv + non-root user)
 │   └── pyproject.toml           # Dependensi Python & optional group [ml]
 ├── web_admin/                   # Web Dashboard Admin (Next.js App Router + TypeScript)
@@ -119,7 +119,7 @@ absen-ai-bot/
 │   │   ├── services/            # BlinkLivenessDetector (state machine kedipan + cooldown 2.5d)
 │   │   ├── widgets/             # KioskPinSheet (keypad numerik PIN 4-6 digit)
 │   │   └── screens/             # Login, Home, SessionDetail, KioskScanner, LeaveVerification
-│   └── test/                    # 23 unit & widget tests Flutter
+│   └── test/                    # 40 unit & widget tests Flutter
 ├── docker-compose.yml           # Orkestrasi PostgreSQL 16 + WAHA + FastAPI Backend
 └── .env.example                 # Template variabel lingkungan
 ```
@@ -276,7 +276,7 @@ Secara default aplikasi berjalan dalam mode aman tanpa API key (`WHATSAPP_PROVID
 ## Menjalankan Pengujian Otomatis
 
 ```bash
-# 1. Backend (52 unit & integration tests, zero warnings)
+# 1. Backend (62 unit & integration tests, zero warnings)
 cd backend
 uv run pytest -v -W error
 
@@ -284,7 +284,7 @@ uv run pytest -v -W error
 cd web_admin
 npx tsc --noEmit && npm run lint && npm run build
 
-# 3. Mobile Guru (23 unit & widget tests + static analyzer)
+# 3. Mobile Guru (40 unit & widget tests + static analyzer)
 cd mobile_guru
 flutter analyze && flutter test
 ```

@@ -1,11 +1,12 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../core/api_client.dart';
 import '../core/formatters.dart';
 import '../core/theme.dart';
 import '../models/models.dart';
+import '../widgets/kiosk_pin_setup_dialog.dart';
 import '../widgets/kiosk_pin_sheet.dart';
+import '../widgets/manual_attendance_dialog.dart';
 import 'home_screen.dart';
 import 'kiosk_scanner_screen.dart';
 
@@ -52,8 +53,13 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
     try {
       final detail = await widget.apiClient.getSessionDetail(widget.sessionId);
       if (!mounted) return;
+      final stillHasWaFailed =
+          detail.students.any((student) => student.waStatus == 'failed');
       setState(() {
         _detail = detail;
+        if (_statusFilter == 'wa_failed' && !stillHasWaFailed) {
+          _statusFilter = 'all';
+        }
         _isLoading = false;
       });
     } on ApiException catch (exc) {
@@ -76,9 +82,18 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
     if (detail == null) return;
 
     if (!detail.isOpen) {
-      _showSnackBar('Sesi sudah ditutup. Buka sesi baru untuk memindai wajah.', isError: true);
+      _showSnackBar(
+        'Sesi sudah ditutup. Buka sesi baru untuk memindai wajah.',
+        isError: true,
+      );
       return;
     }
+
+    final hasPin = await KioskPinSetupDialog.ensureKioskPin(
+      context,
+      widget.apiClient,
+    );
+    if (!hasPin || !mounted) return;
 
     await Navigator.of(context).push<void>(
       MaterialPageRoute(
@@ -112,21 +127,56 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
     );
   }
 
-  Future<void> _openManualAttendanceModal({StudentAttendanceItem? presetStudent}) async {
+  Future<void> _openManualAttendanceModal({
+    StudentAttendanceItem? presetStudent,
+  }) async {
     final detail = _detail;
-    if (detail == null) return;
+    if (detail == null || _isMutating) return;
 
-    if (detail.students.isEmpty) {
-      _showSnackBar('Belum ada daftar siswa di sesi ini untuk input manual.', isError: true);
+    final hasPin = await KioskPinSetupDialog.ensureKioskPin(
+      context,
+      widget.apiClient,
+    );
+    if (!hasPin || !mounted) return;
+
+    List<StudentAttendanceItem> candidates = detail.students;
+    if (detail.classId == null) {
+      setState(() => _isMutating = true);
+      try {
+        candidates = await loadManualAttendanceCandidates(
+          widget.apiClient,
+          detail,
+        );
+      } on ApiException catch (exc) {
+        if (!mounted) return;
+        _showSnackBar(exc.message, isError: true);
+        return;
+      } catch (exc) {
+        if (!mounted) return;
+        _showSnackBar('Gagal memuat daftar siswa aktif: $exc', isError: true);
+        return;
+      } finally {
+        if (mounted) {
+          setState(() => _isMutating = false);
+        }
+      }
+    }
+
+    if (!mounted) return;
+    if (candidates.isEmpty) {
+      _showSnackBar(
+        'Belum ada daftar siswa di sesi ini untuk input manual.',
+        isError: true,
+      );
       return;
     }
 
-    final selection = await showDialog<_ManualAttendanceSelection>(
+    final selection = await showDialog<ManualAttendanceSelection>(
       context: context,
-      builder: (dialogContext) => _ManualAttendanceDialog(
-        students: detail.students,
+      builder: (dialogContext) => ManualAttendanceDialog(
+        students: candidates,
         presetStudent: presetStudent,
-        requireInlinePin: false,
+        isGeneralGate: detail.classId == null,
       ),
     );
 
@@ -157,6 +207,9 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
     } on ApiException catch (exc) {
       if (!mounted) return;
       _showSnackBar(exc.message, isError: true);
+    } catch (exc) {
+      if (!mounted) return;
+      _showSnackBar('Gagal menyimpan presensi manual: $exc', isError: true);
     } finally {
       if (mounted) {
         setState(() => _isMutating = false);
@@ -169,16 +222,30 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
     if (detail == null || !detail.isOpen) return;
 
     final unrecorded = detail.summary.unrecordedCount;
+    final isGeneralGate = detail.classId == null;
+    final isGateOut = detail.sessionType == 'gate_out';
+
+    final dialogTitle = isGeneralGate ? 'Tutup Sesi Gerbang?' : 'Tutup Sesi Kelas?';
+    final String dialogContent;
+    if (isGateOut) {
+      dialogContent =
+          'Menutup sesi Gerbang Pulang akan menghentikan pemindaian Kiosk. Siswa yang tidak memindai pulang tidak akan ditandai ALFA.';
+    } else if (isGeneralGate) {
+      dialogContent = unrecorded > 0
+          ? 'Masih ada $unrecorded siswa aktif di seluruh sekolah yang belum tercatat. Menutup sesi Gerbang Umum akan otomatis menandai mereka sebagai ALFA (kecuali yang memiliki izin disetujui) dan menghentikan scan Kiosk.'
+          : 'Semua siswa aktif telah tercatat. Menutup sesi akan mengunci presensi Gerbang Umum ini.';
+    } else {
+      dialogContent = unrecorded > 0
+          ? 'Masih ada $unrecorded siswa yang belum tercatat. Menutup sesi akan otomatis menandai mereka sebagai ALFA dan menghentikan scan Kiosk.'
+          : 'Semua siswa telah tercatat. Menutup sesi akan mengunci presensi kelas ini.';
+    }
+
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) {
         return AlertDialog(
-          title: const Text('Tutup Sesi Kelas?'),
-          content: Text(
-            unrecorded > 0
-                ? 'Masih ada $unrecorded siswa yang belum tercatat. Menutup sesi akan otomatis menandai mereka sebagai ALFA dan menghentikan scan Kiosk.'
-                : 'Semua siswa telah tercatat. Menutup sesi akan mengunci presensi kelas ini.',
-          ),
+          title: Text(dialogTitle),
+          content: Text(dialogContent),
           actions: [
             TextButton(
               onPressed: () => Navigator.of(dialogContext).pop(false),
@@ -205,6 +272,9 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
     } on ApiException catch (exc) {
       if (!mounted) return;
       _showSnackBar(exc.message, isError: true);
+    } catch (exc) {
+      if (!mounted) return;
+      _showSnackBar('Gagal menutup sesi presensi: $exc', isError: true);
     } finally {
       if (mounted) {
         setState(() => _isMutating = false);
@@ -225,6 +295,9 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
     } on ApiException catch (exc) {
       if (!mounted) return;
       _showSnackBar(exc.message, isError: true);
+    } catch (exc) {
+      if (!mounted) return;
+      _showSnackBar('Gagal mengirim ulang WA: $exc', isError: true);
     } finally {
       if (mounted) {
         setState(() => _resendingIds.remove(attendanceId));
@@ -246,13 +319,16 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
     return detail.students.where((student) {
       if (_statusFilter == 'permit_sick') {
         if (student.status != 'permit' && student.status != 'sick') return false;
+      } else if (_statusFilter == 'wa_failed') {
+        if (student.waStatus != 'failed') return false;
       } else if (_statusFilter != 'all' && student.status != _statusFilter) {
         return false;
       }
 
       if (query.isEmpty) return true;
       return student.studentName.toLowerCase().contains(query) ||
-          student.nis.toLowerCase().contains(query);
+          student.nis.toLowerCase().contains(query) ||
+          student.className.toLowerCase().contains(query);
     }).toList();
   }
 
@@ -287,7 +363,7 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
                       const SizedBox(height: 14),
                       _buildSummaryStrip(detail.summary),
                       const SizedBox(height: 14),
-                      _buildSearchAndFilterBar(),
+                      _buildSearchAndFilterBar(detail),
                       const SizedBox(height: 12),
                       ..._buildStudentList(detail),
                     ],
@@ -306,7 +382,8 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
                   children: [
                     Expanded(
                       child: OutlinedButton.icon(
-                        onPressed: _isMutating ? null : () => _openManualAttendanceModal(),
+                        onPressed:
+                            _isMutating ? null : () => _openManualAttendanceModal(),
                         icon: const Icon(Icons.edit_note_rounded, size: 20),
                         label: const Text('Input Manual (PIN)'),
                       ),
@@ -319,7 +396,11 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
                         ),
                         onPressed: _isMutating ? null : _confirmCloseSession,
                         icon: const Icon(Icons.lock_clock_outlined, size: 18),
-                        label: const Text('Tutup Sesi Kelas'),
+                        label: Text(
+                          detail.classId == null
+                              ? 'Tutup Sesi Gerbang'
+                              : 'Tutup Sesi Kelas',
+                        ),
                       ),
                     ),
                   ],
@@ -485,14 +566,17 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
     );
   }
 
-  Widget _buildSearchAndFilterBar() {
-    const filters = [
+  Widget _buildSearchAndFilterBar(SessionDetail detail) {
+    final failedWaCount =
+        detail.students.where((student) => student.waStatus == 'failed').length;
+    final filters = [
       (key: 'all', label: 'Semua'),
       (key: 'present', label: 'Hadir'),
       (key: 'late', label: 'Telat'),
       (key: 'permit_sick', label: 'Izin/Sakit'),
       (key: 'unrecorded', label: 'Belum'),
       (key: 'absent', label: 'Alfa'),
+      if (failedWaCount > 0) (key: 'wa_failed', label: 'WA Gagal ($failedWaCount)'),
     ];
 
     return Column(
@@ -510,16 +594,22 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
           child: Row(
             children: filters.map((f) {
               final selected = _statusFilter == f.key;
+              final isWaFailedChip = f.key == 'wa_failed';
               return Padding(
                 padding: const EdgeInsets.only(right: 8),
                 child: ChoiceChip(
                   label: Text(f.label),
                   selected: selected,
-                  selectedColor: AppColors.primaryTint,
+                  selectedColor:
+                      isWaFailedChip ? AppColors.dangerTint : AppColors.primaryTint,
                   labelStyle: TextStyle(
                     fontSize: 12.5,
                     fontWeight: FontWeight.w600,
-                    color: selected ? AppColors.primary : AppColors.textSecondary,
+                    color: selected
+                        ? (isWaFailedChip ? AppColors.danger : AppColors.primary)
+                        : (isWaFailedChip
+                            ? AppColors.danger
+                            : AppColors.textSecondary),
                   ),
                   onSelected: (_) => setState(() => _statusFilter = f.key),
                 ),
@@ -557,6 +647,7 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
             padding: const EdgeInsets.only(bottom: 10),
             child: _StudentAttendanceTile(
               item: student,
+              showClassName: detail.classId == null,
               isSessionOpen: detail.isOpen,
               isResending: student.attendanceId != null &&
                   _resendingIds.contains(student.attendanceId),
@@ -647,6 +738,7 @@ class _SummaryCounterChip extends StatelessWidget {
 class _StudentAttendanceTile extends StatelessWidget {
   const _StudentAttendanceTile({
     required this.item,
+    required this.showClassName,
     required this.isSessionOpen,
     required this.isResending,
     required this.onResendWa,
@@ -654,15 +746,35 @@ class _StudentAttendanceTile extends StatelessWidget {
   });
 
   final StudentAttendanceItem item;
+  final bool showClassName;
   final bool isSessionOpen;
   final bool isResending;
   final VoidCallback onResendWa;
   final VoidCallback? onTapManual;
 
+  String _buildMetadataLine() {
+    final parts = <String>[
+      if (showClassName) item.className,
+      'NIS ${item.nis}',
+    ];
+    if (item.scannedAt != null) {
+      parts.add(AppFormatters.formatWibTime(item.scannedAt));
+    }
+    if (item.verificationMethod != null && item.verificationMethod!.isNotEmpty) {
+      parts.add(AppFormatters.verificationMethodLabel(item.verificationMethod));
+    } else if (item.status == 'unrecorded') {
+      parts.add('Belum tercatat');
+    }
+    return parts.join(' • ');
+  }
+
   @override
   Widget build(BuildContext context) {
     final statusColors = AppFormatters.attendanceStatusColors(item.status);
     final statusLabel = AppFormatters.attendanceStatusLabel(item.status);
+    final canRetryWa =
+        (item.waStatus == 'failed' || item.waStatus == 'pending') &&
+        item.attendanceId != null;
 
     return InkWell(
       onTap: onTapManual,
@@ -697,6 +809,8 @@ class _StudentAttendanceTile extends StatelessWidget {
                     children: [
                       Text(
                         item.studentName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
                           fontSize: 14.5,
                           fontWeight: FontWeight.w700,
@@ -705,7 +819,9 @@ class _StudentAttendanceTile extends StatelessWidget {
                       ),
                       const SizedBox(height: 2),
                       Text(
-                        'NIS ${item.nis} • ${item.scannedAt != null ? AppFormatters.formatWibTime(item.scannedAt) : AppFormatters.verificationMethodLabel(item.verificationMethod)}',
+                        _buildMetadataLine(),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
                           fontSize: 12,
                           color: AppColors.textSecondary,
@@ -738,10 +854,13 @@ class _StudentAttendanceTile extends StatelessWidget {
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
                   _buildWaBadge(),
-                  if (item.waStatus == 'failed' && item.attendanceId != null)
+                  if (canRetryWa)
                     TextButton.icon(
                       style: TextButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 4,
+                        ),
                         minimumSize: Size.zero,
                         tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                       ),
@@ -755,7 +874,10 @@ class _StudentAttendanceTile extends StatelessWidget {
                           : const Icon(Icons.refresh_rounded, size: 15),
                       label: const Text(
                         'Kirim Ulang WA',
-                        style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
                     ),
                 ],
@@ -823,172 +945,5 @@ class _StudentAttendanceTile extends StatelessWidget {
           style: TextStyle(fontSize: 11, color: AppColors.textMuted),
         );
     }
-  }
-}
-
-class _ManualAttendanceSelection {
-  const _ManualAttendanceSelection({
-    required this.studentId,
-    required this.studentName,
-    required this.status,
-    required this.notifyWa,
-    this.inlinePin,
-  });
-
-  final String studentId;
-  final String studentName;
-  final String status;
-  final bool notifyWa;
-  final String? inlinePin;
-}
-
-class _ManualAttendanceDialog extends StatefulWidget {
-  const _ManualAttendanceDialog({
-    required this.students,
-    required this.requireInlinePin,
-    this.presetStudent,
-  });
-
-  final List<StudentAttendanceItem> students;
-  final bool requireInlinePin;
-  final StudentAttendanceItem? presetStudent;
-
-  @override
-  State<_ManualAttendanceDialog> createState() => _ManualAttendanceDialogState();
-}
-
-class _ManualAttendanceDialogState extends State<_ManualAttendanceDialog> {
-  late String _selectedStudentId;
-  late String _selectedStatus;
-  bool _notifyWa = true;
-  final _pinController = TextEditingController();
-  String? _error;
-
-  @override
-  void initState() {
-    super.initState();
-    final initialStudent = widget.presetStudent ?? widget.students.first;
-    _selectedStudentId = initialStudent.studentId;
-    _selectedStatus =
-        initialStudent.status == 'unrecorded' ? 'present' : initialStudent.status;
-  }
-
-  @override
-  void dispose() {
-    _pinController.dispose();
-    super.dispose();
-  }
-
-  void _confirm() {
-    if (widget.requireInlinePin) {
-      final pin = _pinController.text.trim();
-      if (!RegExp(r'^\d{4,6}$').hasMatch(pin)) {
-        setState(() => _error = 'Masukkan PIN Kiosk 4–6 digit angka.');
-        return;
-      }
-    }
-
-    final student = widget.students.firstWhere((s) => s.studentId == _selectedStudentId);
-    Navigator.of(context).pop(
-      _ManualAttendanceSelection(
-        studentId: _selectedStudentId,
-        studentName: student.studentName,
-        status: _selectedStatus,
-        notifyWa: _notifyWa,
-        inlinePin: widget.requireInlinePin ? _pinController.text.trim() : null,
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('Input Presensi Manual'),
-      content: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            if (_error != null) ...[
-              Text(
-                _error!,
-                style: const TextStyle(color: AppColors.danger, fontSize: 12.5),
-              ),
-              const SizedBox(height: 10),
-            ],
-            DropdownButtonFormField<String>(
-              initialValue: _selectedStudentId,
-              isExpanded: true,
-              decoration: const InputDecoration(labelText: 'Pilih Siswa'),
-              items: widget.students
-                  .map(
-                    (s) => DropdownMenuItem<String>(
-                      value: s.studentId,
-                      child: Text(
-                        '${s.studentName} (${s.nis})',
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                  )
-                  .toList(),
-              onChanged: (val) {
-                if (val != null) setState(() => _selectedStudentId = val);
-              },
-            ),
-            const SizedBox(height: 12),
-            DropdownButtonFormField<String>(
-              initialValue: _selectedStatus,
-              decoration: const InputDecoration(labelText: 'Status Kehadiran'),
-              items: const [
-                DropdownMenuItem(value: 'present', child: Text('Hadir')),
-                DropdownMenuItem(value: 'late', child: Text('Terlambat')),
-                DropdownMenuItem(value: 'permit', child: Text('Izin')),
-                DropdownMenuItem(value: 'sick', child: Text('Sakit')),
-                DropdownMenuItem(value: 'absent', child: Text('Alfa')),
-              ],
-              onChanged: (val) {
-                if (val != null) setState(() => _selectedStatus = val);
-              },
-            ),
-            const SizedBox(height: 10),
-            CheckboxListTile(
-              value: _notifyWa,
-              contentPadding: EdgeInsets.zero,
-              title: const Text(
-                'Kirim notifikasi WhatsApp ke orang tua',
-                style: TextStyle(fontSize: 13),
-              ),
-              onChanged: (val) => setState(() => _notifyWa = val ?? true),
-            ),
-            if (widget.requireInlinePin) ...[
-              const SizedBox(height: 8),
-              TextField(
-                controller: _pinController,
-                obscureText: true,
-                maxLength: 6,
-                keyboardType: TextInputType.number,
-                inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                decoration: const InputDecoration(
-                  labelText: 'PIN Kiosk Guru',
-                  hintText: '4–6 digit angka',
-                  counterText: '',
-                  prefixIcon: Icon(Icons.pin_outlined),
-                ),
-              ),
-            ],
-          ],
-        ),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: const Text('Batal'),
-        ),
-        ElevatedButton(
-          onPressed: _confirm,
-          child: const Text('Simpan Presensi'),
-        ),
-      ],
-    );
   }
 }

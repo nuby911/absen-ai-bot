@@ -29,6 +29,7 @@ class _SmartSchoolGuruAppState extends State<SmartSchoolGuruApp> {
   late final ApiClient _apiClient;
   UserProfile? _initialUser;
   bool _initializing = true;
+  bool _isHandlingUnauthorized = false;
 
   @override
   void initState() {
@@ -62,11 +63,13 @@ class _SmartSchoolGuruAppState extends State<SmartSchoolGuruApp> {
   Widget _buildLeaveVerificationTab(
     BuildContext context,
     VoidCallback onLeaveChanged,
-    int refreshTrigger,
-  ) {
+    int refreshTrigger, {
+    ValueChanged<int>? onPendingCountLoaded,
+  }) {
     return LeaveVerificationScreen(
       apiClient: _apiClient,
       onLeaveChanged: onLeaveChanged,
+      onPendingCountLoaded: onPendingCountLoaded,
       refreshTrigger: refreshTrigger,
     );
   }
@@ -87,19 +90,26 @@ class _SmartSchoolGuruAppState extends State<SmartSchoolGuruApp> {
     );
   }
 
-  void _handleUnauthorized() {
-    _apiClient.logout();
-    _navigatorKey.currentState?.pushAndRemoveUntil(
-      MaterialPageRoute<void>(
-        builder: (_) => LoginScreen(
-          apiClient: _apiClient,
-          kioskScannerBuilder: _buildKioskScanner,
-          leaveVerificationBuilder: _buildLeaveVerificationTab,
-          pinPromptBuilder: _showKioskPinPrompt,
+  Future<void> _handleUnauthorized() async {
+    if (_isHandlingUnauthorized) return;
+    _isHandlingUnauthorized = true;
+    try {
+      await _apiClient.logout();
+      if (!mounted) return;
+      _navigatorKey.currentState?.pushAndRemoveUntil(
+        MaterialPageRoute<void>(
+          builder: (_) => LoginScreen(
+            apiClient: _apiClient,
+            kioskScannerBuilder: _buildKioskScanner,
+            leaveVerificationBuilder: _buildLeaveVerificationTab,
+            pinPromptBuilder: _showKioskPinPrompt,
+          ),
         ),
-      ),
-      (route) => false,
-    );
+        (route) => false,
+      );
+    } finally {
+      _isHandlingUnauthorized = false;
+    }
   }
 
   @override

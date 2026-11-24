@@ -1,7 +1,25 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../core/api_client.dart';
 import '../core/theme.dart';
+
+/// Aksi yang dipilih guru setelah PIN Kiosk berhasil diverifikasi.
+enum KioskPinAction {
+  primary,
+  secondary,
+}
+
+/// Hasil terstruktur dari [KioskPinSheet.showWithAction].
+class KioskPinSheetResult {
+  const KioskPinSheetResult({
+    required this.pin,
+    required this.action,
+  });
+
+  final String pin;
+  final KioskPinAction action;
+}
 
 /// Layar 06 Figma: Bottom sheet verifikasi PIN Kiosk Guru (4–6 digit).
 class KioskPinSheet extends StatefulWidget {
@@ -11,20 +29,24 @@ class KioskPinSheet extends StatefulWidget {
     this.title = 'Masukkan PIN Kiosk Guru',
     this.subtitle = 'Masukkan 4–6 digit PIN untuk membuka kunci Mode Kiosk.',
     this.confirmLabel = 'Buka Kunci & Keluar Kiosk',
+    this.secondaryActionLabel,
     this.cancelLabel = 'Batal — Kembali ke Pemindaian Wajah',
     this.minLength = 4,
     this.maxLength = 6,
     this.onVerifiedSuccess,
+    this.onSecondaryVerifiedSuccess,
   });
 
   final Future<bool> Function(String pin) onVerify;
   final String title;
   final String subtitle;
   final String confirmLabel;
+  final String? secondaryActionLabel;
   final String cancelLabel;
   final int minLength;
   final int maxLength;
   final ValueChanged<String>? onVerifiedSuccess;
+  final ValueChanged<String>? onSecondaryVerifiedSuccess;
 
   /// Menampilkan [KioskPinSheet] sebagai modal bottom sheet dan mengembalikan PIN valid jika berhasil.
   static Future<String?> show(
@@ -51,6 +73,40 @@ class KioskPinSheet extends StatefulWidget {
     );
   }
 
+  /// Menampilkan [KioskPinSheet] dengan opsi aksi sekunder (mis. Absen Manual langsung dari Kiosk).
+  static Future<KioskPinSheetResult?> showWithAction(
+    BuildContext context, {
+    required Future<bool> Function(String pin) onVerify,
+    String title = 'Masukkan PIN Kiosk Guru',
+    String subtitle = 'Masukkan 4–6 digit PIN untuk membuka kunci Mode Kiosk.',
+    String confirmLabel = 'Buka Kunci & Keluar Kiosk',
+    String? secondaryActionLabel,
+    String cancelLabel = 'Batal — Kembali ke Pemindaian Wajah',
+  }) {
+    return showModalBottomSheet<KioskPinSheetResult>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: Colors.transparent,
+      builder: (sheetContext) => KioskPinSheet(
+        onVerify: onVerify,
+        title: title,
+        subtitle: subtitle,
+        confirmLabel: confirmLabel,
+        secondaryActionLabel: secondaryActionLabel,
+        cancelLabel: cancelLabel,
+        onVerifiedSuccess: (pin) => Navigator.of(sheetContext).pop(
+          KioskPinSheetResult(pin: pin, action: KioskPinAction.primary),
+        ),
+        onSecondaryVerifiedSuccess: secondaryActionLabel == null
+            ? null
+            : (pin) => Navigator.of(sheetContext).pop(
+                  KioskPinSheetResult(pin: pin, action: KioskPinAction.secondary),
+                ),
+      ),
+    );
+  }
+
   @override
   State<KioskPinSheet> createState() => _KioskPinSheetState();
 }
@@ -58,10 +114,12 @@ class KioskPinSheet extends StatefulWidget {
 class _KioskPinSheetState extends State<KioskPinSheet> {
   String _pin = '';
   bool _isVerifying = false;
+  KioskPinAction? _verifyingAction;
   String? _errorMessage;
 
   void _appendDigit(String digit) {
     if (_isVerifying || _pin.length >= widget.maxLength) return;
+    HapticFeedback.selectionClick();
     setState(() {
       _pin += digit;
       _errorMessage = null;
@@ -70,6 +128,7 @@ class _KioskPinSheetState extends State<KioskPinSheet> {
 
   void _backspace() {
     if (_isVerifying || _pin.isEmpty) return;
+    HapticFeedback.selectionClick();
     setState(() {
       _pin = _pin.substring(0, _pin.length - 1);
       _errorMessage = null;
@@ -78,18 +137,20 @@ class _KioskPinSheetState extends State<KioskPinSheet> {
 
   void _clearAll() {
     if (_isVerifying) return;
+    HapticFeedback.selectionClick();
     setState(() {
       _pin = '';
       _errorMessage = null;
     });
   }
 
-  Future<void> _submit() async {
+  Future<void> _submit(KioskPinAction action) async {
     if (_isVerifying || _pin.length < widget.minLength) return;
     final candidatePin = _pin;
 
     setState(() {
       _isVerifying = true;
+      _verifyingAction = action;
       _errorMessage = null;
     });
 
@@ -97,30 +158,42 @@ class _KioskPinSheetState extends State<KioskPinSheet> {
       final isValid = await widget.onVerify(candidatePin);
       if (!mounted) return;
       if (isValid) {
-        if (widget.onVerifiedSuccess != null) {
+        if (action == KioskPinAction.secondary &&
+            widget.onSecondaryVerifiedSuccess != null) {
+          widget.onSecondaryVerifiedSuccess!(candidatePin);
+        } else if (widget.onVerifiedSuccess != null) {
           widget.onVerifiedSuccess!(candidatePin);
         } else if (Navigator.of(context).canPop()) {
           Navigator.of(context).pop(candidatePin);
         } else {
-          setState(() => _isVerifying = false);
+          setState(() {
+            _isVerifying = false;
+            _verifyingAction = null;
+          });
         }
         return;
       }
 
       setState(() {
         _isVerifying = false;
+        _verifyingAction = null;
+        _pin = '';
         _errorMessage = 'PIN Kiosk salah. Silakan periksa kembali PIN Anda.';
       });
     } on ApiException catch (exc) {
       if (!mounted) return;
       setState(() {
         _isVerifying = false;
+        _verifyingAction = null;
+        _pin = '';
         _errorMessage = exc.message;
       });
     } catch (_) {
       if (!mounted) return;
       setState(() {
         _isVerifying = false;
+        _verifyingAction = null;
+        _pin = '';
         _errorMessage = 'Gagal memverifikasi PIN Kiosk. Coba lagi.';
       });
     }
@@ -240,8 +313,8 @@ class _KioskPinSheetState extends State<KioskPinSheet> {
               _buildNumericKeypad(),
               const SizedBox(height: 14),
               ElevatedButton(
-                onPressed: canSubmit ? _submit : null,
-                child: _isVerifying
+                onPressed: canSubmit ? () => _submit(KioskPinAction.primary) : null,
+                child: _isVerifying && _verifyingAction == KioskPinAction.primary
                     ? const SizedBox(
                         width: 20,
                         height: 20,
@@ -252,6 +325,22 @@ class _KioskPinSheetState extends State<KioskPinSheet> {
                       )
                     : Text(widget.confirmLabel),
               ),
+              if (widget.secondaryActionLabel != null) ...[
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  key: const Key('kiosk_pin_secondary_action_button'),
+                  onPressed:
+                      canSubmit ? () => _submit(KioskPinAction.secondary) : null,
+                  icon: _isVerifying && _verifyingAction == KioskPinAction.secondary
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.edit_note_rounded, size: 20),
+                  label: Text(widget.secondaryActionLabel!),
+                ),
+              ],
               const SizedBox(height: 8),
               TextButton(
                 onPressed: _isVerifying ? null : _cancel,

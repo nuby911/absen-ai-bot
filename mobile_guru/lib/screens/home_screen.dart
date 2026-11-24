@@ -5,6 +5,7 @@ import '../core/api_client.dart';
 import '../core/formatters.dart';
 import '../core/theme.dart';
 import '../models/models.dart';
+import '../widgets/kiosk_pin_setup_dialog.dart';
 import 'leave_verification_screen.dart';
 import 'login_screen.dart';
 import 'session_detail_screen.dart';
@@ -20,8 +21,9 @@ typedef KioskScannerBuilder = Widget Function(
 typedef LeaveVerificationTabBuilder = Widget Function(
   BuildContext context,
   VoidCallback onLeaveChanged,
-  int refreshTrigger,
-);
+  int refreshTrigger, {
+  ValueChanged<int>? onPendingCountLoaded,
+});
 
 /// Callback opsional untuk menampilkan modal PIN Kiosk (`KioskPinSheet`) di Task 10.
 typedef ManualPinPromptBuilder = Future<String?> Function(
@@ -55,9 +57,11 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   int _currentTab = 0;
   int _leaveRefreshTick = 0;
+  int? _livePendingLeavesCount;
   late UserProfile _user;
   TeacherDashboardData? _dashboard;
   bool _isLoading = true;
+  bool _isOpeningCreateDialog = false;
   String? _errorMessage;
 
   @override
@@ -79,6 +83,7 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
       setState(() {
         _dashboard = dashboard;
+        _livePendingLeavesCount = dashboard.stats.pendingLeavesCount;
         if (latestUser != null) {
           _user = latestUser;
         }
@@ -99,6 +104,13 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  void _handlePendingLeavesCountLoaded(int count) {
+    if (!mounted || _livePendingLeavesCount == count) return;
+    setState(() {
+      _livePendingLeavesCount = count;
+    });
+  }
+
   Future<void> _openSessionDetail(String sessionId) async {
     await Navigator.of(context).push<void>(
       MaterialPageRoute(
@@ -111,38 +123,58 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
     );
     if (mounted) {
+      final latestUser = widget.apiClient.currentUser;
+      if (latestUser != null && latestUser.hasKioskPin != _user.hasKioskPin) {
+        setState(() => _user = latestUser);
+      }
       _loadDashboard();
     }
   }
 
   Future<void> _showCreateSessionDialog({ScheduleItem? presetSchedule}) async {
-    List<SchoolClassItem> classes = [];
+    if (_isOpeningCreateDialog) return;
+    _isOpeningCreateDialog = true;
+
     try {
-      classes = await widget.apiClient.getClasses();
-    } on ApiException catch (exc) {
+      List<SchoolClassItem> classes = [];
+      try {
+        classes = await widget.apiClient.getClasses();
+      } on ApiException catch (exc) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(exc.message), backgroundColor: AppColors.danger),
+        );
+        return;
+      } catch (exc) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Gagal memuat daftar kelas: $exc'),
+            backgroundColor: AppColors.danger,
+          ),
+        );
+        return;
+      }
+
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(exc.message), backgroundColor: AppColors.danger),
+
+      final created = await showDialog<SessionSummary>(
+        context: context,
+        builder: (dialogContext) => _CreateSessionDialog(
+          apiClient: widget.apiClient,
+          classes: classes,
+          todaySchedules: _dashboard?.todaySchedules ?? const [],
+          presetSchedule: presetSchedule,
+        ),
       );
-      return;
-    }
 
-    if (!mounted) return;
-
-    final created = await showDialog<SessionSummary>(
-      context: context,
-      builder: (dialogContext) => _CreateSessionDialog(
-        apiClient: widget.apiClient,
-        classes: classes,
-        todaySchedules: _dashboard?.todaySchedules ?? const [],
-        presetSchedule: presetSchedule,
-      ),
-    );
-
-    if (created != null && mounted) {
-      await _loadDashboard();
-      if (!mounted) return;
-      await _openSessionDetail(created.id);
+      if (created != null && mounted) {
+        await _loadDashboard();
+        if (!mounted) return;
+        await _openSessionDetail(created.id);
+      }
+    } finally {
+      _isOpeningCreateDialog = false;
     }
   }
 
@@ -176,7 +208,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final pendingCount = _dashboard?.stats.pendingLeavesCount ?? 0;
+    final pendingCount =
+        _livePendingLeavesCount ?? _dashboard?.stats.pendingLeavesCount ?? 0;
 
     return Scaffold(
       backgroundColor: AppColors.background,
@@ -189,6 +222,7 @@ class _HomeScreenState extends State<HomeScreen> {
             apiClient: widget.apiClient,
             user: _user,
             onUserUpdated: (updated) => setState(() => _user = updated),
+            onServerUrlUpdated: _loadDashboard,
             onLogout: _logout,
           ),
         ],
@@ -232,12 +266,14 @@ class _HomeScreenState extends State<HomeScreen> {
         context,
         _loadDashboard,
         _leaveRefreshTick,
+        onPendingCountLoaded: _handlePendingLeavesCountLoaded,
       );
     }
 
     return LeaveVerificationScreen(
       apiClient: widget.apiClient,
       onLeaveChanged: _loadDashboard,
+      onPendingCountLoaded: _handlePendingLeavesCountLoaded,
       refreshTrigger: _leaveRefreshTick,
     );
   }
@@ -418,11 +454,15 @@ class _HomeScreenState extends State<HomeScreen> {
                       color: Colors.white.withValues(alpha: 0.85),
                     ),
                     const SizedBox(width: 5),
-                    Text(
-                      dateLabel,
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: Colors.white.withValues(alpha: 0.9),
+                    Flexible(
+                      child: Text(
+                        dateLabel,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Colors.white.withValues(alpha: 0.9),
+                        ),
                       ),
                     ),
                   ],
@@ -442,7 +482,17 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _buildPinWarningBanner() {
     return InkWell(
-      onTap: () => _selectTab(2),
+      onTap: () async {
+        await KioskPinSetupDialog.show(
+          context,
+          widget.apiClient,
+          onUserUpdated: (updated) {
+            if (mounted) {
+              setState(() => _user = updated);
+            }
+          },
+        );
+      },
       borderRadius: BorderRadius.circular(14),
       child: Container(
         padding: const EdgeInsets.all(12),
@@ -502,7 +552,8 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _buildKpiRow(TeacherDashboardStats? stats) {
     final presentRate = stats == null ? '-' : '${stats.presentRate.toStringAsFixed(0)}%';
     final lateCount = stats == null ? '-' : '${stats.lateCount}';
-    final pendingCount = stats == null ? '-' : '${stats.pendingLeavesCount}';
+    final resolvedPending = _livePendingLeavesCount ?? stats?.pendingLeavesCount;
+    final pendingCount = resolvedPending == null ? '-' : '$resolvedPending';
 
     return Row(
       children: [
@@ -754,11 +805,18 @@ class _SessionCard extends StatelessWidget {
               children: [
                 const Icon(Icons.access_time, size: 14, color: AppColors.textMuted),
                 const SizedBox(width: 5),
-                Text(
-                  session.expectedStartTime != null
-                      ? 'Mulai ${AppFormatters.formatTimeShort(session.expectedStartTime)} (toleransi ${session.lateToleranceMinutes} mnt)'
-                      : 'Dibuka ${AppFormatters.formatWibTime(session.openedAt)}',
-                  style: const TextStyle(fontSize: 12, color: AppColors.textSecondary),
+                Expanded(
+                  child: Text(
+                    session.expectedStartTime != null
+                        ? 'Mulai ${AppFormatters.formatTimeShort(session.expectedStartTime)} (toleransi ${session.lateToleranceMinutes} mnt)'
+                        : 'Dibuka ${AppFormatters.formatWibTime(session.openedAt)}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      color: AppColors.textSecondary,
+                    ),
+                  ),
                 ),
               ],
             ),
@@ -774,16 +832,20 @@ class _SessionCard extends StatelessWidget {
             ),
             const SizedBox(height: 8),
             Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Text(
-                  'Hadir ${session.presentCount} • Telat ${session.lateCount} • Izin/Sakit ${session.permitCount + session.sickCount}',
-                  style: const TextStyle(
-                    fontSize: 12,
-                    color: AppColors.textSecondary,
-                    fontWeight: FontWeight.w500,
+                Expanded(
+                  child: Text(
+                    'Hadir ${session.presentCount} • Telat ${session.lateCount} • Izin/Sakit ${session.permitCount + session.sickCount}${session.absentCount > 0 ? ' • Alfa ${session.absentCount}' : ''}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      color: AppColors.textSecondary,
+                      fontWeight: FontWeight.w500,
+                    ),
                   ),
                 ),
+                const SizedBox(width: 8),
                 Text(
                   '${session.recordedCount}/${session.totalStudents}',
                   style: const TextStyle(
@@ -1079,8 +1141,12 @@ class _CreateSessionDialogState extends State<_CreateSessionDialog> {
                 setState(() {
                   _sessionType = val;
                   _error = null;
-                  if (val != 'subject') {
+                  if (val == 'gate_in' || val == 'gate_out') {
                     _selectedScheduleId = null;
+                    _selectedClassId = null;
+                    if (val == 'gate_out') {
+                      _expectedStartTime = null;
+                    }
                   } else if (_resolveValidClassId(_selectedClassId) == null &&
                       widget.classes.isNotEmpty) {
                     _selectedClassId = widget.classes.first.id;
@@ -1179,11 +1245,26 @@ class _CreateSessionDialogState extends State<_CreateSessionDialog> {
                       }
                     },
                     child: InputDecorator(
-                      decoration: const InputDecoration(labelText: 'Jam Mulai'),
+                      decoration: InputDecoration(
+                        labelText: 'Jam Mulai',
+                        suffixIcon: _expectedStartTime != null
+                            ? IconButton(
+                                key: const Key('clear_expected_start_time_button'),
+                                tooltip: 'Hapus jam mulai (Tidak dibatasi)',
+                                padding: EdgeInsets.zero,
+                                constraints: const BoxConstraints(),
+                                icon: const Icon(Icons.close_rounded, size: 18),
+                                onPressed: () =>
+                                    setState(() => _expectedStartTime = null),
+                              )
+                            : null,
+                      ),
                       child: Text(
                         _expectedStartTime != null
                             ? _formatTimeDisplay(_expectedStartTime!)
                             : 'Tidak dibatasi',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
                       ),
                     ),
                   ),
@@ -1229,12 +1310,14 @@ class _ProfilePinTab extends StatefulWidget {
     required this.apiClient,
     required this.user,
     required this.onUserUpdated,
+    required this.onServerUrlUpdated,
     required this.onLogout,
   });
 
   final ApiClient apiClient;
   final UserProfile user;
   final ValueChanged<UserProfile> onUserUpdated;
+  final VoidCallback onServerUrlUpdated;
   final VoidCallback onLogout;
 
   @override
@@ -1242,9 +1325,15 @@ class _ProfilePinTab extends StatefulWidget {
 }
 
 class _ProfilePinTabState extends State<_ProfilePinTab> {
+  final _currentPinController = TextEditingController();
   final _pinController = TextEditingController();
+  final _confirmPinController = TextEditingController();
   late final TextEditingController _serverController;
+  bool _obscureCurrentPin = true;
+  bool _obscureNewPin = true;
+  bool _obscureConfirmPin = true;
   bool _savingPin = false;
+  String? _serverUrlError;
 
   @override
   void initState() {
@@ -1254,28 +1343,51 @@ class _ProfilePinTabState extends State<_ProfilePinTab> {
 
   @override
   void dispose() {
+    _currentPinController.dispose();
     _pinController.dispose();
+    _confirmPinController.dispose();
     _serverController.dispose();
     super.dispose();
   }
 
+  void _showErrorSnackBar(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), backgroundColor: AppColors.danger),
+    );
+  }
+
   Future<void> _savePin() async {
+    final currentPin = _currentPinController.text.trim();
     final pin = _pinController.text.trim();
-    if (!RegExp(r'^\d{4,6}$').hasMatch(pin)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('PIN Kiosk harus terdiri dari 4 hingga 6 digit angka.'),
-          backgroundColor: AppColors.danger,
-        ),
+    final confirmPin = _confirmPinController.text.trim();
+
+    if (widget.user.hasKioskPin && !RegExp(r'^\d{4,6}$').hasMatch(currentPin)) {
+      _showErrorSnackBar(
+        'PIN Kiosk lama wajib diisi (4 hingga 6 digit angka).',
       );
+      return;
+    }
+
+    if (!RegExp(r'^\d{4,6}$').hasMatch(pin)) {
+      _showErrorSnackBar('PIN Kiosk baru harus terdiri dari 4 hingga 6 digit angka.');
+      return;
+    }
+
+    if (pin != confirmPin) {
+      _showErrorSnackBar('Konfirmasi PIN baru tidak sama dengan PIN baru.');
       return;
     }
 
     setState(() => _savingPin = true);
     try {
-      await widget.apiClient.updateKioskPin(pin);
+      await widget.apiClient.updateKioskPin(
+        pin,
+        currentPin: widget.user.hasKioskPin ? currentPin : null,
+      );
       widget.onUserUpdated(widget.user.copyWith(hasKioskPin: true));
+      _currentPinController.clear();
       _pinController.clear();
+      _confirmPinController.clear();
       if (!mounted) return;
       FocusScope.of(context).unfocus();
       ScaffoldMessenger.of(context).showSnackBar(
@@ -1286,9 +1398,10 @@ class _ProfilePinTabState extends State<_ProfilePinTab> {
       );
     } on ApiException catch (exc) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(exc.message), backgroundColor: AppColors.danger),
-      );
+      _showErrorSnackBar(exc.message);
+    } catch (exc) {
+      if (!mounted) return;
+      _showErrorSnackBar('Gagal menyimpan PIN Kiosk: $exc');
     } finally {
       if (mounted) {
         setState(() => _savingPin = false);
@@ -1297,16 +1410,32 @@ class _ProfilePinTabState extends State<_ProfilePinTab> {
   }
 
   Future<void> _saveServerUrl() async {
-    final url = _serverController.text.trim();
-    if (url.isEmpty) return;
-    await widget.apiClient.setBaseUrl(url);
-    if (!mounted) return;
-    FocusScope.of(context).unfocus();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('URL Server diperbarui: ${widget.apiClient.baseUrl}'),
-      ),
-    );
+    final validated = ApiClient.validateAndNormalizeBaseUrl(_serverController.text);
+    if (validated.url == null) {
+      setState(() => _serverUrlError = validated.error);
+      return;
+    }
+
+    setState(() => _serverUrlError = null);
+    try {
+      await widget.apiClient.setBaseUrl(validated.url!);
+      _serverController.text = widget.apiClient.baseUrl;
+      if (!mounted) return;
+      FocusScope.of(context).unfocus();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('URL Server diperbarui: ${widget.apiClient.baseUrl}'),
+          backgroundColor: AppColors.success,
+        ),
+      );
+      widget.onServerUrlUpdated();
+    } on ApiException catch (exc) {
+      if (!mounted) return;
+      setState(() => _serverUrlError = exc.message);
+    } catch (exc) {
+      if (!mounted) return;
+      _showErrorSnackBar('Gagal memperbarui URL server: $exc');
+    }
   }
 
   @override
@@ -1419,17 +1548,90 @@ class _ProfilePinTabState extends State<_ProfilePinTab> {
                   style: TextStyle(fontSize: 12.5, color: AppColors.textSecondary),
                 ),
                 const SizedBox(height: 14),
+                if (widget.user.hasKioskPin) ...[
+                  TextField(
+                    key: const Key('profile_current_pin_field'),
+                    controller: _currentPinController,
+                    obscureText: _obscureCurrentPin,
+                    maxLength: 6,
+                    keyboardType: TextInputType.number,
+                    inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                    textInputAction: TextInputAction.next,
+                    decoration: InputDecoration(
+                      labelText: 'PIN Kiosk Lama',
+                      hintText: 'Masukkan PIN Kiosk saat ini',
+                      counterText: '',
+                      prefixIcon: const Icon(Icons.lock_outline_rounded),
+                      suffixIcon: IconButton(
+                        tooltip: _obscureCurrentPin
+                            ? 'Tampilkan PIN'
+                            : 'Sembunyikan PIN',
+                        onPressed: () => setState(
+                          () => _obscureCurrentPin = !_obscureCurrentPin,
+                        ),
+                        icon: Icon(
+                          _obscureCurrentPin
+                              ? Icons.visibility_outlined
+                              : Icons.visibility_off_outlined,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                ],
                 TextField(
+                  key: const Key('profile_new_pin_field'),
                   controller: _pinController,
-                  obscureText: true,
+                  obscureText: _obscureNewPin,
                   maxLength: 6,
                   keyboardType: TextInputType.number,
                   inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                  decoration: const InputDecoration(
+                  textInputAction: TextInputAction.next,
+                  decoration: InputDecoration(
                     labelText: 'PIN Kiosk Baru (4–6 Digit)',
                     hintText: 'Contoh: 1234',
                     counterText: '',
-                    prefixIcon: Icon(Icons.lock_reset_outlined),
+                    prefixIcon: const Icon(Icons.lock_reset_outlined),
+                    suffixIcon: IconButton(
+                      tooltip: _obscureNewPin ? 'Tampilkan PIN' : 'Sembunyikan PIN',
+                      onPressed: () =>
+                          setState(() => _obscureNewPin = !_obscureNewPin),
+                      icon: Icon(
+                        _obscureNewPin
+                            ? Icons.visibility_outlined
+                            : Icons.visibility_off_outlined,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  key: const Key('profile_confirm_pin_field'),
+                  controller: _confirmPinController,
+                  obscureText: _obscureConfirmPin,
+                  maxLength: 6,
+                  keyboardType: TextInputType.number,
+                  inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                  textInputAction: TextInputAction.done,
+                  onSubmitted: (_) => _savingPin ? null : _savePin(),
+                  decoration: InputDecoration(
+                    labelText: 'Konfirmasi PIN Baru',
+                    hintText: 'Ulangi PIN Kiosk baru',
+                    counterText: '',
+                    prefixIcon: const Icon(Icons.verified_user_outlined),
+                    suffixIcon: IconButton(
+                      tooltip: _obscureConfirmPin
+                          ? 'Tampilkan PIN'
+                          : 'Sembunyikan PIN',
+                      onPressed: () => setState(
+                        () => _obscureConfirmPin = !_obscureConfirmPin,
+                      ),
+                      icon: Icon(
+                        _obscureConfirmPin
+                            ? Icons.visibility_outlined
+                            : Icons.visibility_off_outlined,
+                      ),
+                    ),
                   ),
                 ),
                 const SizedBox(height: 12),
@@ -1444,7 +1646,9 @@ class _ProfilePinTabState extends State<_ProfilePinTab> {
                             color: Colors.white,
                           ),
                         )
-                      : Text(widget.user.hasKioskPin ? 'Perbarui PIN Kiosk' : 'Simpan PIN Kiosk'),
+                      : Text(widget.user.hasKioskPin
+                          ? 'Perbarui PIN Kiosk'
+                          : 'Simpan PIN Kiosk'),
                 ),
               ],
             ),
@@ -1468,9 +1672,16 @@ class _ProfilePinTabState extends State<_ProfilePinTab> {
                 TextField(
                   controller: _serverController,
                   keyboardType: TextInputType.url,
-                  decoration: const InputDecoration(
+                  onChanged: (_) {
+                    if (_serverUrlError != null) {
+                      setState(() => _serverUrlError = null);
+                    }
+                  },
+                  decoration: InputDecoration(
                     labelText: 'API Base URL',
-                    prefixIcon: Icon(Icons.dns_outlined),
+                    hintText: 'http://10.0.2.2:8000/api/v1',
+                    prefixIcon: const Icon(Icons.dns_outlined),
+                    errorText: _serverUrlError,
                   ),
                 ),
                 const SizedBox(height: 12),

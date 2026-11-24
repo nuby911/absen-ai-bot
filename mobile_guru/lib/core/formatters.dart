@@ -115,7 +115,7 @@ abstract final class AppFormatters {
     switch (method) {
       case 'face_kiosk':
       case 'face_recognition':
-        return 'Scan Wajah Kiosk';
+        return 'Scan Wajah';
       case 'manual_teacher':
         return 'Manual Guru';
       case 'leave_approved':

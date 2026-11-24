@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -74,7 +75,7 @@ class _LoginScreenState extends State<LoginScreen> {
 
       var activeUser = result.user;
       final pinText = _pinController.text.trim();
-      if (pinText.isNotEmpty) {
+      if (pinText.isNotEmpty && !result.user.hasKioskPin) {
         try {
           await widget.apiClient.updateKioskPin(pinText);
         } catch (_) {
@@ -135,11 +136,14 @@ class _LoginScreenState extends State<LoginScreen> {
     }
   }
 
+  static const bool _showDemoLoginButton =
+      kDebugMode || bool.fromEnvironment('SHOW_DEMO_LOGIN');
+
   void _fillDemoTeacher() {
     setState(() {
       _identifierController.text = 'sari.wulandari@sekolah.sch.id';
       _passwordController.text = 'guru123';
-      _pinController.text = '1234';
+      _pinController.clear();
       _errorMessage = null;
     });
   }
@@ -430,12 +434,14 @@ class _LoginScreenState extends State<LoginScreen> {
                     )
                   : const Text('Masuk ke Beranda Guru'),
             ),
-            const SizedBox(height: 10),
-            OutlinedButton.icon(
-              onPressed: _isSubmitting ? null : _fillDemoTeacher,
-              icon: const Icon(Icons.auto_fix_high_outlined, size: 18),
-              label: const Text('Isi Akun Demo Ibu Sari'),
-            ),
+            if (_showDemoLoginButton) ...[
+              const SizedBox(height: 10),
+              OutlinedButton.icon(
+                onPressed: _isSubmitting ? null : _fillDemoTeacher,
+                icon: const Icon(Icons.auto_fix_high_outlined, size: 18),
+                label: const Text('Isi Akun Demo Ibu Sari'),
+              ),
+            ],
           ],
         ),
       ),
@@ -454,6 +460,7 @@ class _ServerConfigDialog extends StatefulWidget {
 
 class _ServerConfigDialogState extends State<_ServerConfigDialog> {
   late final TextEditingController _controller;
+  String? _errorText;
 
   @override
   void initState() {
@@ -468,7 +475,12 @@ class _ServerConfigDialogState extends State<_ServerConfigDialog> {
   }
 
   void _save() {
-    Navigator.of(context).pop(_controller.text.trim());
+    final validated = ApiClient.validateAndNormalizeBaseUrl(_controller.text);
+    if (validated.url == null) {
+      setState(() => _errorText = validated.error);
+      return;
+    }
+    Navigator.of(context).pop(validated.url);
   }
 
   @override
@@ -488,10 +500,16 @@ class _ServerConfigDialogState extends State<_ServerConfigDialog> {
             controller: _controller,
             keyboardType: TextInputType.url,
             textInputAction: TextInputAction.done,
+            onChanged: (_) {
+              if (_errorText != null) {
+                setState(() => _errorText = null);
+              }
+            },
             onSubmitted: (_) => _save(),
-            decoration: const InputDecoration(
+            decoration: InputDecoration(
               labelText: 'API Base URL',
               hintText: 'http://10.0.2.2:8000/api/v1',
+              errorText: _errorText,
             ),
           ),
         ],

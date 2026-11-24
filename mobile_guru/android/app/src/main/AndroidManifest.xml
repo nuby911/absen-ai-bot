@@ -6,10 +6,9 @@
     <uses-feature android:name="android.hardware.camera.front" android:required="false" />
 
     <application
-        android:label="smart_school_guru"
+        android:label="SmartSchool Guru"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher"
-        android:usesCleartextTraffic="true">
+        android:icon="@mipmap/ic_launcher">
         <activity
             android:name=".MainActivity"
             android:exported="true"

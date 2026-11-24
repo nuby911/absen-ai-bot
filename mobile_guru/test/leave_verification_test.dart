@@ -151,8 +151,14 @@ void main() {
 
         await tester.tap(find.text('Setujui & Kabari WA'));
         await tester.pumpAndSettle();
+        expect(find.text('Setujui Pengajuan SAKIT?'), findsOneWidget);
+        await tester.tap(find.byKey(const Key('leave_confirm_decision_button')));
+        await tester.pumpAndSettle();
 
         await tester.tap(find.text('Tolak'));
+        await tester.pumpAndSettle();
+        expect(find.text('Tolak Pengajuan SAKIT?'), findsOneWidget);
+        await tester.tap(find.byKey(const Key('leave_confirm_decision_button')));
         await tester.pumpAndSettle();
 
         expect(calls, [
@@ -202,10 +208,12 @@ void main() {
     );
 
     testWidgets(
-      'mengambil daftar dari ApiClient dan memanggil PATCH /leave-requests/{id}/verify saat Setujui ditekan',
+      'mengambil daftar dari ApiClient, mengirim note opsional pada PATCH verify, dan menyinkronkan badge pending',
       (WidgetTester tester) async {
         String currentStatus = 'pending';
         String? sentDecision;
+        String? sentNote;
+        final reportedPendingCounts = <int>[];
 
         final apiClient = _createStubApiClient((options) {
           if (options.path == '/leave-requests' && options.method == 'GET') {
@@ -231,6 +239,7 @@ void main() {
                     currentStatus == 'pending' ? null : 'Ibu Sari Wulandari, S.Pd',
                 'verified_at':
                     currentStatus == 'pending' ? null : '2026-11-23T01:00:00Z',
+                'verification_note': currentStatus == 'pending' ? null : sentNote,
                 'created_at': '2026-11-23T00:10:00Z',
               },
             ];
@@ -239,6 +248,7 @@ void main() {
               options.method == 'PATCH') {
             final body = options.data as Map<String, dynamic>;
             sentDecision = body['decision'] as String?;
+            sentNote = body['note'] as String?;
             currentStatus = 'approved';
             return {
               'leave': {
@@ -260,6 +270,7 @@ void main() {
                 'verified_by': 'tch-1',
                 'verified_by_name': 'Ibu Sari Wulandari, S.Pd',
                 'verified_at': '2026-11-23T01:00:00Z',
+                'verification_note': sentNote,
                 'created_at': '2026-11-23T00:10:00Z',
               },
               'synced_sessions_count': 1,
@@ -277,23 +288,44 @@ void main() {
             home: LeaveVerificationScreen(
               apiClient: apiClient,
               onLeaveChanged: () => notifyParentCount += 1,
+              onPendingCountLoaded: reportedPendingCounts.add,
             ),
           ),
         );
         await tester.pumpAndSettle();
 
+        expect(reportedPendingCounts, [1]);
         expect(find.text('Septi Cahyaningtias'), findsOneWidget);
+        expect(find.textContaining('Diajukan 23 Nov 2026, 07:10 WIB'), findsOneWidget);
+
+        // Buka dialog konfirmasi lalu batalkan -> tidak memanggil PATCH
         await tester.tap(find.text('Setujui & Kabari WA'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Batal'));
+        await tester.pumpAndSettle();
+        expect(sentDecision, isNull);
+
+        // Buka ulang dialog konfirmasi, isi catatan opsional, lalu konfirmasi
+        await tester.tap(find.text('Setujui & Kabari WA'));
+        await tester.pumpAndSettle();
+        await tester.enterText(
+          find.byKey(const Key('leave_verification_note_field')),
+          'Semoga lekas sembuh',
+        );
+        await tester.tap(find.byKey(const Key('leave_confirm_decision_button')));
         await tester.pumpAndSettle();
 
         expect(sentDecision, 'approved');
+        expect(sentNote, 'Semoga lekas sembuh');
         expect(notifyParentCount, 1);
+        expect(reportedPendingCounts, [1, 0]);
 
-        // Setelah refresh, Septi berpindah dari tab Menunggu ke tab Disetujui
+        // Setelah refresh, Septi berpindah dari tab Menunggu ke tab Disetujui dengan catatan guru
         expect(find.text('Septi Cahyaningtias'), findsNothing);
         await tester.tap(find.text('Disetujui'));
         await tester.pumpAndSettle();
         expect(find.text('Septi Cahyaningtias'), findsOneWidget);
+        expect(find.textContaining('Catatan guru: Semoga lekas sembuh'), findsOneWidget);
       },
     );
 
