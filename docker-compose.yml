@@ -29,7 +29,10 @@ services:
       - waha_sessions:/app/.sessions
 
   backend:
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        INSTALL_ML: ${INSTALL_ML:-false}
     restart: unless-stopped
     depends_on:
       postgres:
@@ -41,6 +44,7 @@ services:
       ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-480}
       FACE_SIMILARITY_THRESHOLD: ${FACE_SIMILARITY_THRESHOLD:-0.55}
       FACE_ENGINE_MODE: ${FACE_ENGINE_MODE:-auto}
+      INSIGHTFACE_HOME: ${INSIGHTFACE_HOME:-/app/.insightface}
       WHATSAPP_PROVIDER_MODE: ${WHATSAPP_PROVIDER_MODE:-mock}
       WAHA_BASE_URL: http://waha:3000
       WAHA_API_KEY: ${WAHA_API_KEY:-}
@@ -55,14 +59,28 @@ services:
       - "127.0.0.1:8000:8000"
     volumes:
       - backend_uploads:/app/uploads
+      - insightface_models:/app/.insightface
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
       interval: 15s
       timeout: 5s
       retries: 3
       start_period: 15s
 
+  web_admin:
+    build:
+      context: ./web_admin
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000/api/v1}
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3001:3001"
+
 volumes:
   postgres_data:
   waha_sessions:
   backend_uploads:
+  insightface_models:
