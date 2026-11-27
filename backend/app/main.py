@@ -3,9 +3,11 @@ from contextlib import asynccontextmanager
 import logging
 from pathlib import Path
 
-from fastapi import FastAPI, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.models  # noqa: F401
 from app.config import KNOWN_DEFAULT_JWT_SECRETS, Settings, get_settings
@@ -121,6 +123,18 @@ def create_app(
     @app.get("/health")
     async def health_check() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/health/ready")
+    async def readiness_check(db: AsyncSession = Depends(get_db)) -> dict[str, str]:
+        try:
+            await db.execute(text("SELECT 1"))
+        except Exception as exc:
+            logger.exception("Pemeriksaan kesiapan database gagal: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Database tidak siap menerima koneksi.",
+            ) from exc
+        return {"status": "ok", "database": "ok"}
 
     app.include_router(auth_router)
     app.include_router(admin_router)

@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 from io import BytesIO
 import logging
+from pathlib import Path
 import threading
 from typing import Any, Protocol, runtime_checkable
 import warnings
@@ -235,10 +236,12 @@ class InsightFaceEngine:
         model_name: str = "buffalo_l",
         providers: Sequence[str] | None = None,
         min_det_score: float = 0.5,
+        root_dir: str | None = None,
     ) -> None:
         self.model_name = model_name
         self.providers = list(providers) if providers is not None else ["CPUExecutionProvider"]
         self.min_det_score = min_det_score
+        self.root_dir = root_dir
         self._face_app: Any = None
         self._lock = threading.Lock()
 
@@ -248,7 +251,14 @@ class InsightFaceEngine:
                 if self._face_app is None:
                     from insightface.app import FaceAnalysis  # type: ignore[import-not-found]
 
-                    face_app = FaceAnalysis(name=self.model_name, providers=self.providers)
+                    init_kwargs: dict[str, Any] = {
+                        "name": self.model_name,
+                        "providers": self.providers,
+                    }
+                    if self.root_dir:
+                        Path(self.root_dir).mkdir(parents=True, exist_ok=True)
+                        init_kwargs["root"] = self.root_dir
+                    face_app = FaceAnalysis(**init_kwargs)
                     uses_gpu = any(
                         "cuda" in provider.lower() or "tensorrt" in provider.lower()
                         for provider in self.providers
@@ -308,13 +318,14 @@ def _insightface_available() -> bool:
 def create_face_engine(settings: Settings) -> FaceEngine:
     """Instantiate the configured FaceEngine implementation based on settings."""
     mode = settings.face_engine_mode.strip().lower()
+    root_dir = settings.insightface_home.strip() or str(Path(settings.upload_dir) / ".insightface")
     if mode == "deterministic":
         return DeterministicFaceEngine()
     if mode == "insightface":
-        return InsightFaceEngine()
+        return InsightFaceEngine(root_dir=root_dir)
     if mode == "auto":
         if _insightface_available():
-            return InsightFaceEngine()
+            return InsightFaceEngine(root_dir=root_dir)
         logger.warning(
             "InsightFace/ONNXRuntime tidak terpasang; FaceEngine dalam mode 'auto' "
             "beralih ke DeterministicFaceEngine (fallback pengembangan/pengujian)."

@@ -19,6 +19,27 @@ class Base(DeclarativeBase):
     """Base class for all SQLAlchemy ORM models."""
 
 
+def format_column_default_sql(column: Any, dialect_name: str) -> str:
+    """Return SQL DEFAULT clause for a column, safely handling SQLite and PostgreSQL dialects."""
+    if column.server_default is not None:
+        return f" DEFAULT {column.server_default.arg}"
+    if column.default is not None and getattr(column.default, "is_scalar", False):
+        val = column.default.arg
+        if isinstance(val, bool):
+            val_str = ("1" if val else "0") if dialect_name == "sqlite" else ("TRUE" if val else "FALSE")
+        elif isinstance(val, (int, float)):
+            val_str = str(val)
+        else:
+            escaped = str(val).replace("'", "''")
+            val_str = f"'{escaped}'"
+        return f" DEFAULT {val_str}"
+    if column.name == "is_active":
+        return " DEFAULT 1" if dialect_name == "sqlite" else " DEFAULT TRUE"
+    if column.name == "is_impostor":
+        return " DEFAULT 0" if dialect_name == "sqlite" else " DEFAULT FALSE"
+    return ""
+
+
 def sync_schema_columns(sync_conn: Any) -> None:
     """Ensure missing columns in existing tables are added automatically."""
     from sqlalchemy import inspect, text
@@ -34,22 +55,7 @@ def sync_schema_columns(sync_conn: Any) -> None:
         for column in table.columns:
             if column.name not in existing_cols:
                 col_type = column.type.compile(dialect=dialect)
-                default_clause = ""
-                if column.server_default is not None:
-                    default_clause = f" DEFAULT {column.server_default.arg}"
-                elif column.default is not None and getattr(column.default, "is_scalar", False):
-                    val = column.default.arg
-                    if isinstance(val, bool):
-                        val_str = "1" if val else "0" if dialect_name == "sqlite" else ("TRUE" if val else "FALSE")
-                    elif isinstance(val, (int, float)):
-                        val_str = str(val)
-                    else:
-                        val_str = f"'{val}'"
-                    default_clause = f" DEFAULT {val_str}"
-                elif column.name == "is_active":
-                    default_clause = " DEFAULT 1" if dialect_name == "sqlite" else " DEFAULT TRUE"
-                elif column.name == "is_impostor":
-                    default_clause = " DEFAULT 0" if dialect_name == "sqlite" else " DEFAULT FALSE"
+                default_clause = format_column_default_sql(column, dialect_name)
 
                 null_clause = ""
                 if not column.nullable and default_clause:
