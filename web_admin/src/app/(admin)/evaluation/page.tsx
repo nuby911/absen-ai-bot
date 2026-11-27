@@ -873,12 +873,12 @@ export default function EvaluationPage() {
             <table className="w-full text-left text-xs">
               <thead className="border-b border-[#E2E8F0] bg-[#F8FAFC] font-semibold text-slate-500">
                 <tr>
-                  <th className="px-3 py-2.5">Waktu & Pengirim</th>
-                  <th className="px-3 py-2.5">Pesan Orang Tua</th>
-                  <th className="px-3 py-2.5">Topik / Aksi</th>
-                  <th className="px-3 py-2.5">Status</th>
-                  <th className="px-3 py-2.5 text-right">Kecepatan</th>
-                  <th className="px-3 py-2.5 text-right">Detail</th>
+                  <th className="px-2 py-2.5">Pengirim</th>
+                  <th className="px-2 py-2.5">Pesan</th>
+                  <th className="px-2 py-2.5">Topik</th>
+                  <th className="px-2 py-2.5">Status</th>
+                  <th className="px-2 py-2.5 text-right">Waktu</th>
+                  <th className="px-2 py-2.5 text-right">Aksi</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#E2E8F0]">
@@ -901,59 +901,63 @@ export default function EvaluationPage() {
                       onClick={() => setSelectedChatbotLog(log)}
                       className="cursor-pointer hover:bg-[#F8FAFC]"
                     >
-                      <td className="px-3 py-3 align-top whitespace-nowrap">
+                      <td className="px-2 py-3 align-top whitespace-nowrap">
                         <p className="font-mono font-semibold text-[#0F172A]">
                           {formatWaPhoneDisplay(log.phone_wa)}
                         </p>
                         <p className="text-[11px] text-slate-400">
-                          {formatWibDateTime(log.created_at)}
+                          {formatWibDateTime(log.created_at).replace(" WIB", "")}
                         </p>
                       </td>
-                      <td className="px-3 py-3 align-top max-w-xs">
+                      <td className="px-2 py-3 align-top max-w-[140px]">
                         <p className="text-slate-700 line-clamp-2">
                           {log.user_message}
                         </p>
                       </td>
-                      <td className="px-3 py-3 align-top">
-                        <p className="font-semibold text-[#0F172A]">
+                      <td className="px-2 py-3 align-top max-w-[135px]">
+                        <p className="truncate font-semibold text-[#0F172A]">
                           {log.detected_intent || "-"}
                         </p>
                         {log.tool_called ? (
-                          <code className="mt-0.5 inline-block rounded bg-[#EFF6FF] px-1.5 py-0.5 font-mono text-[10px] font-semibold text-[#1D4ED8]">
+                          <code className="mt-0.5 inline-block max-w-full truncate rounded bg-[#EFF6FF] px-1.5 py-0.5 font-mono text-[10px] font-semibold text-[#1D4ED8]">
                             {log.tool_called}()
                           </code>
                         ) : (
                           <span className="text-[11px] text-slate-400">
-                            Tanpa tool call
+                            Tanpa aksi
                           </span>
                         )}
                       </td>
-                      <td className="px-3 py-3 align-top">
+                      <td className="px-2 py-3 align-top">
                         <div className="flex flex-col items-start gap-1">
                           <StatusBadge
                             tone={log.is_in_domain ? "success" : "danger"}
+                            className="whitespace-nowrap"
                           >
-                            {log.is_in_domain ? "Topik Sekolah" : "Di Luar Topik"}
+                            {log.is_in_domain ? "Sekolah" : "Luar Topik"}
                           </StatusBadge>
                           {log.is_fallback ? (
-                            <StatusBadge tone="warning">Cadangan</StatusBadge>
+                            <StatusBadge tone="warning" className="whitespace-nowrap">
+                              Cadangan
+                            </StatusBadge>
                           ) : null}
                         </div>
                       </td>
-                      <td className="px-3 py-3 align-top text-right font-mono font-semibold text-slate-700 whitespace-nowrap">
+                      <td className="px-2 py-3 align-top text-right font-mono font-semibold text-slate-700 whitespace-nowrap">
                         {log.latency_ms} ms
                       </td>
-                      <td className="px-3 py-3 align-top text-right">
+                      <td className="px-2 py-3 align-top text-right whitespace-nowrap">
                         <button
                           type="button"
+                          title="Lihat detail percakapan"
+                          aria-label="Lihat detail percakapan"
                           onClick={(e) => {
                             e.stopPropagation();
                             setSelectedChatbotLog(log);
                           }}
-                          className="inline-flex items-center gap-1 rounded-lg border border-[#E2E8F0] bg-white px-2.5 py-1 text-[11px] font-semibold text-[#1D4ED8] hover:border-[#1D4ED8] hover:bg-[#EFF6FF]"
+                          className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[#E2E8F0] bg-white text-[#1D4ED8] hover:border-[#1D4ED8] hover:bg-[#EFF6FF]"
                         >
-                          <Eye className="h-3 w-3" aria-hidden="true" />
-                          <span>Lihat</span>
+                          <Eye className="h-3.5 w-3.5" aria-hidden="true" />
                         </button>
                       </td>
                     </tr>
@@ -1245,15 +1249,15 @@ export default function EvaluationPage() {
           <table className="w-full text-left text-xs">
             <thead className="border-b border-[#E2E8F0] bg-[#F8FAFC] font-semibold text-slate-500">
               <tr>
-                <th className="px-4 py-3 whitespace-nowrap">Waktu Scan</th>
-                <th className="px-4 py-3 whitespace-nowrap">Tebakan Kamera</th>
-                <th className="px-4 py-3 whitespace-nowrap">Orang Sebenarnya</th>
-                <th className="px-4 py-3 whitespace-nowrap">Skor / Batas</th>
-                <th className="px-4 py-3 whitespace-nowrap">Kedip Mata</th>
-                <th className="px-4 py-3 whitespace-nowrap">Hasil</th>
-                <th className="px-4 py-3 whitespace-nowrap">Catatan</th>
-                <th className="px-4 py-3 text-right whitespace-nowrap">Kecepatan</th>
-                <th className="px-4 py-3 text-right whitespace-nowrap">Aksi</th>
+                <th className="px-3 py-3 whitespace-nowrap">Waktu Scan</th>
+                <th className="px-3 py-3 whitespace-nowrap">Tebakan Kamera</th>
+                <th className="px-3 py-3 whitespace-nowrap">Orang Sebenarnya</th>
+                <th className="px-3 py-3 whitespace-nowrap">Skor / Batas</th>
+                <th className="px-3 py-3 whitespace-nowrap">Kedip</th>
+                <th className="px-3 py-3 whitespace-nowrap">Hasil</th>
+                <th className="px-3 py-3 whitespace-nowrap">Catatan</th>
+                <th className="px-3 py-3 text-right whitespace-nowrap">Waktu</th>
+                <th className="px-3 py-3 text-right whitespace-nowrap">Aksi</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-[#E2E8F0]">
@@ -1274,17 +1278,17 @@ export default function EvaluationPage() {
                   const isLabeled = log.classification !== "unlabeled";
                   return (
                     <tr key={log.id} className="hover:bg-[#F8FAFC]">
-                      <td className="px-4 py-3 whitespace-nowrap text-slate-600">
-                        {formatWibDateTime(log.created_at)}
+                      <td className="px-3 py-3 whitespace-nowrap text-slate-600">
+                        {formatWibDateTime(log.created_at).replace(" WIB", "")}
                       </td>
-                      <td className="px-4 py-3 font-semibold text-[#0F172A]">
+                      <td className="px-3 py-3 font-semibold text-[#0F172A]">
                         {log.predicted_student_name ?? (
                           <span className="text-slate-400 italic">
                             Tidak Cocok
                           </span>
                         )}
                       </td>
-                      <td className="px-4 py-3 whitespace-nowrap">
+                      <td className="px-3 py-3 whitespace-nowrap">
                         {log.is_impostor ? (
                           <StatusBadge tone="danger">Orang Lain</StatusBadge>
                         ) : log.actual_student_name ? (
@@ -1295,7 +1299,7 @@ export default function EvaluationPage() {
                           <span className="text-slate-400">Belum dikoreksi</span>
                         )}
                       </td>
-                      <td className="px-4 py-3 font-mono whitespace-nowrap">
+                      <td className="px-3 py-3 font-mono whitespace-nowrap">
                         <span className="font-bold text-[#0F172A]">
                           {log.top_similarity_score.toFixed(3)}
                         </span>{" "}
@@ -1303,14 +1307,14 @@ export default function EvaluationPage() {
                           / {log.threshold_used.toFixed(2)}
                         </span>
                       </td>
-                      <td className="px-4 py-3 whitespace-nowrap">
+                      <td className="px-3 py-3 whitespace-nowrap">
                         <StatusBadge
                           tone={log.liveness_passed ? "success" : "danger"}
                         >
                           {log.liveness_passed ? "Lolos" : "Gagal"}
                         </StatusBadge>
                       </td>
-                      <td className="px-4 py-3 whitespace-nowrap">
+                      <td className="px-3 py-3 whitespace-nowrap">
                         <StatusBadge
                           tone={getClassificationBadgeTone(log.classification)}
                         >
@@ -1319,13 +1323,13 @@ export default function EvaluationPage() {
                             : log.classification}
                         </StatusBadge>
                       </td>
-                      <td className="px-4 py-3 font-mono text-[11px] text-slate-600">
+                      <td className="px-3 py-3 font-mono text-[11px] text-slate-600">
                         {log.condition_note || "-"}
                       </td>
-                      <td className="px-4 py-3 text-right font-mono text-slate-700 whitespace-nowrap">
+                      <td className="px-3 py-3 text-right font-mono text-slate-700 whitespace-nowrap">
                         {log.latency_ms} ms
                       </td>
-                      <td className="px-4 py-3 text-right whitespace-nowrap">
+                      <td className="px-3 py-3 text-right whitespace-nowrap">
                         <button
                           type="button"
                           onClick={() => setLabelingLog(log)}

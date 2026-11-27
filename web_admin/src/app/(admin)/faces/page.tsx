@@ -199,9 +199,9 @@ function FaceSlotCard({
       </div>
 
       <div className="p-3 space-y-2">
-        <div className="flex items-center justify-between gap-1.5 text-xs">
+        <div className="flex items-center justify-between gap-1 text-xs">
           <span className="whitespace-nowrap font-semibold text-slate-600">
-            Kualitas Foto
+            Kualitas
           </span>
           <span
             className={`whitespace-nowrap font-mono font-bold ${
