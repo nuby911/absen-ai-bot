@@ -30,6 +30,9 @@ local.properties
 .env
 .env.local
 .env.*.local
+key.properties
+*.jks
+*.keystore
 uploads/
 *.db
 *.sqlite
