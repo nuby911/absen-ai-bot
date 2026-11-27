@@ -199,10 +199,12 @@ function FaceSlotCard({
       </div>
 
       <div className="p-3 space-y-2">
-        <div className="flex items-center justify-between text-xs">
-          <span className="font-semibold text-slate-600">Skor Kualitas AI</span>
+        <div className="flex items-center justify-between gap-1.5 text-xs">
+          <span className="whitespace-nowrap font-semibold text-slate-600">
+            Kualitas Foto
+          </span>
           <span
-            className={`font-mono font-bold ${
+            className={`whitespace-nowrap font-mono font-bold ${
               qualityHigh ? "text-[#059669]" : "text-[#D97706]"
             }`}
           >
@@ -217,9 +219,13 @@ function FaceSlotCard({
             style={{ width: `${qualityPct}%` }}
           />
         </div>
-        <div className="flex items-center justify-between text-[10px] text-slate-400">
-          <span>{face.embedding_dim}-d vector</span>
-          <span>{formatWibDateTime(face.created_at).replace(" WIB", "")}</span>
+        <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 text-[10px] text-slate-400">
+          <span className="whitespace-nowrap font-medium text-emerald-600">
+            Siap pakai
+          </span>
+          <span className="whitespace-nowrap">
+            {formatWibDateTime(face.created_at).replace(" WIB", "")}
+          </span>
         </div>
       </div>
     </div>
@@ -533,8 +539,8 @@ function FaceDatasetContent() {
   return (
     <>
       <AdminPageHeader
-        title="Dataset Wajah Siswa"
-        subtitle="Registrasi 3–5 foto wajah per siswa untuk ekstraksi vektor 512-d InsightFace."
+        title="Foto Wajah Siswa"
+        subtitle="Simpan 3–5 foto wajah per siswa agar kamera absensi mudah mengenali."
         headerActions={headerActions}
       />
 
@@ -688,7 +694,7 @@ function FaceDatasetContent() {
                     <div>
                       <div className="flex flex-wrap items-center gap-2">
                         <h2 className="text-lg font-bold text-[#0F172A]">
-                          Registrasi Dataset Wajah — {selectedStudent.name}
+                          Foto Wajah — {selectedStudent.name}
                         </h2>
                         {!loadingFaces ? (
                           <StatusBadge
@@ -744,7 +750,7 @@ function FaceDatasetContent() {
                       className="inline-flex items-center gap-2 rounded-xl bg-[#1D4ED8] px-4 py-2.5 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-[#1E3A8A] disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       <Camera className="h-4 w-4" aria-hidden="true" />
-                      <span>Ambil via Webcam</span>
+                      <span>Foto Pakai Kamera</span>
                     </button>
                     <button
                       type="button"
@@ -757,7 +763,7 @@ function FaceDatasetContent() {
                         aria-hidden="true"
                       />
                       <span>
-                        {uploading ? "Mengunggah..." : "Upload File Foto"}
+                        {uploading ? "Mengunggah..." : "Pilih File Foto"}
                       </span>
                     </button>
                   </div>
@@ -809,7 +815,7 @@ function FaceDatasetContent() {
                 <div>
                   <div className="mb-3 flex items-center justify-between">
                     <p className="text-xs font-bold uppercase tracking-wide text-slate-500">
-                      Slot Sampel Biometrik Wajah (Maksimal 5 Foto)
+                      Foto Wajah Siswa (Maksimal 5 Foto)
                     </p>
                     {loadingFaces ? (
                       <span className="text-xs text-slate-400">
@@ -856,24 +862,24 @@ function FaceDatasetContent() {
                     </div>
                     <div>
                       <p className="flex items-center gap-1.5 text-sm font-bold text-[#0F172A]">
-                        <span>Status Biometrik InsightFace 512-d</span>
+                        <span>Panduan Foto Wajah</span>
                         <Sparkles
                           className="h-3.5 w-3.5 text-[#1D4ED8]"
                           aria-hidden="true"
                         />
                       </p>
                       <p className="mt-0.5 text-xs text-slate-600">
-                        Setiap foto divalidasi otomatis harus memuat{" "}
-                        <strong>tepat 1 wajah jelas</strong> dengan skor
-                        kualitas deteksi AI ≥ <strong>0.50</strong> sebelum
-                        vektor embedding 512 dimensi disimpan.
+                        Pastikan setiap foto menampilkan{" "}
+                        <strong>tepat 1 wajah yang jelas</strong> dengan
+                        pencahayaan cukup agar kamera absensi dapat mengenali
+                        siswa dengan akurat.
                       </p>
                     </div>
                   </div>
                   <StatusBadge tone="primary">
                     {loadingFaces
                       ? "Memuat..."
-                      : `${faces.length}/5 Embedding Aktif (512-d)`}
+                      : `${faces.length}/5 Foto Siap Pakai`}
                   </StatusBadge>
                 </div>
               </div>

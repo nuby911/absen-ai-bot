@@ -24,26 +24,26 @@ interface SidebarProps {
 const NAV_ITEMS = [
   {
     href: "/",
-    label: "Dashboard Ringkasan",
-    description: "Ringkasan operasional",
+    label: "Beranda",
+    description: "Ringkasan hari ini",
     icon: LayoutDashboard,
   },
   {
     href: "/students",
-    label: "Data Siswa & Master",
-    description: "Siswa, Ortu, Kelas, Jadwal & Guru",
+    label: "Data Sekolah",
+    description: "Siswa, Ortu, Kelas, Guru & Jadwal",
     icon: Users,
   },
   {
     href: "/faces",
-    label: "Dataset Wajah Siswa",
-    description: "Registrasi 5-slot biometrik",
+    label: "Foto Wajah Siswa",
+    description: "Upload & atur foto wajah (maks 5)",
     icon: ScanFace,
   },
   {
     href: "/evaluation",
-    label: "Laporan & Evaluasi FAR/FRR",
-    description: "Confusion Matrix & Chatbot",
+    label: "Laporan & Akurasi",
+    description: "Rekap absen, ketepatan wajah & WA",
     icon: BarChart3,
   },
 ];

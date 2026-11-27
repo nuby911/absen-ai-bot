@@ -176,8 +176,8 @@ export default function DashboardPage() {
   return (
     <>
       <AdminPageHeader
-        title="Dashboard Ringkasan"
-        subtitle="Pemantauan kesiapan dataset biometrik, kehadiran harian, dan layanan AI WhatsApp."
+        title="Beranda"
+        subtitle="Pantau kesiapan foto wajah, absensi harian, dan layanan WhatsApp sekolah."
         headerActions={headerActions}
       />
 
@@ -225,7 +225,7 @@ export default function DashboardPage() {
         <div className="rounded-2xl border border-[#E2E8F0] bg-white p-5 shadow-2xs">
           <div className="flex items-center justify-between">
             <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
-              Kesiapan Dataset Wajah
+              Siap Absen Wajah
             </p>
             <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#ECFDF5] text-[#10B981]">
               <ScanFace className="h-4 w-4" aria-hidden="true" />
@@ -273,7 +273,7 @@ export default function DashboardPage() {
         <div className="rounded-2xl border border-[#E2E8F0] bg-white p-5 shadow-2xs">
           <div className="flex items-center justify-between">
             <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
-              Akurasi Biometrik
+              Ketepatan Kenal Wajah
             </p>
             <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#FFFBEB] text-[#F59E0B]">
               <Activity className="h-4 w-4" aria-hidden="true" />
@@ -287,12 +287,12 @@ export default function DashboardPage() {
           <p className="mt-1 text-xs text-slate-500">
             {hasLabeledFaceLogs ? (
               <>
-                FAR {(faceMetrics?.far ?? 0).toFixed(1)}% • FRR{" "}
+                Salah orang {(faceMetrics?.far ?? 0).toFixed(1)}% • Gagal kenali{" "}
                 {(faceMetrics?.frr ?? 0).toFixed(1)}% (
-                {faceMetrics?.total_labeled ?? 0} log berlabel)
+                {faceMetrics?.total_labeled ?? 0} data)
               </>
             ) : (
-              "Belum ada log berlabel ground-truth"
+              "Belum ada data uji yang dikoreksi"
             )}
           </p>
         </div>
@@ -324,10 +324,10 @@ export default function DashboardPage() {
                 </div>
                 <div>
                   <p className="text-xs font-semibold text-[#0F172A]">
-                    Threshold Cosine Similarity
+                    Tingkat Ketelitian Wajah
                   </p>
                   <p className="text-[11px] text-slate-500">
-                    InsightFace 512-d embedding match
+                    Batas kemiripan minimal saat scan kamera
                   </p>
                 </div>
               </div>
@@ -343,11 +343,11 @@ export default function DashboardPage() {
                 </div>
                 <div>
                   <p className="text-xs font-semibold text-[#0F172A]">
-                    Notifikasi & AI Chatbot WhatsApp
+                    Notifikasi & Bot WhatsApp
                   </p>
                   <p className="text-[11px] text-slate-500">
-                    In-Domain {(chatbotMetrics?.in_domain_rate ?? 0).toFixed(1)}%
-                    • Rata-rata {Math.round(chatbotMetrics?.avg_latency_ms ?? 0)}{" "}
+                    Topik Sekolah {(chatbotMetrics?.in_domain_rate ?? 0).toFixed(1)}%
+                    • Balas rata-rata {Math.round(chatbotMetrics?.avg_latency_ms ?? 0)}{" "}
                     ms
                   </p>
                 </div>
@@ -393,21 +393,21 @@ export default function DashboardPage() {
           {/* Quick Actions */}
           <div className="pt-2 space-y-2.5">
             <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
-              Tautan Cepat Admin
+              Menu Cepat
             </p>
             <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
               <Link
                 href="/faces"
                 className="flex items-center justify-between rounded-xl bg-[#1D4ED8] px-4 py-3 text-xs font-semibold text-white transition-colors hover:bg-[#1E3A8A]"
               >
-                <span>Registrasi Wajah</span>
+                <span>Atur Foto Wajah</span>
                 <ArrowRight className="h-4 w-4" aria-hidden="true" />
               </Link>
               <Link
                 href="/evaluation"
                 className="flex items-center justify-between rounded-xl border border-[#E2E8F0] bg-white px-4 py-3 text-xs font-semibold text-[#0F172A] transition-colors hover:bg-slate-50"
               >
-                <span>Evaluasi FAR/FRR</span>
+                <span>Lihat Laporan</span>
                 <BarChart3
                   className="h-4 w-4 text-[#1D4ED8]"
                   aria-hidden="true"
@@ -418,7 +418,7 @@ export default function DashboardPage() {
               href="/students"
               className="flex items-center justify-between rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] px-4 py-2.5 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-100"
             >
-              <span>Kelola Data Master (Siswa, Ortu, Kelas, Jadwal, Guru)</span>
+              <span>Kelola Siswa, Guru & Kelas</span>
               <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
             </Link>
           </div>
@@ -449,18 +449,18 @@ export default function DashboardPage() {
             </Link>
           </div>
 
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-sm">
+          <div className="-mx-2 overflow-x-auto px-2 sm:mx-0 sm:px-0">
+            <table className="w-full min-w-[540px] text-left text-sm">
               <thead>
                 <tr className="border-b border-[#E2E8F0] text-xs font-semibold text-slate-500">
-                  <th className="pb-3 pr-4">Kelas</th>
-                  <th className="pb-3 pr-4">Wali Kelas</th>
-                  <th className="pb-3 px-2 text-center">Sesi</th>
-                  <th className="pb-3 px-2 text-center">Hadir</th>
-                  <th className="pb-3 px-2 text-center">Telat</th>
-                  <th className="pb-3 px-2 text-center">Izin/Sakit</th>
-                  <th className="pb-3 px-2 text-center">Alfa</th>
-                  <th className="pb-3 pl-2 text-right">Notif WA</th>
+                  <th className="pb-3 pr-4 whitespace-nowrap">Kelas</th>
+                  <th className="pb-3 pr-4 whitespace-nowrap">Wali Kelas</th>
+                  <th className="pb-3 px-2 text-center whitespace-nowrap">Sesi</th>
+                  <th className="pb-3 px-2 text-center whitespace-nowrap">Hadir</th>
+                  <th className="pb-3 px-2 text-center whitespace-nowrap">Telat</th>
+                  <th className="pb-3 px-2 text-center whitespace-nowrap">Izin/Sakit</th>
+                  <th className="pb-3 px-2 text-center whitespace-nowrap">Alfa</th>
+                  <th className="pb-3 pl-2 text-right whitespace-nowrap">Notif WA</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#E2E8F0]">

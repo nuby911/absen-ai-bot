@@ -383,8 +383,8 @@ export default function MasterDataPage() {
   return (
     <>
       <AdminPageHeader
-        title="Data Siswa & Master"
-        subtitle="Kelola data master Siswa, Orang Tua (WhatsApp), Kelas, Jadwal Pelajaran, dan Akun Guru."
+        title="Data Sekolah"
+        subtitle="Kelola data Siswa, Orang Tua (WhatsApp), Kelas, Jadwal Pelajaran, dan Akun Guru."
         headerActions={headerActions}
       />
 

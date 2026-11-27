@@ -317,7 +317,7 @@ export function WebcamCaptureModal({
       open={open}
       onClose={handleSafeClose}
       preventClose={isUploading}
-      title="Ambil Foto Wajah via Webcam"
+      title="Foto Wajah Pakai Kamera"
       subtitle={`Siswa: ${studentName} • Posisikan tepat 1 wajah di dalam bingkai oval`}
       maxWidthClass="max-w-xl"
     >
@@ -397,7 +397,7 @@ export function WebcamCaptureModal({
               aria-hidden="true"
             />
             <p className="text-base font-bold text-[#065F46]">
-              Dataset Wajah Lengkap ({maxFaces}/{maxFaces} Slot)
+              Foto Wajah Lengkap ({maxFaces}/{maxFaces} Foto)
             </p>
             <p className="text-xs text-emerald-800">
               Seluruh 5 sampel foto wajah untuk <strong>{studentName}</strong>{" "}

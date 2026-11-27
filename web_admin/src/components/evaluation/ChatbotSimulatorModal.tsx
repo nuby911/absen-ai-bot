@@ -83,8 +83,8 @@ export function ChatbotSimulatorModal({
       onClose={onClose}
       preventClose={simulating}
       maxWidthClass="max-w-2xl"
-      title="Simulator Uji Chatbot WhatsApp (Dry-Run)"
-      subtitle="Uji intent, pemanggilan function tool, dan respons AI secara langsung tanpa mengirim pesan WAHA nyata."
+      title="Tes Bot WhatsApp"
+      subtitle="Coba kirim pesan seperti orang tua untuk mengecek balasan bot tanpa mengirim pesan WhatsApp asli."
     >
       <form onSubmit={handleSubmit} className="space-y-4">
         {error ? (
@@ -102,7 +102,7 @@ export function ChatbotSimulatorModal({
             htmlFor="sim-parent"
             className="block text-xs font-semibold text-[#0F172A]"
           >
-            Pilih Orang Tua Terdaftar (Pengirim Simulasi)
+            Pilih Orang Tua (Pengirim Tes)
           </label>
           <select
             id="sim-parent"
@@ -120,8 +120,8 @@ export function ChatbotSimulatorModal({
           </select>
           {parents.length === 0 ? (
             <p className="text-[11px] text-[#D97706]">
-              Belum ada data orang tua terdaftar. Tambahkan orang tua di menu Data
-              Siswa & Master terlebih dahulu.
+              Belum ada data orang tua terdaftar. Tambahkan orang tua di menu
+              Data Sekolah terlebih dahulu.
             </p>
           ) : null}
         </div>
@@ -162,8 +162,7 @@ export function ChatbotSimulatorModal({
           <p className="flex items-center gap-1.5 text-[11px] text-slate-500">
             <FlaskConical className="h-3.5 w-3.5 text-[#1D4ED8]" aria-hidden="true" />
             <span>
-              Mode dry-run: tidak mengirim WA ke WAHA, namun tercatat di log
-              evaluasi.
+              Mode tes: tidak mengirim WA asli, namun tercatat di riwayat bot.
             </span>
           </p>
 
@@ -182,7 +181,7 @@ export function ChatbotSimulatorModal({
               className="inline-flex items-center gap-1.5 rounded-xl bg-[#1D4ED8] px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-[#1E3A8A] disabled:opacity-60"
             >
               <Send className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>{simulating ? "Memproses AI..." : "Kirim Simulasi"}</span>
+              <span>{simulating ? "Memproses..." : "Kirim Pesan Tes"}</span>
             </button>
           </div>
         </div>
@@ -193,14 +192,14 @@ export function ChatbotSimulatorModal({
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-2 text-xs font-bold text-[#065F46]">
                 <Bot className="h-4 w-4 text-[#10B981]" aria-hidden="true" />
-                <span>Hasil Balasan AI Chatbot</span>
+                <span>Balasan Bot WhatsApp</span>
               </div>
               <div className="flex flex-wrap items-center gap-1.5">
                 <StatusBadge tone={result.is_in_domain ? "success" : "danger"}>
-                  {result.is_in_domain ? "In-Domain" : "Out-of-Domain"}
+                  {result.is_in_domain ? "Topik Sekolah" : "Di Luar Topik"}
                 </StatusBadge>
                 <StatusBadge tone={result.is_fallback ? "warning" : "neutral"}>
-                  {result.is_fallback ? "Fallback" : "Non-Fallback"}
+                  {result.is_fallback ? "Balasan Cadangan" : "Normal"}
                 </StatusBadge>
                 <span className="inline-flex items-center gap-1 rounded-full border border-[#E2E8F0] bg-white px-2 py-0.5 font-mono text-[11px] font-semibold text-slate-700">
                   <Clock className="h-3 w-3 text-slate-400" aria-hidden="true" />

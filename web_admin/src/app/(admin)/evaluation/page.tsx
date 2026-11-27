@@ -56,9 +56,9 @@ const PAGE_SIZE = 20;
 
 const FACE_FILTER_PILLS: Array<{ key: FaceLogStatusFilter; label: string }> = [
   { key: "all", label: "Semua" },
-  { key: "unlabeled", label: "Belum Dilabeli" },
-  { key: "labeled", label: "Sudah Dilabeli" },
-  { key: "errors", label: "Salah / FP & FN" },
+  { key: "unlabeled", label: "Belum Dikoreksi" },
+  { key: "labeled", label: "Sudah Dikoreksi" },
+  { key: "errors", label: "Salah / Gagal" },
 ];
 
 const CHATBOT_FILTER_PILLS: Array<{
@@ -66,8 +66,8 @@ const CHATBOT_FILTER_PILLS: Array<{
   label: string;
 }> = [
   { key: "all", label: "Semua" },
-  { key: "true", label: "In-Domain" },
-  { key: "false", label: "Out-of-Domain" },
+  { key: "true", label: "Topik Sekolah" },
+  { key: "false", label: "Di Luar Topik" },
 ];
 
 function getClassificationBadgeTone(classification: string): BadgeTone {
@@ -430,7 +430,7 @@ export default function EvaluationPage() {
           className="inline-flex items-center gap-1.5 rounded-xl bg-[#1D4ED8] px-3.5 py-2 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-[#1E3A8A]"
         >
           <FlaskConical className="h-3.5 w-3.5" aria-hidden="true" />
-          <span>Simulator Chatbot WA</span>
+          <span>Tes Bot WhatsApp</span>
         </button>
 
         <button
@@ -467,8 +467,8 @@ export default function EvaluationPage() {
   return (
     <>
       <AdminPageHeader
-        title="Laporan & Evaluasi FAR/FRR"
-        subtitle="Metrik ilmiah Confusion Matrix pengenalan wajah, evaluasi AI Chatbot WhatsApp, dan rekap kehadiran kelas."
+        title="Laporan & Akurasi"
+        subtitle="Pantau rekap absensi kelas, ketepatan kamera wajah, dan riwayat balasan WhatsApp."
         headerActions={headerActions}
       />
 
@@ -519,7 +519,7 @@ export default function EvaluationPage() {
         <div className="rounded-2xl border border-[#E2E8F0] bg-white p-5 shadow-2xs">
           <div className="flex items-center justify-between">
             <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-              Face Recognition Accuracy
+              Ketepatan Kenal Wajah
             </p>
             <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#EFF6FF] text-[#1D4ED8]">
               <ShieldCheck className="h-4 w-4" aria-hidden="true" />
@@ -533,11 +533,11 @@ export default function EvaluationPage() {
           <p className="mt-1 text-xs text-slate-500">
             {hasLabeledFaceLogs ? (
               <>
-                (TP+TN) / Total Label: {(face?.tp ?? 0) + (face?.tn ?? 0)} /{" "}
-                {face?.total_labeled ?? 0} log
+                Benar {(face?.tp ?? 0) + (face?.tn ?? 0)} dari{" "}
+                {face?.total_labeled ?? 0} data uji
               </>
             ) : (
-              "Belum ada log berlabel ground-truth"
+              "Belum ada data uji yang dikoreksi"
             )}
           </p>
         </div>
@@ -545,7 +545,7 @@ export default function EvaluationPage() {
         <div className="rounded-2xl border border-red-200/80 bg-white p-5 shadow-2xs">
           <div className="flex items-center justify-between">
             <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-              FAR (False Acceptance Rate)
+              Salah Kenali Orang (FAR)
             </p>
             <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#FEF2F2] text-[#EF4444]">
               <ShieldAlert className="h-4 w-4" aria-hidden="true" />
@@ -559,11 +559,11 @@ export default function EvaluationPage() {
           <p className="mt-1 text-xs text-slate-500">
             {hasLabeledFaceLogs ? (
               <>
-                FP / (FP+TN): {face?.fp ?? 0} impostor lolos dari{" "}
-                {(face?.fp ?? 0) + (face?.tn ?? 0)}
+                {face?.fp ?? 0} orang lain lolos dari{" "}
+                {(face?.fp ?? 0) + (face?.tn ?? 0)} percobaan
               </>
             ) : (
-              "Belum ada log berlabel ground-truth"
+              "Belum ada data uji yang dikoreksi"
             )}
           </p>
         </div>
@@ -571,7 +571,7 @@ export default function EvaluationPage() {
         <div className="rounded-2xl border border-amber-200/80 bg-white p-5 shadow-2xs">
           <div className="flex items-center justify-between">
             <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-              FRR (False Rejection Rate)
+              Gagal Kenali Siswa (FRR)
             </p>
             <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#FFFBEB] text-[#F59E0B]">
               <Activity className="h-4 w-4" aria-hidden="true" />
@@ -585,11 +585,11 @@ export default function EvaluationPage() {
           <p className="mt-1 text-xs text-slate-500">
             {hasLabeledFaceLogs ? (
               <>
-                FN / (FN+TP): {face?.fn ?? 0} siswa ditolak dari{" "}
-                {(face?.fn ?? 0) + (face?.tp ?? 0)}
+                {face?.fn ?? 0} siswa ditolak dari{" "}
+                {(face?.fn ?? 0) + (face?.tp ?? 0)} percobaan
               </>
             ) : (
-              "Belum ada log berlabel ground-truth"
+              "Belum ada data uji yang dikoreksi"
             )}
           </p>
         </div>
@@ -597,7 +597,7 @@ export default function EvaluationPage() {
         <div className="rounded-2xl border border-emerald-200/80 bg-white p-5 shadow-2xs">
           <div className="flex items-center justify-between">
             <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-              Avg WA Chatbot Latency
+              Kecepatan Balas WA
             </p>
             <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#ECFDF5] text-[#10B981]">
               <Clock className="h-4 w-4" aria-hidden="true" />
@@ -623,15 +623,15 @@ export default function EvaluationPage() {
           <div className="flex items-center justify-between gap-2">
             <div>
               <h2 className="text-base font-bold text-[#0F172A]">
-                Confusion Matrix Pengenalan Wajah
+                Hasil Uji Ketepatan Wajah
               </h2>
               <p className="text-xs text-slate-500">
                 Total {face?.total_scans ?? 0} scan ({face?.total_labeled ?? 0}{" "}
-                sudah berlabel ground-truth)
+                sudah dikoreksi)
               </p>
             </div>
             <StatusBadge tone="primary">
-              Threshold {(face?.threshold ?? 0.55).toFixed(2)}
+              Batas {(face?.threshold ?? 0.55).toFixed(2)}
             </StatusBadge>
           </div>
 
@@ -639,49 +639,49 @@ export default function EvaluationPage() {
           <div className="grid grid-cols-2 gap-3">
             <div className="rounded-2xl border border-emerald-200 bg-[#ECFDF5] p-4">
               <p className="text-xs font-bold text-[#059669]">
-                True Positive (TP)
+                Benar Dikenali (TP)
               </p>
               <p className="mt-2 text-3xl font-extrabold text-[#065F46] tabular-nums">
                 {face?.tp ?? 0}
               </p>
               <p className="mt-1 text-[11px] text-emerald-800/80">
-                Siswa teridentifikasi sesuai identitas asli
+                Siswa dikenali sesuai nama aslinya
               </p>
             </div>
 
             <div className="rounded-2xl border border-red-200 bg-[#FEF2F2] p-4">
               <p className="text-xs font-bold text-[#DC2626]">
-                False Positive (FP)
+                Salah Orang (FP)
               </p>
               <p className="mt-2 text-3xl font-extrabold text-[#991B1B] tabular-nums">
                 {face?.fp ?? 0}
               </p>
               <p className="mt-1 text-[11px] text-red-800/80">
-                Impostor / siswa lain keliru diterima (FAR)
+                Orang lain keliru masuk sebagai siswa
               </p>
             </div>
 
             <div className="rounded-2xl border border-amber-200 bg-[#FFFBEB] p-4">
               <p className="text-xs font-bold text-[#D97706]">
-                False Negative (FN)
+                Gagal Dikenali (FN)
               </p>
               <p className="mt-2 text-3xl font-extrabold text-[#92400E] tabular-nums">
                 {face?.fn ?? 0}
               </p>
               <p className="mt-1 text-[11px] text-amber-800/80">
-                Siswa terdaftar gagal dikenali sistem (FRR)
+                Siswa terdaftar gagal terbaca kamera
               </p>
             </div>
 
             <div className="rounded-2xl border border-blue-200 bg-[#EFF6FF] p-4">
               <p className="text-xs font-bold text-[#1D4ED8]">
-                True Negative (TN)
+                Orang Asing Ditolak (TN)
               </p>
               <p className="mt-2 text-3xl font-extrabold text-[#1E3A8A] tabular-nums">
                 {face?.tn ?? 0}
               </p>
               <p className="mt-1 text-[11px] text-blue-900/80">
-                Non-siswa / impostor ditolak dengan tepat
+                Orang bukan siswa berhasil ditolak
               </p>
             </div>
           </div>
@@ -695,13 +695,13 @@ export default function EvaluationPage() {
                   aria-hidden="true"
                 />
                 <h3 className="text-sm font-bold text-[#0F172A]">
-                  Slider Threshold Cosine Similarity
+                  Atur Tingkat Ketelitian Wajah
                 </h3>
               </div>
               <div className="flex items-center gap-2">
                 {isThresholdDirty ? (
                   <StatusBadge tone="warning">
-                    Perubahan belum disimpan
+                    Belum disimpan
                   </StatusBadge>
                 ) : null}
                 <span className="rounded-lg bg-white px-2.5 py-1 font-mono text-sm font-extrabold text-[#1D4ED8] ring-1 ring-[#E2E8F0]">
@@ -712,7 +712,7 @@ export default function EvaluationPage() {
 
             <input
               type="range"
-              aria-label="Threshold Cosine Similarity"
+              aria-label="Atur Tingkat Ketelitian Wajah"
               min={0.2}
               max={0.95}
               step={0.01}
@@ -722,9 +722,9 @@ export default function EvaluationPage() {
             />
 
             <div className="flex justify-between text-[11px] font-medium text-slate-500">
-              <span>0.20 (Longgar • FRR ↓)</span>
+              <span>0.20 (Longgar)</span>
               <span>0.55 (Standar)</span>
-              <span>0.95 (Ketat • FAR ↓)</span>
+              <span>0.95 (Sangat Ketat)</span>
             </div>
 
             <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
@@ -751,13 +751,13 @@ export default function EvaluationPage() {
                 onClick={() => void handleSaveThreshold()}
                 className="rounded-xl bg-[#1D4ED8] px-4 py-2 text-xs font-semibold text-white shadow-sm hover:bg-[#1E3A8A] disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {savingThreshold ? "Menyimpan..." : "Simpan Threshold"}
+                {savingThreshold ? "Menyimpan..." : "Simpan Batas"}
               </button>
             </div>
 
             <p className="text-[11px] text-slate-500">
-              Threshold baru berlaku untuk pemindaian Kiosk berikutnya dan tidak
-              mengubah hasil klasifikasi log historis secara surut.
+              Pengaturan baru berlaku untuk absensi wajah berikutnya dan tidak
+              mengubah riwayat scan sebelumnya.
             </p>
           </div>
         </section>
@@ -771,10 +771,10 @@ export default function EvaluationPage() {
               </div>
               <div>
                 <h2 className="text-base font-bold text-[#0F172A]">
-                  Log Evaluasi AI Chatbot WhatsApp (Function Calling)
+                  Riwayat Pesan Bot WhatsApp
                 </h2>
                 <p className="text-xs text-slate-500">
-                  Klik baris untuk membaca percakapan penuh & balasan bot
+                  Klik baris untuk membaca pesan orang tua & balasan bot
                 </p>
               </div>
             </div>
@@ -785,7 +785,7 @@ export default function EvaluationPage() {
               className="inline-flex items-center gap-1.5 rounded-xl border border-blue-200 bg-[#EFF6FF] px-3 py-1.5 text-xs font-semibold text-[#1D4ED8] hover:bg-blue-100"
             >
               <FlaskConical className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>Uji Simulator</span>
+              <span>Tes Bot WA</span>
             </button>
           </div>
 
@@ -798,12 +798,12 @@ export default function EvaluationPage() {
               <p className="mt-1 text-2xl font-extrabold text-[#0F172A] tabular-nums">
                 {chatbot?.total_messages ?? 0}
               </p>
-              <p className="text-[11px] text-slate-500">Semua interaksi WA</p>
+              <p className="text-[11px] text-slate-500">Semua pesan WA</p>
             </div>
 
             <div className="rounded-xl border border-emerald-200 bg-[#ECFDF5] p-3">
               <p className="text-[11px] font-semibold uppercase tracking-wide text-[#059669]">
-                In-Domain
+                Topik Sekolah
               </p>
               <p className="mt-1 text-2xl font-extrabold text-[#065F46] tabular-nums">
                 {domainDenominator > 0
@@ -817,17 +817,17 @@ export default function EvaluationPage() {
 
             <div className="rounded-xl border border-red-200 bg-[#FEF2F2] p-3">
               <p className="text-[11px] font-semibold uppercase tracking-wide text-[#DC2626]">
-                Out-of-Domain
+                Di Luar Topik
               </p>
               <p className="mt-1 text-2xl font-extrabold text-[#991B1B] tabular-nums">
                 {chatbot?.out_of_domain_count ?? 0}
               </p>
-              <p className="text-[11px] text-red-800">Di luar topik sekolah</p>
+              <p className="text-[11px] text-red-800">Bukan urusan sekolah</p>
             </div>
 
             <div className="rounded-xl border border-amber-200 bg-[#FFFBEB] p-3">
               <p className="text-[11px] font-semibold uppercase tracking-wide text-[#D97706]">
-                Fallback Rate
+                Balasan Cadangan
               </p>
               <p className="mt-1 text-2xl font-extrabold text-[#92400E] tabular-nums">
                 {(chatbot?.total_messages ?? 0) > 0
@@ -835,7 +835,7 @@ export default function EvaluationPage() {
                   : "—"}
               </p>
               <p className="text-[11px] text-amber-800">
-                {chatbot?.fallback_count ?? 0} pesan fallback
+                {chatbot?.fallback_count ?? 0} kali dipakai
               </p>
             </div>
           </div>
@@ -875,9 +875,9 @@ export default function EvaluationPage() {
                 <tr>
                   <th className="px-3 py-2.5">Waktu & Pengirim</th>
                   <th className="px-3 py-2.5">Pesan Orang Tua</th>
-                  <th className="px-3 py-2.5">Intent / Tool</th>
+                  <th className="px-3 py-2.5">Topik / Aksi</th>
                   <th className="px-3 py-2.5">Status</th>
-                  <th className="px-3 py-2.5 text-right">Latency</th>
+                  <th className="px-3 py-2.5 text-right">Kecepatan</th>
                   <th className="px-3 py-2.5 text-right">Detail</th>
                 </tr>
               </thead>
@@ -933,10 +933,10 @@ export default function EvaluationPage() {
                           <StatusBadge
                             tone={log.is_in_domain ? "success" : "danger"}
                           >
-                            {log.is_in_domain ? "In-Domain" : "Out-of-Domain"}
+                            {log.is_in_domain ? "Topik Sekolah" : "Di Luar Topik"}
                           </StatusBadge>
                           {log.is_fallback ? (
-                            <StatusBadge tone="warning">Fallback</StatusBadge>
+                            <StatusBadge tone="warning">Cadangan</StatusBadge>
                           ) : null}
                         </div>
                       </td>
@@ -1206,11 +1206,11 @@ export default function EvaluationPage() {
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="text-base font-bold text-[#0F172A]">
-              Log Pemindaian Wajah & Pelabelan Lab (Confusion Matrix)
+              Riwayat Scan Wajah & Koreksi Data
             </h2>
             <p className="text-xs text-slate-500">
-              Tandai ground-truth siswa atau impostor agar metrik TP/FP/FN/TN,
-              FAR, dan FRR terhitung otomatis.
+              Tandai nama siswa yang sebenarnya agar tingkat ketepatan kamera
+              terhitung otomatis.
             </p>
           </div>
 
@@ -1245,15 +1245,15 @@ export default function EvaluationPage() {
           <table className="w-full text-left text-xs">
             <thead className="border-b border-[#E2E8F0] bg-[#F8FAFC] font-semibold text-slate-500">
               <tr>
-                <th className="px-4 py-3">Waktu Scan</th>
-                <th className="px-4 py-3">Prediksi Sistem</th>
-                <th className="px-4 py-3">Ground Truth</th>
-                <th className="px-4 py-3">Similarity / Thr</th>
-                <th className="px-4 py-3">Liveness</th>
-                <th className="px-4 py-3">Klasifikasi</th>
-                <th className="px-4 py-3">Catatan Kondisi</th>
-                <th className="px-4 py-3 text-right">Latency</th>
-                <th className="px-4 py-3 text-right">Aksi</th>
+                <th className="px-4 py-3 whitespace-nowrap">Waktu Scan</th>
+                <th className="px-4 py-3 whitespace-nowrap">Tebakan Kamera</th>
+                <th className="px-4 py-3 whitespace-nowrap">Orang Sebenarnya</th>
+                <th className="px-4 py-3 whitespace-nowrap">Skor / Batas</th>
+                <th className="px-4 py-3 whitespace-nowrap">Kedip Mata</th>
+                <th className="px-4 py-3 whitespace-nowrap">Hasil</th>
+                <th className="px-4 py-3 whitespace-nowrap">Catatan</th>
+                <th className="px-4 py-3 text-right whitespace-nowrap">Kecepatan</th>
+                <th className="px-4 py-3 text-right whitespace-nowrap">Aksi</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-[#E2E8F0]">
@@ -1284,18 +1284,18 @@ export default function EvaluationPage() {
                           </span>
                         )}
                       </td>
-                      <td className="px-4 py-3">
+                      <td className="px-4 py-3 whitespace-nowrap">
                         {log.is_impostor ? (
-                          <StatusBadge tone="danger">Impostor</StatusBadge>
+                          <StatusBadge tone="danger">Orang Lain</StatusBadge>
                         ) : log.actual_student_name ? (
                           <span className="font-semibold text-[#0F172A]">
                             {log.actual_student_name}
                           </span>
                         ) : (
-                          <span className="text-slate-400">Belum dilabeli</span>
+                          <span className="text-slate-400">Belum dikoreksi</span>
                         )}
                       </td>
-                      <td className="px-4 py-3 font-mono">
+                      <td className="px-4 py-3 font-mono whitespace-nowrap">
                         <span className="font-bold text-[#0F172A]">
                           {log.top_similarity_score.toFixed(3)}
                         </span>{" "}
@@ -1303,19 +1303,19 @@ export default function EvaluationPage() {
                           / {log.threshold_used.toFixed(2)}
                         </span>
                       </td>
-                      <td className="px-4 py-3">
+                      <td className="px-4 py-3 whitespace-nowrap">
                         <StatusBadge
                           tone={log.liveness_passed ? "success" : "danger"}
                         >
                           {log.liveness_passed ? "Lolos" : "Gagal"}
                         </StatusBadge>
                       </td>
-                      <td className="px-4 py-3">
+                      <td className="px-4 py-3 whitespace-nowrap">
                         <StatusBadge
                           tone={getClassificationBadgeTone(log.classification)}
                         >
                           {log.classification === "unlabeled"
-                            ? "Belum Dilabeli"
+                            ? "Belum Dikoreksi"
                             : log.classification}
                         </StatusBadge>
                       </td>
@@ -1325,14 +1325,14 @@ export default function EvaluationPage() {
                       <td className="px-4 py-3 text-right font-mono text-slate-700 whitespace-nowrap">
                         {log.latency_ms} ms
                       </td>
-                      <td className="px-4 py-3 text-right">
+                      <td className="px-4 py-3 text-right whitespace-nowrap">
                         <button
                           type="button"
                           onClick={() => setLabelingLog(log)}
-                          className="inline-flex items-center gap-1 rounded-lg border border-[#E2E8F0] bg-white px-2.5 py-1.5 text-[11px] font-semibold text-[#1D4ED8] hover:border-[#1D4ED8] hover:bg-[#EFF6FF]"
+                          className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-[#E2E8F0] bg-white px-2.5 py-1.5 text-[11px] font-semibold text-[#1D4ED8] hover:border-[#1D4ED8] hover:bg-[#EFF6FF]"
                         >
                           <Tag className="h-3 w-3" aria-hidden="true" />
-                          <span>{isLabeled ? "Edit Label" : "Labeli Log"}</span>
+                          <span>{isLabeled ? "Koreksi" : "Tandai"}</span>
                         </button>
                       </td>
                     </tr>

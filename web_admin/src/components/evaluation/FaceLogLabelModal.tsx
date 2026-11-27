@@ -122,10 +122,10 @@ export function FaceLogLabelModal({
       preventClose={busy}
       title={
         isAlreadyLabeled
-          ? "Edit Ground-Truth Log Wajah"
-          : "Pelabelan Ground-Truth Log Wajah"
+          ? "Ubah Koreksi Hasil Scan"
+          : "Koreksi Hasil Scan Wajah"
       }
-      subtitle={`Skor similarity: ${log.top_similarity_score.toFixed(3)} • Threshold: ${log.threshold_used.toFixed(2)} • Prediksi: ${log.predicted_student_name ?? "Tidak Cocok"}`}
+      subtitle={`Skor: ${log.top_similarity_score.toFixed(3)} • Batas: ${log.threshold_used.toFixed(2)} • Tebakan Kamera: ${log.predicted_student_name ?? "Tidak Dikenali"}`}
     >
       <form onSubmit={handleSubmit} className="space-y-5">
         {error ? (
@@ -140,7 +140,7 @@ export function FaceLogLabelModal({
 
         <div className="space-y-2">
           <p className="text-xs font-semibold text-[#0F172A]">
-            Identitas Sebenarnya Saat Pengujian Lab
+            Siapa Orang Sebenarnya di Depan Kamera?
           </p>
           <div className="grid grid-cols-2 gap-3">
             <button
@@ -174,7 +174,7 @@ export function FaceLogLabelModal({
               }`}
             >
               <ShieldAlert className="h-4 w-4" aria-hidden="true" />
-              <span>Impostor / Non-Siswa</span>
+              <span>Orang Lain / Bukan Siswa</span>
             </button>
           </div>
         </div>
@@ -185,7 +185,7 @@ export function FaceLogLabelModal({
               htmlFor="actual-student"
               className="block text-xs font-semibold text-[#0F172A]"
             >
-              Pilih Siswa Asli (Ground Truth)
+              Pilih Siswa Sebenarnya
             </label>
             <select
               id="actual-student"
@@ -203,10 +203,11 @@ export function FaceLogLabelModal({
           </div>
         ) : (
           <div className="rounded-xl border border-red-200 bg-[#FEF2F2] p-3 text-xs text-slate-700">
-            Log ini akan diklasifikasikan sebagai pengujian negatif/impostor:
-            <strong className="text-[#DC2626]"> FP</strong> jika sistem sempat
-            mencocokkan, atau <strong className="text-[#1D4ED8]">TN</strong>{" "}
-            jika ditolak dengan benar.
+            Data ini ditandai sebagai orang luar/bukan siswa: dihitung{" "}
+            <strong className="text-[#DC2626]">Salah Orang (FP)</strong> jika
+            kamera sempat mengenali, atau{" "}
+            <strong className="text-[#1D4ED8]">Ditolak Tepat (TN)</strong> jika
+            berhasil ditolak.
           </div>
         )}
 
@@ -251,7 +252,7 @@ export function FaceLogLabelModal({
               >
                 <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
                 <span>
-                  {resetting ? "Mereset..." : "Reset ke Belum Dilabeli"}
+                  {resetting ? "Mereset..." : "Hapus Koreksi"}
                 </span>
               </button>
             ) : null}
@@ -271,7 +272,7 @@ export function FaceLogLabelModal({
               disabled={busy}
               className="rounded-xl bg-[#1D4ED8] px-5 py-2 text-sm font-semibold text-white hover:bg-[#1E3A8A] disabled:opacity-60"
             >
-              {submitting ? "Menyimpan..." : "Simpan Label"}
+              {submitting ? "Menyimpan..." : "Simpan Koreksi"}
             </button>
           </div>
         </div>

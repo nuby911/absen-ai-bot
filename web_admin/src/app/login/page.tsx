@@ -156,34 +156,33 @@ export default function LoginPage() {
         <div className="my-10 space-y-6 lg:my-0">
           <div className="inline-flex items-center gap-2 rounded-full border border-blue-500/30 bg-blue-500/10 px-3 py-1 text-xs font-semibold text-blue-300">
             <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
-            <span>InsightFace 512-d & WhatsApp AI Chatbot</span>
+            <span>Absensi Wajah & Bot WhatsApp Sekolah</span>
           </div>
           <h1 className="text-3xl font-extrabold tracking-tight text-white sm:text-4xl leading-tight">
-            Pusat Kontrol Absensi Biometrik Sekolah
+            Panel Admin Absensi Sekolah Cerdas
           </h1>
           <p className="max-w-md text-sm leading-relaxed text-slate-300">
-            Kelola data master siswa, orang tua WhatsApp, jadwal pelajaran,
-            registrasi dataset wajah 5-slot, serta evaluasi ilmiah Confusion
-            Matrix (FAR/FRR) secara terpusat.
+            Kelola data siswa, kontak WhatsApp orang tua, jadwal kelas, foto
+            wajah siswa, serta laporan kehadiran harian secara terpusat.
           </p>
 
           <div className="grid grid-cols-2 gap-3 pt-2 max-w-md">
             <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-3.5">
-              <p className="text-xs font-medium text-slate-400">Model Wajah</p>
+              <p className="text-xs font-medium text-slate-400">Absensi Wajah</p>
               <p className="mt-1 text-sm font-bold text-white">
-                InsightFace ONNX
+                Kamera Kiosk Guru
               </p>
-              <p className="text-[11px] text-emerald-400">512-d Cosine Match</p>
+              <p className="text-[11px] text-emerald-400">Anti-Foto & Cepat</p>
             </div>
             <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-3.5">
               <p className="text-xs font-medium text-slate-400">
-                Notifikasi & AI
+                Info Orang Tua
               </p>
               <p className="mt-1 text-sm font-bold text-white">
-                WhatsApp Gateway
+                Bot WhatsApp Otomatis
               </p>
               <p className="text-[11px] text-blue-300">
-                Gemini Function Calling
+                Notifikasi & Izin Online
               </p>
             </div>
           </div>

@@ -22,21 +22,21 @@ export function ChatbotLogDetailModal({
       open={Boolean(log)}
       onClose={onClose}
       maxWidthClass="max-w-3xl"
-      title="Detail Percakapan AI Chatbot WhatsApp"
+      title="Detail Percakapan Bot WhatsApp"
       subtitle={`Pengirim: ${formatWaPhoneDisplay(log.phone_wa)} • ${formatWibDateTime(log.created_at)}`}
     >
       <div className="space-y-5">
         {/* Metadata Strip */}
         <div className="flex flex-wrap items-center gap-2 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-3.5 text-xs">
           <StatusBadge tone={log.is_in_domain ? "success" : "danger"}>
-            {log.is_in_domain ? "In-Domain" : "Out-of-Domain"}
+            {log.is_in_domain ? "Topik Sekolah" : "Di Luar Topik"}
           </StatusBadge>
           {log.is_fallback ? (
-            <StatusBadge tone="warning">Fallback</StatusBadge>
+            <StatusBadge tone="warning">Balasan Cadangan</StatusBadge>
           ) : null}
 
           <span className="inline-flex items-center gap-1 rounded-full border border-[#E2E8F0] bg-white px-2.5 py-0.5 text-xs font-semibold text-slate-700">
-            <span>Intent:</span>
+            <span>Tujuan:</span>
             <strong className="font-mono text-[#0F172A]">
               {log.detected_intent || "-"}
             </strong>
@@ -45,7 +45,7 @@ export function ChatbotLogDetailModal({
           <span className="inline-flex items-center gap-1 rounded-full border border-blue-200 bg-[#EFF6FF] px-2.5 py-0.5 text-xs font-semibold text-[#1D4ED8]">
             <Wrench className="h-3 w-3" aria-hidden="true" />
             <span className="font-mono">
-              {log.tool_called ? `${log.tool_called}()` : "Tanpa tool call"}
+              {log.tool_called ? `${log.tool_called}()` : "Tanpa aksi sistem"}
             </span>
           </span>
 
